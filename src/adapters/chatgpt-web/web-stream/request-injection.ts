@@ -39,7 +39,7 @@ export type ChatGptRequestPromptShape = {
 
 export type ChatGptDirectRequestMetadata = {
   connector?: { pluginId: string; appName: string };
-  mode?: { model: string; thinkingEffort: string };
+  mode?: { model: string; thinkingEffort?: string };
 };
 
 export type ChatGptRequestInjectionSnapshot = {
@@ -603,7 +603,7 @@ export class ChatGptRequestInjector {
     if (directMetadata?.mode) {
       const { model, thinkingEffort } = directMetadata.mode;
       if (!/^[A-Za-z0-9._-]{3,128}$/.test(model)
-        || !/^[A-Za-z0-9._-]{2,40}$/.test(thinkingEffort)) {
+        || (thinkingEffort !== undefined && !/^[A-Za-z0-9._-]{2,40}$/.test(thinkingEffort))) {
         throw new Error("ChatGPT direct mode metadata is invalid");
       }
     }
@@ -760,11 +760,16 @@ export class ChatGptRequestInjector {
               return count;
             };
             if (directMetadataValue.mode) {
-              if (typeof body.model !== "string" || typeof body.thinking_effort !== "string") {
+              if (typeof body.model !== "string"
+                || (body.thinking_effort !== undefined && typeof body.thinking_effort !== "string")) {
                 return fail("request-shape", exactValueMatches, literalMatches, rawBody.length);
               }
               body.model = directMetadataValue.mode.model;
-              body.thinking_effort = directMetadataValue.mode.thinkingEffort;
+              if (directMetadataValue.mode.thinkingEffort === undefined) {
+                delete body.thinking_effort;
+              } else {
+                body.thinking_effort = directMetadataValue.mode.thinkingEffort;
+              }
             }
             if (directMetadataValue.connector) {
               const { pluginId, appName } = directMetadataValue.connector;

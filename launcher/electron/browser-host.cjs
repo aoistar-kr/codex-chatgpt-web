@@ -1934,13 +1934,15 @@ class BrowserHost {
     // tabs leaked one slot per response/compaction until the bounded tab limit made later
     // turns fail. The result already lives in Codex; release the browser document on every
     // terminal path while leaving other concurrently running tabs untouched.
-    // High is request-owned: the browser worker injects model/effort/connector metadata into the
-    // generated /conversation request. Prewarming those controls through DOM would reintroduce the
-    // exact slider/@mention path this fast route is designed to remove. Keep only the hot document.
-    const requestOwnedHigh = tab.modelId === "gpt-5.6-sol"
-      && (tab.reasoning === undefined || tab.reasoning === "high");
+    // Every selectable Sol/Pro lane is request-owned: the browser worker injects model/effort/
+    // connector metadata into the generated /conversation request. Prewarming those controls
+    // through DOM would reintroduce the exact slider/@mention path this fast route is designed to
+    // remove. Keep only the hot document.
+    const requestOwnedDirectMode = tab.modelId === "gpt-5.6-sol"
+      && (tab.reasoning === undefined
+        || ["low", "medium", "high", "xhigh", "max"].includes(tab.reasoning));
     const modeHint = status === "completed"
-      && !requestOwnedHigh
+      && !requestOwnedDirectMode
       && typeof tab.modelId === "string"
       && tab.modelId
       ? {

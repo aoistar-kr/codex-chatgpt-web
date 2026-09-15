@@ -188,16 +188,20 @@ request body and logs only content-free shape metadata: whether the body was sup
 many JSON string values exactly matched the submitted prompt. The live stream canary enables this
 shadow unless `CODEX_CHATGPT_WEB_STREAM_CANARY_REQUEST_SHADOW=0` is set.
 
-Request-injection primary is enabled by default for eligible simple fresh browser-only turns. Codex
-writes a one-use random placeholder into the normal ChatGPT composer,
-ChatGPT's own SPA builds and submits the request, and the wrapper replaces exactly one matching JSON
-string value immediately before `fetch`. Unsupported body transports, malformed/non-object JSON,
-duplicate value matches, or raw JSON-literal collisions are blocked before network transmission;
-the worker retries through the verified full DOM prompt path only after proving the blocked optimistic
-submission left no new user/assistant turn. Multipart, file, connector, retained-conversation, and
-compaction turns remain on the DOM path. Set `CODEX_CHATGPT_WEB_REQUEST_INJECTION_PRIMARY=0` as an
-explicit rollback kill switch. Use `CODEX_CHATGPT_WEB_STREAM_CANARY_REQUEST_PRIMARY=1` for a live
-Temporary Chat canary.
+Request-injection primary is enabled by default for eligible simple fresh turns. Codex writes a
+one-use random placeholder into the normal ChatGPT composer, ChatGPT's own SPA builds and submits the
+request, and the wrapper replaces exactly one matching JSON string value immediately before `fetch`.
+For every selectable Sol/Pro effort the fresh-turn fast path also owns the exact web wire mode, so it
+can skip the model/effort UI round trip: Instant uses `gpt-5-6` with no `thinking_effort`; Medium,
+High, and Extra High use `gpt-5-6-thinking` with `standard`, `extended`, and `max`; Pro uses
+`gpt-5-6-pro` with `standard`. When Full mode already has a verified cached connector identity, the
+same one-use rewrite can carry that connector metadata without reopening the @mention picker.
+Unsupported body transports, malformed/non-object JSON, duplicate value matches, or raw JSON-literal
+collisions are blocked before network transmission; the worker retries through the verified full DOM
+prompt/model/connector path only after proving the blocked optimistic submission left no new
+user/assistant turn. Multipart, image/file, retained-conversation, and compaction turns remain on the
+DOM-safe path. Set `CODEX_CHATGPT_WEB_REQUEST_INJECTION_PRIMARY=0` as an explicit rollback kill switch.
+Use `CODEX_CHATGPT_WEB_STREAM_CANARY_REQUEST_PRIMARY=1` for a live Temporary Chat canary.
 
 New installs use **Compatibility V1** for cross-backend subagents. **Native** preserves Codex's own
 feature settings and enables plaintext Web-to-Web V2 delegation. Restart Codex and start a new task

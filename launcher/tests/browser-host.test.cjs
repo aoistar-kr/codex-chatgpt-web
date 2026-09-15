@@ -2922,15 +2922,15 @@ test("a real turn discards an incomplete hot prewarm before allocating its brows
   assert.equal(lease.tabId, "fresh");
 });
 
-test("ending a fresh turn queues a replacement hot Temporary Chat surface", async () => {
+test("ending a non-direct fresh turn may prewarm its replacement hot Temporary Chat surface", async () => {
   const tab = {
     id: "tab-ended",
     traceId: "trace_ended",
     helperPid: 555,
     conversationKey: undefined,
     connectorIdentity: undefined,
-    modelId: "gpt-5.6-sol",
-    reasoning: "medium",
+    modelId: "gpt-5.6-luna",
+    reasoning: "low",
     status: "running",
     view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {} } },
   };
@@ -2966,49 +2966,51 @@ test("ending a fresh turn queues a replacement hot Temporary Chat surface", asyn
 
   assert.deepEqual(release, { cancelledByUser: false });
   assert.deepEqual(queued, [["turn_released", {
-    modelId: "gpt-5.6-sol",
-    reasoning: "medium",
+    modelId: "gpt-5.6-luna",
+    reasoning: "low",
   }]]);
 });
 
-test("ending a High turn queues only a hydrated hot Temporary surface with no DOM mode prewarm", async () => {
-  const tab = {
-    id: "tab-high-ended",
-    traceId: "trace_high_ended",
-    helperPid: 556,
-    conversationKey: undefined,
-    connectorIdentity: "Codex Native2",
-    modelId: "gpt-5.6-sol",
-    reasoning: "high",
-    status: "running",
-    view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {} } },
-  };
-  const queued = [];
-  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
-    closedTurnOwners: new Map(),
-    userCancelledTurnOwners: new Map(),
-    removeTurnTab(candidate) { this.turnTabs.delete(candidate.id); },
-    queueHotTemporarySurface(reason, modeHint) { queued.push([reason, modeHint]); },
-    turnTabs: new Map([[tab.id, tab]]),
-    syncPowerSaveBlocker() {},
-    publishState() {},
-    snapshot: () => ({ tabs: [] }),
-    logger: { info() {} },
-  });
+test("every direct Sol/Pro effort keeps only a hydrated hot surface with no DOM mode prewarm", async () => {
+  for (const reasoning of ["low", "medium", "high", "xhigh", "max"]) {
+    const tab = {
+      id: `tab-${reasoning}-ended`,
+      traceId: `trace_${reasoning}_ended`,
+      helperPid: 556,
+      conversationKey: undefined,
+      connectorIdentity: "Codex Native2",
+      modelId: "gpt-5.6-sol",
+      reasoning,
+      status: "running",
+      view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {} } },
+    };
+    const queued = [];
+    const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+      closedTurnOwners: new Map(),
+      userCancelledTurnOwners: new Map(),
+      removeTurnTab(candidate) { this.turnTabs.delete(candidate.id); },
+      queueHotTemporarySurface(reasonValue, modeHint) { queued.push([reasonValue, modeHint]); },
+      turnTabs: new Map([[tab.id, tab]]),
+      syncPowerSaveBlocker() {},
+      publishState() {},
+      snapshot: () => ({ tabs: [] }),
+      logger: { info() {} },
+    });
 
-  const release = await BrowserHost.prototype.endTurn.call(
-    fixture,
-    "trace_high_ended",
-    556,
-    "completed",
-    false,
-    undefined,
-    false,
-    true,
-  );
+    const release = await BrowserHost.prototype.endTurn.call(
+      fixture,
+      tab.traceId,
+      556,
+      "completed",
+      false,
+      undefined,
+      false,
+      true,
+    );
 
-  assert.deepEqual(release, { cancelledByUser: false });
-  assert.deepEqual(queued, [["turn_released", undefined]]);
+    assert.deepEqual(release, { cancelledByUser: false });
+    assert.deepEqual(queued, [["turn_released", undefined]], reasoning);
+  }
 });
 
 test("a required retained conversation fails before creating a browser tab", () => {

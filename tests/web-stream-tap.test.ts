@@ -699,6 +699,29 @@ test("page request injector directly synthesizes the observed High plus connecto
   await injector.close();
 });
 
+test("page request injector removes stale thinking effort for the Instant direct lane", async () => {
+  const fixture = pageRequestInjectorFixture();
+  const placeholder = "__PLACEHOLDER__";
+  const injector = await ChatGptRequestInjector.install(
+    fixture.page,
+    "trace_direct_instant",
+    placeholder,
+    "actual prompt",
+    { mode: { model: "gpt-5-6" } },
+  );
+  await fixture.fetchConversation(JSON.stringify({
+    model: "gpt-5-6-thinking",
+    thinking_effort: "max",
+    messages: [{ content: { parts: [placeholder] }, metadata: {} }],
+  }));
+  await injector.assertRewriteAttempt(1_000);
+  const rewritten = JSON.parse(String(fixture.sent[0]?.init?.body));
+  expect(rewritten.model).toBe("gpt-5-6");
+  expect(rewritten).not.toHaveProperty("thinking_effort");
+  expect(rewritten.messages[0].content.parts).toEqual(["actual prompt"]);
+  await injector.close();
+});
+
 test("page request injector refuses to overwrite conflicting connector metadata", async () => {
   const fixture = pageRequestInjectorFixture();
   const placeholder = "__PLACEHOLDER__";

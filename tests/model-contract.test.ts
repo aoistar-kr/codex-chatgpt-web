@@ -1,5 +1,26 @@
 import { expect, test } from "bun:test";
-import { CHATGPT_WEB_LUNA_MODEL_ID, CHATGPT_WEB_MODEL_ID, resolveChatGptWebModelMode } from "../src/adapters/chatgpt-web/model";
+import {
+  CHATGPT_WEB_LUNA_MODEL_ID,
+  CHATGPT_WEB_MODEL_ID,
+  resolveChatGptDirectRequestMode,
+  resolveChatGptWebModelMode,
+} from "../src/adapters/chatgpt-web/model";
+
+test("direct request mode maps every selectable effort to the captured ChatGPT wire lane", () => {
+  expect(resolveChatGptDirectRequestMode("low")).toEqual({ model: "gpt-5-6" });
+  expect(resolveChatGptDirectRequestMode("medium")).toEqual({
+    model: "gpt-5-6-thinking", thinkingEffort: "standard",
+  });
+  expect(resolveChatGptDirectRequestMode("high")).toEqual({
+    model: "gpt-5-6-thinking", thinkingEffort: "extended",
+  });
+  expect(resolveChatGptDirectRequestMode("xhigh")).toEqual({
+    model: "gpt-5-6-thinking", thinkingEffort: "max",
+  });
+  expect(resolveChatGptDirectRequestMode("max")).toEqual({
+    model: "gpt-5-6-pro", thinkingEffort: "standard",
+  });
+});
 
 test("the browser adapter maps fixed routed efforts to the visible ChatGPT modes", () => {
   const capabilities = { localToolsEnabled: true, solAvailable: true, proAvailable: true };

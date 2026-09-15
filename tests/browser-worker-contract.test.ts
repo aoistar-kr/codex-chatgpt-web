@@ -283,6 +283,7 @@ test("a hot-surface mode proof skips only the matching initial effort selection"
   const runBrowserTurn = workerSource.slice(workerSource.indexOf("  private async runBrowserTurn("));
   const helper = readFileSync(new URL("../src/adapters/chatgpt-web/browser-helper-main.ts", import.meta.url), "utf8");
   const launcherHelper = readFileSync(new URL("../launcher/electron/browser-helper-verifier.cjs", import.meta.url), "utf8");
+  const launcherHost = readFileSync(new URL("../launcher/electron/browser-host.cjs", import.meta.url), "utf8");
 
   expect(runExclusive).toContain("modelId: turn.modelId");
   expect(runExclusive).toContain("reasoning: turn.reasoning");
@@ -291,10 +292,12 @@ test("a hot-surface mode proof skips only the matching initial effort selection"
     "prewarmedMode,",
   );
   expect(runBrowserTurn).toContain(
-    "if (turnPlan.initialEffortSelectionRequired && !directHighMode)",
+    "if (turnPlan.initialEffortSelectionRequired && !directModeRequested)",
   );
-  expect(runBrowserTurn).toContain('mode: { model: "gpt-5-6-thinking", thinkingEffort: "extended" }');
+  expect(runBrowserTurn).toContain("resolveChatGptDirectRequestMode(requestedMode.effort)");
+  expect(runBrowserTurn).toContain("mode: directRequestMode");
   expect(runBrowserTurn).toContain("connector: { pluginId: connectorPluginId!, appName: this.config.appName }");
+  expect(launcherHost).toContain('["low", "medium", "high", "xhigh", "max"].includes(tab.reasoning)');
   expect(helper).toContain('type: "prewarm"');
   expect(helper).toContain('message.type === "prewarm"');
   expect(helper).toContain("worker.prewarmMode(");

@@ -21,6 +21,32 @@ export interface ChatGptWebModelMode {
   localTools: boolean;
 }
 
+export interface ChatGptDirectRequestMode {
+  model: string;
+  thinkingEffort?: string;
+}
+
+/** Captured ChatGPT Web /conversation wire mapping for the five selectable Sol/Pro lanes. */
+export function resolveChatGptDirectRequestMode(
+  effort: ChatGptWebModelMode["effort"],
+): ChatGptDirectRequestMode {
+  switch (effort) {
+    case "low":
+      // Instant is a separate model lane and intentionally carries no thinking_effort field.
+      return { model: "gpt-5-6" };
+    case "medium":
+      return { model: "gpt-5-6-thinking", thinkingEffort: "standard" };
+    case "high":
+      return { model: "gpt-5-6-thinking", thinkingEffort: "extended" };
+    case "xhigh":
+      return { model: "gpt-5-6-thinking", thinkingEffort: "max" };
+    case "max":
+      return { model: "gpt-5-6-pro", thinkingEffort: "standard" };
+  }
+  const unsupportedEffort: never = effort;
+  throw new Error(`ChatGPT direct request effort is unsupported: ${unsupportedEffort}`);
+}
+
 export function resolveChatGptWebModelMode(
   modelId: string,
   reasoning: string | undefined,

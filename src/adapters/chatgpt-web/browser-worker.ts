@@ -26,6 +26,7 @@ import {
 import {
   CHATGPT_WEB_LUNA_MODEL_ID,
   CHATGPT_WEB_MODEL_ID,
+  resolveChatGptDirectRequestMode,
   resolveChatGptWebModelMode,
   type ChatGptWebCapabilities,
   type ChatGptWebModelMode,
@@ -4879,13 +4880,15 @@ export class ChatGptBrowserWorker {
           ),
         );
       }
-      const directHighMode = turnPlan.requestInjection === "primary"
+      const directRequestMode = turnPlan.requestInjection === "primary"
         && !reuseConversation
         && turn.modelId === CHATGPT_WEB_MODEL_ID
-        && requestedMode.effort === "high"
         && !prepared.multipart
-        && prepared.images.length === 0;
-      const directConnectorRequested = directHighMode
+        && prepared.images.length === 0
+        ? resolveChatGptDirectRequestMode(requestedMode.effort)
+        : undefined;
+      const directModeRequested = directRequestMode !== undefined;
+      const directConnectorRequested = directModeRequested
         && requestedMode.localTools
         && !prewarmedConnector;
       if (directConnectorRequested
@@ -4895,7 +4898,7 @@ export class ChatGptBrowserWorker {
       }
       const directConnectorMetadata = directConnectorRequested;
       let mode = requestedMode;
-      if (turnPlan.initialEffortSelectionRequired && !directHighMode) {
+      if (turnPlan.initialEffortSelectionRequired && !directModeRequested) {
         mode = await this.runStage(turn.traceId, "effort_selection", browserStageTimeouts.effortSelection, () => (
           this.selectModelAndEffort(
             page,
@@ -5006,8 +5009,8 @@ export class ChatGptBrowserWorker {
             turn.traceId,
             placeholder,
             finalPrompt,
-            directHighMode ? {
-              mode: { model: "gpt-5-6-thinking", thinkingEffort: "extended" },
+            directModeRequested ? {
+              mode: directRequestMode,
               ...(directConnectorMetadata ? {
                 connector: { pluginId: connectorPluginId!, appName: this.config.appName },
               } : {}),
@@ -5020,7 +5023,7 @@ export class ChatGptBrowserWorker {
             `[chatgpt-web] browser turn ${turn.traceId} could not enable request injection; using DOM prompt path:`
             + ` ${redactChatGptUiDiagnostic(error instanceof Error ? error.message : String(error))}`,
           );
-          if (directHighMode) {
+          if (directModeRequested) {
             mode = await this.runStage(turn.traceId, "effort_selection_install_fallback", browserStageTimeouts.effortSelection, () => (
               this.selectModelAndEffort(page, turn.modelId, requestedMode.effort, browserCapabilities)
             ));
@@ -5226,7 +5229,7 @@ export class ChatGptBrowserWorker {
         requestInjector = undefined;
         requestInjectionCdpInjector = undefined;
         await this.clearChatGptComposerState(page);
-        if (directHighMode) {
+        if (directModeRequested) {
           mode = await this.runStage(turn.traceId, "effort_selection_fallback", browserStageTimeouts.effortSelection, () => (
             this.selectModelAndEffort(page, turn.modelId, requestedMode.effort, browserCapabilities)
           ));
