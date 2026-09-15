@@ -82,7 +82,9 @@ export function resolveChatGptTurnPlan(input: ChatGptTurnPlanInput): ChatGptTurn
   const networkPrimary = input.features.networkStreamPrimary
     && (input.requestedEffort === "low"
       || input.requestedEffort === "medium"
-      || input.requestedEffort === "high")
+      || input.requestedEffort === "high"
+      || input.requestedEffort === "xhigh"
+      || input.requestedEffort === "max")
     && !input.captureLunaCheckpoint;
 
   // H5 recovery is intentionally narrower than ordinary DOM observation because it must stay on

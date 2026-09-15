@@ -164,10 +164,10 @@ Settings can also cancel a retained browser turn or remove the Codex integration
 Set `CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS=1` only when every browser checkpoint needs a screenshot.
 
 The Temporary Chat network stream observer is enabled by default and can be disabled with
-`CODEX_CHATGPT_WEB_NETWORK_STREAM_SHADOW=0`. Network-primary return is also enabled by default inside
-its low/medium/high, no-local-tools, non-Luna-checkpoint eligibility boundary, so a definitive
-captured SSE answer can return without waiting for ChatGPT's final DOM controls. Extra-high/max and
-other ineligible turns remain on DOM/shadow authority. Set `CODEX_CHATGPT_WEB_NETWORK_STREAM_PRIMARY=0`
+`CODEX_CHATGPT_WEB_NETWORK_STREAM_SHADOW=0`. Network-primary return is also enabled by default for
+all selectable efforts (Instant, Medium, High, Extra High, and Pro) inside its non-Luna-checkpoint
+eligibility boundary, so a definitive captured SSE answer can return without waiting for ChatGPT's
+final DOM controls. Set `CODEX_CHATGPT_WEB_NETWORK_STREAM_PRIMARY=0`
 as an explicit rollback kill switch.
 
 Incomplete-capture recovery is enabled by default for its narrow eligible launcher-owned simple-turn

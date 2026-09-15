@@ -7,9 +7,8 @@ export function chatGptNetworkStreamShadowEnabled(
 export function chatGptNetworkStreamPrimaryEnabled(
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): boolean {
-  // Production default is ON inside the existing TurnPlan eligibility boundary. High/xhigh/max,
-  // tool turns, and Luna-checkpoint turns still stay on DOM/shadow authority unless separately
-  // proven eligible. Keep an explicit kill switch for rollback.
+  // Production default is ON for every selectable Sol/Pro effort inside the TurnPlan boundary.
+  // Luna-checkpoint turns still stay on DOM/shadow authority. Keep an explicit kill switch for rollback.
   return env.CODEX_CHATGPT_WEB_NETWORK_STREAM_PRIMARY !== "0";
 }
 

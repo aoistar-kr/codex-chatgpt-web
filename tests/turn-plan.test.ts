@@ -154,7 +154,7 @@ test("CDP request-injection primary is a dedicated canary and never competes wit
   expect(plan({ reuseConversation: true, features: { requestInjectionCdpPrimary: true } }).requestInjectionCdpPrimary).toBeFalse();
 });
 
-test("network plan keeps primary low/medium/high while passive shadow remains independently available", () => {
+test("network plan keeps primary enabled across every selectable effort while passive shadow remains independently available", () => {
   const cases: Array<{
     name: string;
     input: Parameters<typeof plan>[0];
@@ -184,14 +184,14 @@ test("network plan keeps primary low/medium/high while passive shadow remains in
       expected: "primary",
     },
     {
-      name: "extra-high is off without shadow",
+      name: "extra-high primary",
       input: { requestedEffort: "xhigh", features: { networkStreamPrimary: true } },
-      expected: "off",
+      expected: "primary",
     },
     {
-      name: "max is off without shadow",
+      name: "Pro/max primary",
       input: { requestedEffort: "max", features: { networkStreamPrimary: true } },
-      expected: "off",
+      expected: "primary",
     },
     {
       name: "multipart does not block medium primary",
@@ -327,14 +327,16 @@ test("incomplete-capture recovery is admitted only for one passive launcher-owne
   ];
   for (const input of blocked) expect(plan(input).incompleteCaptureRecovery).toBeFalse();
 
-  // High now resolves network-primary too, so the same no-competing-H5 rule applies as low/medium.
-  expect(plan({
-    launcherOwnedSurface: true,
-    requestedEffort: "high",
-    features: {
-      networkStreamPrimary: true,
-      networkStreamShadow: true,
-      incompleteCaptureRecovery: true,
-    },
-  })).toMatchObject({ networkStream: "primary", incompleteCaptureRecovery: false });
+  // Every selectable Sol/Pro effort resolves network-primary, so H5 recovery must never compete.
+  for (const requestedEffort of ["high", "xhigh", "max"] as const) {
+    expect(plan({
+      launcherOwnedSurface: true,
+      requestedEffort,
+      features: {
+        networkStreamPrimary: true,
+        networkStreamShadow: true,
+        incompleteCaptureRecovery: true,
+      },
+    })).toMatchObject({ networkStream: "primary", incompleteCaptureRecovery: false });
+  }
 });
