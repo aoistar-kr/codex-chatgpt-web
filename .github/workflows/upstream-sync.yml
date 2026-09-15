@@ -1,0 +1,193 @@
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: webgpt-upstream-sync
+  cancel-in-progress: false
+
+env:
+  CUSTOM_BRANCH: custom
+  UPSTREAM_REPOSITORY: miuuyy/codex-chatgpt-web
+
+jobs:
+  integrate:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    outputs:
+      changed: ${{ steps.detect.outputs.changed }}
+      sha: ${{ steps.publish.outputs.sha }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.artifact.outputs.version }}
+    steps:
+      - name: Checkout custom branch
+        uses: actions/checkout@v4
+        with:
+          ref: custom
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+
+      - name: Configure upstream
+        shell: pwsh
+        run: |
+          $remotes = @(git remote)
+          if ($remotes -contains 'upstream') {
+            git remote set-url upstream "https://github.com/$env:UPSTREAM_REPOSITORY.git"
+          } else {
+            git remote add upstream "https://github.com/$env:UPSTREAM_REPOSITORY.git"
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Could not configure upstream remote' }
+
+      - name: Resolve latest stable upstream release
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = (gh api "repos/$env:UPSTREAM_REPOSITORY/releases/latest" --jq '.tag_name').Trim()
+          if (-not $tag) { throw 'Upstream latest release returned no tag' }
+          if ($tag -match '-') { throw "releases/latest returned prerelease-like tag $tag" }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Fetch exact release tag
+        id: detect
+        shell: pwsh
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          $ref = "refs/remotes/upstream-release/$env:TAG"
+          git fetch --no-tags --force upstream "refs/tags/$env:TAG`:$ref"
+          if ($LASTEXITCODE -ne 0) { throw "Could not fetch upstream tag $env:TAG" }
+          git merge-base --is-ancestor $ref HEAD
+          if ($LASTEXITCODE -eq 0) {
+            'changed=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host "$env:TAG is already integrated"
+          } elseif ($LASTEXITCODE -eq 1) {
+            'changed=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            throw 'git merge-base failed'
+          }
+
+      - name: Merge upstream release without auto-resolution
+        if: steps.detect.outputs.changed == 'true'
+        shell: pwsh
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          $ref = "refs/remotes/upstream-release/$env:TAG"
+          git merge --no-ff --no-commit $ref
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'Upstream merge conflict. Refusing automatic resolution or deployment.'
+            git diff --name-only --diff-filter=U
+            git merge --abort
+            exit 1
+          }
+
+      - name: Install locked dependencies
+        if: steps.detect.outputs.changed == 'true'
+        shell: pwsh
+        run: |
+          bun install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw 'Root dependency install failed' }
+          Push-Location launcher
+          try {
+            bun install --frozen-lockfile
+            if ($LASTEXITCODE -ne 0) { throw 'Launcher dependency install failed' }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Prepare AVX2-independent Windows runtime
+        if: steps.detect.outputs.changed == 'true'
+        shell: pwsh
+        run: ./scripts/prepare-windows-baseline-bun.ps1 -Version 1.4.0 -GitHubEnv $env:GITHUB_ENV
+
+      - name: Fail-closed verification
+        if: steps.detect.outputs.changed == 'true'
+        shell: pwsh
+        run: |
+          bun run verify
+          if ($LASTEXITCODE -ne 0) { throw 'WebGPT verification failed' }
+          bun run app:package
+          if ($LASTEXITCODE -ne 0) { throw 'Windows launcher packaging failed' }
+          bun run app:smoke
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged launcher smoke failed' }
+          git diff --exit-code
+          if ($LASTEXITCODE -ne 0) { throw 'Verification modified tracked source files' }
+
+      - name: Locate validated installer
+        if: steps.detect.outputs.changed == 'true'
+        id: artifact
+        shell: pwsh
+        run: |
+          $version = (node -p "require('./launcher/package.json').version").Trim()
+          if (-not $version) { throw 'Could not resolve launcher version' }
+          $installer = Join-Path 'launcher/artifacts' "codex-web-gpt-$version-win-x64.exe"
+          if (-not (Test-Path -LiteralPath $installer)) { throw "Validated installer is missing: $installer" }
+          "installer=$installer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Commit and push integrated release
+        if: steps.detect.outputs.changed == 'true'
+        id: publish
+        shell: pwsh
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git status --short
+          git commit -m "chore(upstream): integrate $env:TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not commit integrated upstream release' }
+          $sha = (git rev-parse HEAD).Trim()
+          git push origin "HEAD:$env:CUSTOM_BRANCH"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not push integrated custom branch' }
+          "sha=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Upload validated Windows installer
+        if: steps.detect.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: webgpt-${{ steps.release.outputs.tag }}
+          path: ${{ steps.artifact.outputs.installer }}
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    needs: integrate
+    if: needs.integrate.outputs.changed == 'true'
+    runs-on: [self-hosted, Windows, X64, webgpt-deploy]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.integrate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Download validated installer
+        uses: actions/download-artifact@v4
+        with:
+          name: webgpt-${{ needs.integrate.outputs.tag }}
+          path: .cicd-installer
+
+      - name: Install local WebGPT with rollback
+        shell: pwsh
+        env:
+          EXPECTED_VERSION: ${{ needs.integrate.outputs.version }}
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath .cicd-installer -Filter *.exe -File)
+          if ($installers.Count -ne 1) { throw "Expected exactly one WebGPT installer, found $($installers.Count)" }
+          ./scripts/cicd/deploy-local-windows.ps1 -InstallerPath $installers[0].FullName -ExpectedVersion $env:EXPECTED_VERSION
