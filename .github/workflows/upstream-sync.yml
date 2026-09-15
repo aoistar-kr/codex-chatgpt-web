@@ -137,6 +137,12 @@ jobs:
         shell: pwsh
         run: ./scripts/prepare-windows-baseline-bun.ps1 -Version 1.4.0 -GitHubEnv $env:GITHUB_ENV
 
+      - name: Custom invariant regression gate
+        if: steps.detect.outputs.changed == 'true'
+        shell: pwsh
+        run: |
+          bun run test:custom-invariants
+          if ($LASTEXITCODE -ne 0) { throw 'Custom WebGPT invariant regression detected' }
       - name: Fail-closed verification
         if: steps.detect.outputs.changed == 'true'
         shell: pwsh
