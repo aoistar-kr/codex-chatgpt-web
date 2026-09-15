@@ -71,21 +71,45 @@ policies.
 
 ## Quick start
 
-Install or update the desktop launcher. To update or repair an existing installation, quit the
-launcher and run the same command again; it replaces the application and embedded runtime while
-preserving the ChatGPT profile and launcher configuration.
+> [!IMPORTANT]
+> This fork's **`custom` branch is the installation source of truth**. Install from
+> `aoistar-kr/codex-chatgpt-web@custom`; do not substitute the upstream
+> `miuuyy/codex-chatgpt-web` release installer when you want the custom WebGPT implementation.
 
-**macOS or Linux**
+### Windows — install this fork from source
 
-```bash
-curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
-```
-
-**Windows PowerShell**
+Requirements: Git, 64-bit Windows, and **Bun 1.4.0**.
 
 ```powershell
-irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+git clone --branch custom --single-branch https://github.com/aoistar-kr/codex-chatgpt-web.git
+Set-Location codex-chatgpt-web
+
+bun install --frozen-lockfile
+Push-Location launcher
+bun install --frozen-lockfile
+Pop-Location
+
+bun run app:package
+
+$Installer = Get-ChildItem .\launcher\artifacts\codex-web-gpt-*-win-x64.exe |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
+if (-not $Installer) { throw "Windows installer was not produced" }
+
+$Process = Start-Process -FilePath $Installer.FullName -ArgumentList "/S", "/currentuser" -Wait -PassThru
+if ($Process.ExitCode -ne 0) { throw "Installer exited with code $($Process.ExitCode)" }
 ```
+
+For an existing clone, update only from this fork's `custom` branch before rebuilding:
+
+```powershell
+git fetch origin custom
+git switch custom
+git pull --ff-only origin custom
+```
+
+Quit **Codex Web GPT** before reinstalling or updating the packaged app. The installer preserves the
+launcher-owned ChatGPT profile and launcher configuration.
 
 Then complete the three checks in the app:
 
@@ -99,18 +123,21 @@ The launcher detects the current account's ChatGPT controls during setup: Free/G
 only Luna, while Pro appears only when the signed-in account exposes it. The separate **MCP** page
 is optional and guides the full-harness setup without terminal commands.
 
-The packaged launcher keeps sign-in and ChatGPT model turns in its embedded browser. It needs no
-model API key, installed Chrome/Chromium, system Node/Bun, or project-managed browser download.
+The packaged launcher keeps sign-in and ChatGPT model turns in its embedded browser. Once packaged,
+the installed app needs no model API key, installed Chrome/Chromium, system Node/Bun, or
+project-managed browser download. Bun is required only to build this fork from source.
 
-**Run from source**
+### Run this fork directly from source
 
 ```bash
-git clone https://github.com/miuuyy/codex-chatgpt-web.git && \
+git clone --branch custom --single-branch https://github.com/aoistar-kr/codex-chatgpt-web.git && \
 cd codex-chatgpt-web && \
 bun run app
 ```
 
-This source path requires Bun 1.4.0. The command installs locked dependencies and opens the app.
+This development path requires Bun 1.4.0. The command installs the locked root and launcher
+dependencies and opens the launcher in development mode; use the Windows installation procedure
+above when you want the packaged desktop app installed from the current custom source.
 
 ## Modes
 
