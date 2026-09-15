@@ -56,7 +56,7 @@ jobs:
         run: |
           $tag = (gh api "repos/$env:UPSTREAM_REPOSITORY/releases/latest" --jq '.tag_name').Trim()
           if (-not $tag) { throw 'Upstream latest release returned no tag' }
-          if ($tag -match '-') { throw "releases/latest returned prerelease-like tag $tag" }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "latest release tag is not stable semver: $tag" }
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Fetch exact release tag
@@ -70,16 +70,39 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Could not fetch upstream tag $env:TAG" }
           git merge-base --is-ancestor $ref HEAD
           if ($LASTEXITCODE -eq 0) {
-            'changed=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-            Write-Host "$env:TAG is already integrated"
+            $integrated = $true
+            $needsMerge = $false
           } elseif ($LASTEXITCODE -eq 1) {
-            'changed=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            $integrated = $false
+            $needsMerge = $true
           } else {
             throw 'git merge-base failed'
           }
 
+          $marker = "refs/tags/cicd-deployed-$env:TAG"
+          git ls-remote --exit-code --tags origin $marker *> $null
+          $markerStatus = $LASTEXITCODE
+          if ($markerStatus -eq 0) {
+            $deployed = $true
+          } elseif ($markerStatus -eq 2) {
+            $deployed = $false
+          } else {
+            throw "Could not query deployment marker $marker (exit $markerStatus)"
+          }
+          if ($deployed -and -not $integrated) {
+            throw "Deployment marker exists but $env:TAG is not integrated into custom"
+          }
+          "merge=$($needsMerge.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if ($deployed) {
+            'changed=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host "$env:TAG is already integrated and deployed"
+          } else {
+            'changed=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host "$env:TAG requires validation/deployment (merge=$needsMerge)"
+          }
+
       - name: Merge upstream release without auto-resolution
-        if: steps.detect.outputs.changed == 'true'
+        if: steps.detect.outputs.merge == 'true'
         shell: pwsh
         env:
           TAG: ${{ steps.release.outputs.tag }}
@@ -139,19 +162,22 @@ jobs:
           "installer=$installer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Commit and push integrated release
+      - name: Publish validated candidate identity
         if: steps.detect.outputs.changed == 'true'
         id: publish
         shell: pwsh
         env:
           TAG: ${{ steps.release.outputs.tag }}
+          NEEDS_MERGE: ${{ steps.detect.outputs.merge }}
         run: |
-          git status --short
-          git commit -m "chore(upstream): integrate $env:TAG"
-          if ($LASTEXITCODE -ne 0) { throw 'Could not commit integrated upstream release' }
+          if ($env:NEEDS_MERGE -eq 'true') {
+            git status --short
+            git commit -m "chore(upstream): integrate $env:TAG"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not commit integrated upstream release' }
+            git push origin "HEAD:$env:CUSTOM_BRANCH"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not push integrated custom branch' }
+          }
           $sha = (git rev-parse HEAD).Trim()
-          git push origin "HEAD:$env:CUSTOM_BRANCH"
-          if ($LASTEXITCODE -ne 0) { throw 'Could not push integrated custom branch' }
           "sha=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Upload validated Windows installer
@@ -191,3 +217,35 @@ jobs:
           $installers = @(Get-ChildItem -LiteralPath .cicd-installer -Filter *.exe -File)
           if ($installers.Count -ne 1) { throw "Expected exactly one WebGPT installer, found $($installers.Count)" }
           ./scripts/cicd/deploy-local-windows.ps1 -InstallerPath $installers[0].FullName -ExpectedVersion $env:EXPECTED_VERSION
+
+  mark-deployed:
+    needs: [integrate, deploy]
+    if: needs.integrate.outputs.changed == 'true' && needs.deploy.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout custom branch
+        uses: actions/checkout@v4
+        with:
+          ref: custom
+          fetch-depth: 0
+
+      - name: Record successful local deployment
+        shell: bash
+        env:
+          TAG: ${{ needs.integrate.outputs.tag }}
+          SHA: ${{ needs.integrate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          marker="cicd-deployed-${TAG}"
+          existing="$(git ls-remote --tags origin "refs/tags/${marker}" | awk '{print $1}')"
+          if [[ -n "$existing" ]]; then
+            [[ "$existing" == "$SHA" ]] || { echo "::error::Deployment marker points to $existing, expected $SHA"; exit 1; }
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$marker" "$SHA"
+          git push origin "refs/tags/${marker}"
