@@ -701,8 +701,10 @@ test("concurrent embedded login requests share one authentication operation", as
   let resolveLogin;
   let waits = 0;
   let inspections = 0;
+  const hotReasons = [];
   const fixture = {
     state: { authenticated: false },
+    manualOperation: null,
     authNavigationError: null,
     loginOperation: null,
     show() {},
@@ -724,7 +726,18 @@ test("concurrent embedded login requests share one authentication operation", as
       inspections += 1;
     },
     activateHomeSurface() {},
-    withManualOperation: async (_name, action) => await action(),
+    withManualOperation: async (name, action) => {
+      fixture.manualOperation = name;
+      try {
+        return await action();
+      } finally {
+        fixture.manualOperation = null;
+      }
+    },
+    queueHotTemporarySurface: (reason) => {
+      assert.equal(fixture.manualOperation, null);
+      hotReasons.push(reason);
+    },
   };
   const first = BrowserHost.prototype.openLogin.call(fixture);
   const second = BrowserHost.prototype.openLogin.call(fixture);
@@ -734,6 +747,40 @@ test("concurrent embedded login requests share one authentication operation", as
   resolveLogin({ authenticated: true });
   assert.deepEqual(await first, { authenticated: true });
   assert.equal(inspections, 1);
+  assert.deepEqual(hotReasons, ["login_complete"]);
+});
+
+test("successful passkey login queues the first hot Temporary surface only after manual ownership ends", async () => {
+  const hotReasons = [];
+  const fixture = {
+    state: { authenticated: false },
+    manualOperation: null,
+    loginOperation: null,
+    sessionRefreshOperation: null,
+    authNavigationError: null,
+    setState() {},
+    logger: { info() {} },
+    snapshot: () => ({ authenticated: true }),
+    loginWithPasskey: async () => ({ transfer: true }),
+    installPasskeyLogin: async () => ({ authenticated: true }),
+    withManualOperation: async (name, action) => {
+      fixture.manualOperation = name;
+      try {
+        return await action();
+      } finally {
+        fixture.manualOperation = null;
+      }
+    },
+    queueHotTemporarySurface: (reason) => {
+      assert.equal(fixture.manualOperation, null);
+      hotReasons.push(reason);
+    },
+  };
+
+  const state = await BrowserHost.prototype.openPasskeyLogin.call(fixture);
+
+  assert.deepEqual(state, { authenticated: true });
+  assert.deepEqual(hotReasons, ["passkey_login_complete"]);
 });
 
 test("explicit login waits for an in-flight saved-session refresh before taking browser ownership", async () => {
@@ -1271,6 +1318,7 @@ test("connector verification is effort-independent and works while the browser s
     descriptorPath: "/runtime/launcher-browser.json",
     logger: { info: (event, detail) => calls.push(["log", event, detail]) },
     setState: (patch) => calls.push(["state", patch]),
+    setConnectorPluginId: (pluginId) => calls.push(["cache", pluginId]),
     show: () => calls.push(["show"]),
     refreshChatGptHomeDocument: async () => calls.push(["refresh"]),
     selectHighEffort: async () => {
@@ -1278,13 +1326,14 @@ test("connector verification is effort-independent and works while the browser s
     },
     verifyConnectorWithBrowserHelper: async (options) => {
       calls.push(["helper", options]);
-      return { ok: true, appName: options.appName };
+      return { ok: true, appName: options.appName, pluginId: "plugin:0123456789abcdef" };
     },
   };
 
   const result = await BrowserHost.prototype.runConnectorVerification.call(fixture, "Codex Native2");
 
-  assert.deepEqual(result, { ok: true, appName: "Codex Native2" });
+  assert.deepEqual(result, { ok: true, appName: "Codex Native2", pluginId: "plugin:0123456789abcdef" });
+  assert.deepEqual(calls.find(([type]) => type === "cache"), ["cache", "plugin:0123456789abcdef"]);
   assert.equal(calls.some(([type]) => type === "show"), false);
   assert.deepEqual(
     calls.filter(([type]) => ["refresh", "helper"].includes(type)),
@@ -1634,6 +1683,7 @@ test("launcher session refresh resolves persisted authentication before setup ac
   const calls = [];
   const fixture = {
     state: { authenticated: false },
+    manualOperation: null,
     snapshot: () => ({ authenticated: true }),
     setState: (patch) => calls.push(["state", patch]),
     probeAuthentication: async () => {
@@ -1642,7 +1692,16 @@ test("launcher session refresh resolves persisted authentication before setup ac
     },
     withManualOperation: async (name, action) => {
       calls.push(["operation", name]);
-      return await action();
+      fixture.manualOperation = name;
+      try {
+        return await action();
+      } finally {
+        fixture.manualOperation = null;
+      }
+    },
+    queueHotTemporarySurface: (reason) => {
+      assert.equal(fixture.manualOperation, null);
+      calls.push(["hot", reason]);
     },
     view: {
       webContents: {
@@ -1661,7 +1720,30 @@ test("launcher session refresh resolves persisted authentication before setup ac
     ["load", "https://chatgpt.com/?temporary-chat=true"],
     ["probe"],
     ["state", { status: "ready", message: "ChatGPT is ready" }],
+    ["hot", "session_refresh_complete"],
   ]);
+});
+
+test("launcher session refresh does not queue a hot Temporary surface without authenticated proof", async () => {
+  const hotReasons = [];
+  const fixture = {
+    state: { authenticated: false },
+    sessionRefreshOperation: null,
+    snapshot: () => ({ authenticated: false }),
+    setState() {},
+    probeAuthentication: async () => ({ authenticated: false }),
+    withManualOperation: async (_name, action) => await action(),
+    queueHotTemporarySurface: (reason) => hotReasons.push(reason),
+    view: { webContents: {
+      getURL: () => "https://chatgpt.com/?temporary-chat=true",
+      loadURL: async () => {},
+    } },
+  };
+
+  const state = await BrowserHost.prototype.refreshAuthentication.call(fixture);
+
+  assert.deepEqual(state, { authenticated: false });
+  assert.deepEqual(hotReasons, []);
 });
 
 test("concurrent launcher session refresh requests share one browser operation", async () => {
@@ -1739,7 +1821,7 @@ test("manual operations show the home surface without discarding retained task t
   assert.deepEqual(events, ["visibility", "focus", "publish", "descriptor"]);
 });
 
-test("selected home surface remains represented while task tabs are retained", () => {
+test("internal home surface stays hidden while task tabs remain user-visible", () => {
   const { webContents } = createContents();
   const taskTab = { id: "tab-ready", traceId: "trace_ready" };
   const fixture = {
@@ -1762,8 +1844,8 @@ test("selected home surface remains represented while task tabs are retained", (
   const snapshot = BrowserHost.prototype.snapshot.call(fixture);
 
   assert.equal(snapshot.activeTabId, "home");
-  assert.deepEqual(snapshot.tabs.map((tab) => tab.id), ["home", "tab-ready"]);
-  assert.equal(snapshot.tabs[0].active, true);
+  assert.deepEqual(snapshot.tabs.map((tab) => tab.id), ["tab-ready"]);
+  assert.equal(snapshot.tabs[0].active, false);
 });
 
 test("selecting a task tab shows and focuses its owned Playwright surface", () => {
@@ -2059,6 +2141,876 @@ test("a connector conversation is not reused until its connector was bound", () 
   );
 });
 
+test("hot Temporary Chat prewarm commits a fresh owned document before making it leaseable", async () => {
+  let currentUrl = IDLE_BROWSER_URL;
+  let throttled = false;
+  let createArgs;
+  const tab = {
+    id: "hot-new",
+    traceId: "hot_unused",
+    surfaceId: "surface-hot-new",
+    helperPid: process.pid,
+    conversationKey: undefined,
+    connectorIdentity: undefined,
+    connectorBound: false,
+    status: "running",
+    loading: true,
+    bootstrapReady: false,
+    rendererReady: false,
+    lastHeartbeatAt: 1,
+    url: currentUrl,
+    view: {
+      webContents: {
+        isDestroyed: () => false,
+        getURL: () => currentUrl,
+        async loadURL(url) {
+          currentUrl = url;
+          tab.url = url;
+          tab.bootstrapReady = true;
+          tab.rendererReady = true;
+          tab.loading = false;
+        },
+        setBackgroundThrottling(value) { throttled = value; },
+      },
+    },
+  };
+  const logs = [];
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: true },
+    manualOperation: null,
+    selectedTabId: "home",
+    turnTabs: new Map(),
+    async waitForHotTemporaryComposer(candidate) {
+      assert.equal(candidate, tab);
+    },
+    createTurnTab(...args) {
+      createArgs = args;
+      this.turnTabs.set(tab.id, tab);
+      return tab;
+    },
+    syncViewVisibility() {},
+    publishState() {},
+    snapshot: () => ({ tabs: [] }),
+    removeTurnTab(candidate) { this.turnTabs.delete(candidate.id); },
+    logger: {
+      info(event, detail) { logs.push([event, detail]); },
+      warn(event, detail) { logs.push([event, detail]); },
+    },
+  });
+
+  await BrowserHost.prototype.createHotTemporarySurface.call(fixture, "test");
+
+  assert.equal(createArgs[2], undefined);
+  assert.equal(createArgs[3], undefined);
+  assert.deepEqual(createArgs[4], { deferInitialNavigation: true });
+  assert.equal(currentUrl, "https://chatgpt.com/?temporary-chat=true");
+  assert.equal(tab.hotTemporarySurface, true);
+  assert.equal(tab.status, "ready");
+  assert.equal(tab.loading, false);
+  assert.equal(throttled, true);
+  assert.equal(fixture.selectedTabId, tab.id);
+  assert.equal(BrowserHost.prototype.findHotTemporarySurface.call(fixture), tab);
+  assert.equal(logs.some(([event]) => event === "browser.hot_temporary_surface_ready"), true);
+});
+
+test("a replenish request queued behind a superseded warming surface is replayed", async () => {
+  let finishFirst;
+  const first = new Promise(resolve => { finishFirst = resolve; });
+  const calls = [];
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: true },
+    manualOperation: null,
+    turnTabs: new Map(),
+    hotTemporarySurfacePending: false,
+    hotTemporarySurfaceQueued: null,
+    createHotTemporarySurface(reason, modeHint) {
+      calls.push({ reason, modeHint });
+      return calls.length === 1 ? first : Promise.resolve();
+    },
+  });
+
+  const firstHint = { modelId: "gpt-5.6-sol", reasoning: "medium" };
+  const latestHint = { modelId: "gpt-5.6-sol", reasoning: "high" };
+  BrowserHost.prototype.queueHotTemporarySurface.call(fixture, "initial", firstHint);
+  BrowserHost.prototype.queueHotTemporarySurface.call(fixture, "turn_released", latestHint);
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(fixture.hotTemporarySurfaceQueued, {
+    reason: "turn_released",
+    modeHint: latestHint,
+    allowActiveTurn: false,
+  });
+
+  finishFirst();
+  await first;
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual(calls, [
+    { reason: "initial", modeHint: firstHint },
+    { reason: "turn_released", modeHint: latestHint },
+  ]);
+  assert.equal(fixture.hotTemporarySurfacePending, false);
+  assert.equal(fixture.hotTemporarySurfaceQueued, null);
+});
+
+test("hot Temporary Chat readiness waits for composer hydration on the exact reserved surface", async () => {
+  let probes = 0;
+  const tab = {
+    id: "hot-hydrating",
+    view: {
+      webContents: {
+        isDestroyed: () => false,
+        executeJavaScript: async () => {
+          probes += 1;
+          return probes >= 3;
+        },
+      },
+    },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[tab.id, tab]]),
+  });
+
+  await BrowserHost.prototype.waitForHotTemporaryComposer.call(fixture, tab, 500);
+  assert.equal(probes, 3);
+});
+
+test("hot Temporary Chat mode prewarm delegates the exact owned surface and records only proven mode evidence", async () => {
+  const tab = {
+    id: "hot-mode",
+    surfaceId: "A".repeat(32),
+    hotTemporarySurface: "warming",
+  };
+  let request;
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: true },
+    manualOperation: null,
+    turnTabs: new Map([[tab.id, tab]]),
+    connectorName: () => "Codex Native2",
+    runBrowserHelperOperation: async options => {
+      request = options;
+      return {
+        value: {
+          modelId: "gpt-5.6-sol",
+          reasoning: "medium",
+          effort: "medium",
+          connectorBound: false,
+        },
+      };
+    },
+    helper: { executable: "helper.exe", script: "helper.js" },
+    descriptorPath: "launcher-browser.json",
+    logger: { info() {} },
+  });
+
+  const proof = await BrowserHost.prototype.prewarmHotTemporaryMode.call(
+    fixture,
+    tab,
+    { modelId: "gpt-5.6-sol", reasoning: "medium" },
+  );
+
+  assert.deepEqual(proof, {
+    modelId: "gpt-5.6-sol",
+    reasoning: "medium",
+    effort: "medium",
+    connectorBound: false,
+  });
+  assert.equal(request.operation, "prewarm");
+  assert.deepEqual(request.payload, {
+    surfaceId: "A".repeat(32),
+    modelId: "gpt-5.6-sol",
+    reasoning: "medium",
+  });
+});
+
+test("hot Temporary Chat prewarm can prove High plus the Codex Native2 connector before lease", async () => {
+  const tab = { id: "hot-connector", surfaceId: "C".repeat(32), hotTemporarySurface: "warming" };
+  let request;
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: true }, manualOperation: null, turnTabs: new Map([[tab.id, tab]]),
+    connectorName: () => "Codex Native2",
+    runBrowserHelperOperation: async options => {
+      request = options;
+      return { value: { modelId: "gpt-5.6-sol", reasoning: "high", effort: "high", connectorBound: true } };
+    },
+    helper: { executable: "helper.exe", script: "helper.js" }, descriptorPath: "launcher-browser.json",
+    logger: { info() {} },
+  });
+  const proof = await BrowserHost.prototype.prewarmHotTemporaryMode.call(
+    fixture, tab, { modelId: "gpt-5.6-sol", reasoning: "high", connectorIdentity: "Codex Native2" },
+  );
+  assert.deepEqual(request.payload, {
+    surfaceId: "C".repeat(32), modelId: "gpt-5.6-sol", reasoning: "high", connectorIdentity: "Codex Native2",
+  });
+  assert.deepEqual(proof, {
+    modelId: "gpt-5.6-sol", reasoning: "high", effort: "high",
+    connectorIdentity: "Codex Native2", connectorBound: true,
+  });
+});
+
+test("a failed mode prewarm does not discard an otherwise ready hot Temporary Chat", async () => {
+  let currentUrl = IDLE_BROWSER_URL;
+  const tab = {
+    id: "hot-mode-fallback",
+    traceId: "hot_unused",
+    surfaceId: "B".repeat(32),
+    helperPid: process.pid,
+    conversationKey: undefined,
+    connectorIdentity: undefined,
+    connectorBound: false,
+    status: "running",
+    loading: true,
+    bootstrapReady: false,
+    rendererReady: false,
+    lastHeartbeatAt: 1,
+    url: currentUrl,
+    view: {
+      webContents: {
+        isDestroyed: () => false,
+        getURL: () => currentUrl,
+        async loadURL(url) {
+          currentUrl = url;
+          tab.url = url;
+          tab.bootstrapReady = true;
+          tab.rendererReady = true;
+          tab.loading = false;
+        },
+        setBackgroundThrottling() {},
+      },
+    },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: true },
+    manualOperation: null,
+    turnTabs: new Map(),
+    createTurnTab() {
+      this.turnTabs.set(tab.id, tab);
+      return tab;
+    },
+    async waitForHotTemporaryComposer() {},
+    async prewarmHotTemporaryMode() { throw new Error("synthetic prewarm failure"); },
+    publishState() {},
+    snapshot: () => ({ tabs: [] }),
+    removeTurnTab(candidate) { this.turnTabs.delete(candidate.id); },
+    logger: { info() {}, warn() {} },
+  });
+
+  await BrowserHost.prototype.createHotTemporarySurface.call(
+    fixture,
+    "test",
+    { modelId: "gpt-5.6-sol", reasoning: "medium" },
+  );
+
+  assert.equal(tab.status, "ready");
+  assert.equal(tab.hotTemporarySurface, true);
+  assert.equal(tab.prewarmedMode, null);
+  assert.equal(fixture.turnTabs.get(tab.id), tab);
+});
+
+test("a hot Temporary Chat surface is leased for a fresh turn without creating another tab", () => {
+  const overlapRequests = [];
+  const hot = {
+    id: "hot",
+    traceId: "hot_unused",
+    surfaceId: "surface-hot",
+    helperPid: 111,
+    conversationKey: undefined,
+    connectorIdentity: undefined,
+    connectorBound: false,
+    hotTemporarySurface: true,
+    status: "ready",
+    loading: false,
+    bootstrapReady: true,
+    rendererReady: true,
+    message: "Temporary Chat is ready for the next request",
+    lastHeartbeatAt: 1,
+    view: {
+      webContents: {
+        isDestroyed: () => false,
+        getURL: () => "https://chatgpt.com/?temporary-chat=true",
+        setBackgroundThrottling() {},
+      },
+    },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    manualOperation: null,
+    turnTabs: new Map([[hot.id, hot]]),
+    userCancelledTurnOwners: new Map(),
+    createTurnTab() {
+      throw new Error("must lease the hot Temporary Chat surface");
+    },
+    findHotTemporarySurface: () => hot,
+    show() {},
+    syncViewVisibility() {},
+    publishState() {},
+    writeDescriptor() {},
+    snapshot: () => ({ tabs: [] }),
+    queueHotTemporarySurface(reason, modeHint, options) {
+      overlapRequests.push({ reason, modeHint, options });
+    },
+    logger: { info() {} },
+  });
+
+  const lease = BrowserHost.prototype.beginTurn.call(
+    fixture,
+    "trace_fresh",
+    false,
+    222,
+    undefined,
+    undefined,
+  );
+
+  assert.deepEqual(lease, {
+    surfaceId: "surface-hot",
+    tabId: "hot",
+    reused: false,
+    connectorBound: false,
+  });
+  assert.deepEqual(overlapRequests, [{
+    reason: "turn_started_overlap",
+    modeHint: undefined,
+    options: { allowActiveTurn: true },
+  }]);
+  assert.deepEqual(
+    {
+      traceId: hot.traceId,
+      helperPid: hot.helperPid,
+      conversationKey: hot.conversationKey,
+      connectorIdentity: hot.connectorIdentity,
+      hotTemporarySurface: hot.hotTemporarySurface,
+      status: hot.status,
+      loading: hot.loading,
+    },
+    {
+      traceId: "trace_fresh",
+      helperPid: 222,
+      conversationKey: undefined,
+      connectorIdentity: undefined,
+      hotTemporarySurface: false,
+      status: "running",
+      loading: true,
+    },
+  );
+});
+
+test("the UI A/B baseline switch disables only the active-turn hot replacement overlap", () => {
+  const overlapRequests = [];
+  const logEvents = [];
+  const hot = {
+    id: "hot-baseline",
+    traceId: "hot_unused",
+    surfaceId: "surface-hot-baseline",
+    helperPid: 111,
+    conversationKey: undefined,
+    connectorIdentity: undefined,
+    connectorBound: false,
+    hotTemporarySurface: true,
+    status: "ready",
+    loading: false,
+    bootstrapReady: true,
+    rendererReady: true,
+    message: "Temporary Chat is ready for the next request",
+    lastHeartbeatAt: 1,
+    view: {
+      webContents: {
+        isDestroyed: () => false,
+        getURL: () => "https://chatgpt.com/?temporary-chat=true",
+        setBackgroundThrottling() {},
+      },
+    },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    manualOperation: null,
+    hotTemporaryOverlapEnabled: false,
+    turnTabs: new Map([[hot.id, hot]]),
+    userCancelledTurnOwners: new Map(),
+    createTurnTab() {
+      throw new Error("must lease the hot Temporary Chat surface");
+    },
+    findHotTemporarySurface: () => hot,
+    show() {},
+    syncViewVisibility() {},
+    publishState() {},
+    writeDescriptor() {},
+    snapshot: () => ({ tabs: [] }),
+    queueHotTemporarySurface(reason, modeHint, options) {
+      overlapRequests.push({ reason, modeHint, options });
+    },
+    logger: { info(event, detail) { logEvents.push({ event, detail }); } },
+  });
+
+  const lease = BrowserHost.prototype.beginTurn.call(
+    fixture,
+    "trace_baseline",
+    false,
+    222,
+    undefined,
+    undefined,
+  );
+
+  assert.equal(lease.surfaceId, "surface-hot-baseline");
+  assert.equal(hot.status, "running");
+  assert.deepEqual(overlapRequests, []);
+  assert.deepEqual(logEvents.filter(item => item.event === "browser.hot_temporary_surface_overlap_skipped"), [{
+    event: "browser.hot_temporary_surface_overlap_skipped",
+    detail: { traceId: "trace_baseline", reason: "measurement_disabled" },
+  }]);
+});
+
+test("a connector-bound hot Temporary Chat becomes the first retained local-tools conversation without a second tab", () => {
+  const conversationKey = "a".repeat(64);
+  const hot = {
+    id: "hot-local-tools", traceId: "hot_unused", surfaceId: "surface-hot-local-tools",
+    helperPid: process.pid, conversationKey: undefined, connectorIdentity: "Codex Native2",
+    connectorBound: true, hotTemporarySurface: true,
+    prewarmedMode: { modelId: "gpt-5.6-sol", reasoning: "high", effort: "high",
+      connectorIdentity: "Codex Native2", connectorBound: true },
+    status: "ready", loading: false, bootstrapReady: true, rendererReady: true,
+    view: { webContents: { isDestroyed: () => false,
+      getURL: () => "https://chatgpt.com/?temporary-chat=true", setBackgroundThrottling() {} } },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    manualOperation: null, turnTabs: new Map([[hot.id, hot]]), userCancelledTurnOwners: new Map(),
+    show() {}, syncViewVisibility() {}, publishState() {}, writeDescriptor() {},
+    snapshot: () => ({ tabs: [] }), logger: { info() {} },
+    createTurnTab() { throw new Error("must promote the existing hot surface"); },
+  });
+
+  const lease = BrowserHost.prototype.beginTurn.call(
+    fixture, "trace_local_tools", false, 222, conversationKey, "Codex Native2", false,
+    "gpt-5.6-sol", "high",
+  );
+
+  assert.equal(fixture.turnTabs.size, 1);
+  assert.equal(lease.tabId, hot.id);
+  assert.equal(lease.reused, false);
+  assert.equal(lease.effortPrepared, true);
+  assert.equal(lease.connectorBound, true);
+  assert.equal(hot.conversationKey, conversationKey);
+  assert.equal(hot.connectorIdentity, "Codex Native2");
+  assert.equal(hot.connectorBound, true);
+  assert.equal(hot.hotTemporarySurface, false);
+});
+
+test("a matching prewarmed hot surface skips only its proven model and effort selection", () => {
+  const hot = {
+    id: "hot-prewarmed",
+    traceId: "hot_unused",
+    surfaceId: "surface-hot-prewarmed",
+    helperPid: process.pid,
+    conversationKey: undefined,
+    connectorIdentity: undefined,
+    connectorBound: false,
+    hotTemporarySurface: true,
+    prewarmedMode: { modelId: "gpt-5.6-sol", reasoning: "medium", effort: "medium" },
+    status: "ready",
+    loading: false,
+    bootstrapReady: true,
+    rendererReady: true,
+    view: {
+      webContents: {
+        isDestroyed: () => false,
+        getURL: () => "https://chatgpt.com/?temporary-chat=true",
+        setBackgroundThrottling() {},
+      },
+    },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    manualOperation: null,
+    turnTabs: new Map([[hot.id, hot]]),
+    userCancelledTurnOwners: new Map(),
+    findHotTemporarySurface: () => hot,
+    show() {},
+    syncViewVisibility() {},
+    publishState() {},
+    writeDescriptor() {},
+    snapshot: () => ({ tabs: [] }),
+    logger: { info() {} },
+  });
+
+  const lease = BrowserHost.prototype.beginTurn.call(
+    fixture,
+    "trace_matching",
+    false,
+    222,
+    undefined,
+    undefined,
+    false,
+    "gpt-5.6-sol",
+    "medium",
+  );
+
+  assert.equal(lease.effortPrepared, true);
+  assert.equal(hot.prewarmedMode, null);
+  assert.equal(hot.modelId, "gpt-5.6-sol");
+  assert.equal(hot.reasoning, "medium");
+});
+
+test("a mismatched prewarmed hot surface remains usable but cannot claim effort preparation", () => {
+  const hot = {
+    id: "hot-mismatch",
+    traceId: "hot_unused",
+    surfaceId: "surface-hot-mismatch",
+    helperPid: process.pid,
+    conversationKey: undefined,
+    connectorIdentity: undefined,
+    connectorBound: false,
+    hotTemporarySurface: true,
+    prewarmedMode: { modelId: "gpt-5.6-sol", reasoning: "medium", effort: "medium" },
+    status: "ready",
+    loading: false,
+    bootstrapReady: true,
+    rendererReady: true,
+    view: {
+      webContents: {
+        isDestroyed: () => false,
+        getURL: () => "https://chatgpt.com/?temporary-chat=true",
+        setBackgroundThrottling() {},
+      },
+    },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    manualOperation: null,
+    turnTabs: new Map([[hot.id, hot]]),
+    userCancelledTurnOwners: new Map(),
+    findHotTemporarySurface: () => hot,
+    show() {},
+    syncViewVisibility() {},
+    publishState() {},
+    writeDescriptor() {},
+    snapshot: () => ({ tabs: [] }),
+    logger: { info() {} },
+  });
+
+  const lease = BrowserHost.prototype.beginTurn.call(
+    fixture,
+    "trace_mismatch",
+    false,
+    222,
+    undefined,
+    undefined,
+    false,
+    "gpt-5.6-sol",
+    "high",
+  );
+
+  assert.equal(Object.hasOwn(lease, "effortPrepared"), false);
+  assert.equal(hot.prewarmedMode, null);
+  assert.equal(hot.reasoning, "high");
+});
+
+test("an exact retained conversation wins over a hot Temporary Chat surface", () => {
+  const conversationKey = "e".repeat(64);
+  const retained = {
+    id: "retained",
+    traceId: "trace_old",
+    surfaceId: "surface-retained",
+    helperPid: 111,
+    conversationKey,
+    connectorIdentity: "Codex Native2",
+    connectorBound: true,
+    status: "ready",
+    loading: false,
+    lastHeartbeatAt: 100,
+    view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {} } },
+  };
+  const hot = {
+    id: "hot",
+    traceId: "hot_unused",
+    surfaceId: "surface-hot",
+    status: "ready",
+    hotTemporarySurface: true,
+    conversationKey: undefined,
+    connectorIdentity: undefined,
+    view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {} } },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    manualOperation: null,
+    turnTabs: new Map([[retained.id, retained], [hot.id, hot]]),
+    userCancelledTurnOwners: new Map(),
+    findHotTemporarySurface: () => hot,
+    show() {},
+    syncViewVisibility() {},
+    publishState() {},
+    writeDescriptor() {},
+    snapshot: () => ({ tabs: [] }),
+    logger: { info() {} },
+  });
+
+  const lease = BrowserHost.prototype.beginTurn.call(
+    fixture,
+    "trace_next",
+    false,
+    222,
+    conversationKey,
+    "Codex Native2",
+  );
+
+  assert.equal(lease.tabId, "retained");
+  assert.equal(lease.reused, true);
+  assert.equal(hot.status, "ready");
+  assert.equal(hot.hotTemporarySurface, true);
+});
+
+test("active-turn hot replacement hydration is admitted only for exactly one running turn", async () => {
+  const calls = [];
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: true },
+    manualOperation: null,
+    turnTabs: new Map([["running", { id: "running", status: "running" }]]),
+    hotTemporarySurfacePending: false,
+    hotTemporarySurfaceQueued: null,
+    createHotTemporarySurface(reason, modeHint, options) {
+      calls.push({ reason, modeHint, options });
+      return Promise.resolve();
+    },
+  });
+
+  BrowserHost.prototype.queueHotTemporarySurface.call(
+    fixture,
+    "turn_started_overlap",
+    undefined,
+    { allowActiveTurn: true },
+  );
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, [{
+    reason: "turn_started_overlap",
+    modeHint: undefined,
+    options: { allowActiveTurn: true },
+  }]);
+
+  fixture.turnTabs.set("second-running", { id: "second-running", status: "running" });
+  BrowserHost.prototype.queueHotTemporarySurface.call(
+    fixture,
+    "turn_started_overlap",
+    undefined,
+    { allowActiveTurn: true },
+  );
+  assert.equal(calls.length, 1);
+});
+
+test("a fresh turn waits for one matching warming hot Temporary surface and leases it after readiness", async () => {
+  let resolveWarm;
+  const warming = {
+    id: "warming-handoff",
+    traceId: "hot_warming",
+    surfaceId: "surface-warming-handoff",
+    conversationKey: undefined,
+    connectorIdentity: undefined,
+    connectorBound: false,
+    hotTemporarySurface: "warming",
+    hotTemporarySurfaceStartedAt: Date.now(),
+    hotTemporarySurfaceModeHint: undefined,
+    status: "warming",
+    bootstrapReady: false,
+    rendererReady: false,
+    loading: true,
+    view: { webContents: { isDestroyed: () => false, getURL: () => IDLE_BROWSER_URL } },
+  };
+  const logs = [];
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    manualOperation: null,
+    turnTabs: new Map([[warming.id, warming]]),
+    hotTemporarySurfaceTask: new Promise(resolve => { resolveWarm = resolve; }),
+    logger: { info: (event, detail) => logs.push([event, detail]) },
+  });
+  setTimeout(() => {
+    warming.hotTemporarySurface = true;
+    warming.status = "ready";
+    warming.bootstrapReady = true;
+    warming.rendererReady = true;
+    warming.loading = false;
+    warming.view.webContents.getURL = () => "https://chatgpt.com/?temporary-chat=true";
+    resolveWarm();
+  }, 5);
+
+  const ready = await BrowserHost.prototype.waitForWarmingHotTemporarySurfaceForTurn.call(
+    fixture,
+    { traceId: "trace-next", connectorIdentity: undefined, requireRetainedConversation: false },
+    100,
+  );
+
+  assert.equal(ready, true);
+  assert.equal(logs.some(([event, detail]) => event === "browser.hot_temporary_surface_handoff_wait_finished"
+    && detail.outcome === "ready"), true);
+});
+
+test("a warming hot Temporary surface wait is bounded and leaves cold fallback to beginTurn", async () => {
+  const warming = {
+    id: "warming-timeout",
+    traceId: "hot_warming_timeout",
+    hotTemporarySurface: "warming",
+    hotTemporarySurfaceStartedAt: Date.now(),
+    hotTemporarySurfaceModeHint: undefined,
+    status: "warming",
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    manualOperation: null,
+    turnTabs: new Map([[warming.id, warming]]),
+    hotTemporarySurfaceTask: new Promise(() => {}),
+    logger: { info() {} },
+  });
+
+  const ready = await BrowserHost.prototype.waitForWarmingHotTemporarySurfaceForTurn.call(
+    fixture,
+    { traceId: "trace-next", connectorIdentity: undefined, requireRetainedConversation: false },
+    10,
+  );
+
+  assert.equal(ready, false);
+  assert.equal(warming.hotTemporarySurface, "warming");
+  assert.equal(fixture.turnTabs.get(warming.id), warming);
+});
+
+test("a real turn discards an incomplete hot prewarm before allocating its browser slot", () => {
+  const warming = {
+    id: "warming",
+    traceId: "hot_warming",
+    surfaceId: "surface-warming",
+    helperPid: process.pid,
+    conversationKey: undefined,
+    connectorIdentity: undefined,
+    hotTemporarySurface: "warming",
+    status: "warming",
+    view: { webContents: { isDestroyed: () => false, getURL: () => IDLE_BROWSER_URL } },
+  };
+  const created = {
+    id: "fresh",
+    traceId: "trace_fresh",
+    surfaceId: "surface-fresh",
+    helperPid: 222,
+    conversationKey: undefined,
+    connectorIdentity: undefined,
+    connectorBound: false,
+    status: "running",
+    view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {} } },
+  };
+  const discarded = [];
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    manualOperation: null,
+    turnTabs: new Map([[warming.id, warming]]),
+    userCancelledTurnOwners: new Map(),
+    removeTurnTab(candidate) {
+      discarded.push(candidate.id);
+      this.turnTabs.delete(candidate.id);
+    },
+    createTurnTab() {
+      assert.equal(this.turnTabs.has("warming"), false);
+      this.turnTabs.set(created.id, created);
+      return created;
+    },
+    show() {},
+    syncViewVisibility() {},
+    publishState() {},
+    writeDescriptor() {},
+    snapshot: () => ({ tabs: [] }),
+    logger: { info() {} },
+  });
+
+  const lease = BrowserHost.prototype.beginTurn.call(
+    fixture,
+    "trace_fresh",
+    false,
+    222,
+    undefined,
+    undefined,
+  );
+
+  assert.deepEqual(discarded, ["warming"]);
+  assert.equal(lease.tabId, "fresh");
+});
+
+test("ending a fresh turn queues a replacement hot Temporary Chat surface", async () => {
+  const tab = {
+    id: "tab-ended",
+    traceId: "trace_ended",
+    helperPid: 555,
+    conversationKey: undefined,
+    connectorIdentity: undefined,
+    modelId: "gpt-5.6-sol",
+    reasoning: "medium",
+    status: "running",
+    view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {} } },
+  };
+  const queued = [];
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    closedTurnOwners: new Map(),
+    userCancelledTurnOwners: new Map(),
+    removeTurnTab(candidate, abortRunning) {
+      assert.equal(candidate, tab);
+      assert.equal(abortRunning, false);
+      this.turnTabs.delete(candidate.id);
+    },
+    queueHotTemporarySurface(reason, modeHint) {
+      queued.push([reason, modeHint]);
+    },
+    turnTabs: new Map([[tab.id, tab]]),
+    syncPowerSaveBlocker() {},
+    publishState() {},
+    snapshot: () => ({ tabs: [] }),
+    logger: { info() {} },
+  });
+
+  const release = await BrowserHost.prototype.endTurn.call(
+    fixture,
+    "trace_ended",
+    555,
+    "completed",
+    false,
+    undefined,
+    false,
+    false,
+  );
+
+  assert.deepEqual(release, { cancelledByUser: false });
+  assert.deepEqual(queued, [["turn_released", {
+    modelId: "gpt-5.6-sol",
+    reasoning: "medium",
+  }]]);
+});
+
+test("ending a High turn queues only a hydrated hot Temporary surface with no DOM mode prewarm", async () => {
+  const tab = {
+    id: "tab-high-ended",
+    traceId: "trace_high_ended",
+    helperPid: 556,
+    conversationKey: undefined,
+    connectorIdentity: "Codex Native2",
+    modelId: "gpt-5.6-sol",
+    reasoning: "high",
+    status: "running",
+    view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {} } },
+  };
+  const queued = [];
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    closedTurnOwners: new Map(),
+    userCancelledTurnOwners: new Map(),
+    removeTurnTab(candidate) { this.turnTabs.delete(candidate.id); },
+    queueHotTemporarySurface(reason, modeHint) { queued.push([reason, modeHint]); },
+    turnTabs: new Map([[tab.id, tab]]),
+    syncPowerSaveBlocker() {},
+    publishState() {},
+    snapshot: () => ({ tabs: [] }),
+    logger: { info() {} },
+  });
+
+  const release = await BrowserHost.prototype.endTurn.call(
+    fixture,
+    "trace_high_ended",
+    556,
+    "completed",
+    false,
+    undefined,
+    false,
+    true,
+  );
+
+  assert.deepEqual(release, { cancelledByUser: false });
+  assert.deepEqual(queued, [["turn_released", undefined]]);
+});
+
 test("a required retained conversation fails before creating a browser tab", () => {
   let created = false;
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
@@ -2253,6 +3205,30 @@ test("a retained browser tab expires at thirty minutes", () => {
 
   assert.deepEqual(removed, [[tab.id, false]]);
   assert.equal(fixture.turnTabs.size, 0);
+});
+
+test("a ready hot Temporary Chat is not reaped by the retained conversation TTL", () => {
+  const removed = [];
+  const tab = {
+    id: "tab-hot-ready",
+    traceId: "hot_0123456789abcdef",
+    status: "ready",
+    hotTemporarySurface: true,
+    lastHeartbeatAt: 100,
+  };
+  const fixture = {
+    turnTabs: new Map([[tab.id, tab]]),
+    logger: { info() {} },
+    removeTurnTab(candidate, abortRunning) {
+      removed.push([candidate.id, abortRunning]);
+      this.turnTabs.delete(candidate.id);
+    },
+  };
+
+  BrowserHost.prototype.reapExpiredTurnTabs.call(fixture, 100 + (30 * 60 * 1000));
+
+  assert.deepEqual(removed, []);
+  assert.equal(fixture.turnTabs.get(tab.id), tab);
 });
 
 test("a completed connector turn without binding is released instead of retained", async () => {

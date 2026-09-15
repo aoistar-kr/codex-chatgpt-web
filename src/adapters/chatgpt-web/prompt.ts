@@ -6,6 +6,11 @@ import {
   CHATGPT_LUNA_CHECKPOINT_MARKER,
   CHATGPT_LUNA_CHECKPOINT_MAX_TOKENS,
 } from "./rolling-checkpoint";
+import {
+  CODEX_PARALLEL_EXEC_BATCH_CONTROL_WIRE_NAME,
+  CODEX_PARALLEL_EXEC_BATCH_MAX_CALLS,
+  CODEX_PARALLEL_EXEC_BATCH_MIN_CALLS,
+} from "./native-parallel-batch-control";
 
 export interface ChatGptWebPromptImage {
   ref: string;
@@ -364,6 +369,36 @@ export function chatGptReadOnlyContextWarning(
   return `⚠️ ${label} cannot access the local Codex computer in this turn. The accumulated context does not contain local tool results yet: it will see instructions and attachments, but not workspace contents. ChatGPT-native capabilities such as web search remain available when the product provides them.${browserOnlyGuidance}`;
 }
 
+function nativeExecCommandShellGuidance(parsed: CodexParsedRequest): string[] {
+  const command = parsed.context.tools?.find(tool => (
+    !tool.namespace && !tool.freeform && tool.name === "exec_command"
+  ));
+  const properties = command?.parameters.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return [];
+  const declared = properties as Record<string, unknown>;
+  const shellSchema = declared.shell;
+  if (!shellSchema || typeof shellSchema !== "object" || Array.isArray(shellSchema)) return [];
+  const loginSupported = Object.prototype.hasOwnProperty.call(declared, "login");
+
+  return [
+    "The current outer Codex registry advertises exec_command with an explicit shell selector. On Windows, when a complete local command is a simple shell-neutral native executable or command-script invocation, prefer an explicit command name ending in .exe, .com, .cmd, or .bat and avoid PowerShell-only syntax unless the task actually needs it. The native command bridge may then select the lower-overhead cmd.exe path without rewriting the command text. Commands that need quoting, expansion, redirection, pipelines, wildcard handling, profiles, modules, or shell-specific syntax must keep the shell semantics they require. Never convert or reinterpret a shell-specific command merely to qualify for the fast path."
+      + (loginSupported
+        ? " The same current schema also advertises login selection; the shell-neutral Windows fast path uses non-login execution because profile initialization is not part of that restricted command class."
+        : ""),
+  ];
+}
+
+function nativeParallelExecBatchGuidance(parsed: CodexParsedRequest): string[] {
+  const command = parsed.context.tools?.find(tool => (
+    !tool.namespace && !tool.freeform && !tool.toolSearch && tool.name === "exec_command"
+  ));
+  if (!command) return [];
+  return [
+    `When ${CODEX_PARALLEL_EXEC_BATCH_MIN_CALLS}-${CODEX_PARALLEL_EXEC_BATCH_MAX_CALLS} required native command calls are already known to be mutually independent but must remain separate commands, the generic native-tool passthrough supports reserved wire_name ${JSON.stringify(CODEX_PARALLEL_EXEC_BATCH_CONTROL_WIRE_NAME)} with arguments shaped as {"calls":[{"wire_name":"exec_command","arguments":{...}}, ...]}. Use it only to remove model continuation rounds between independent commands; every member still runs as its own outer Codex exec_command with its own sandbox, approval, result, and failure state.`,
+    "Never use the reserved parallel command batch for dependent commands, repeated interaction with one live process, commands whose ordering matters, or operations that should share one shell state. If independence is not already certain, use ordinary native calls instead.",
+  ];
+}
+
 export function compileChatGptWebPrompt(
   parsed: CodexParsedRequest,
   capabilities: ChatGptWebCapabilities,
@@ -425,6 +460,13 @@ export function compileChatGptWebPrompt(
       "Use actual Codex Native results as evidence for local observations and effects.",
       "A Codex Native MCP tool result may require context compaction. If it does, follow the compaction instructions in that result exactly.",
       "After a deterministic tool failure, update the working hypothesis from that result and inspect the relevant repository or environment before choosing a different next action; do not repeat the same call unless its inputs or observable state changed.",
+      "When multiple required local actions are already known to be independent and none needs another action's result as input, prefer issuing those independent Codex Native calls in the same tool-call batch instead of serializing them across separate model continuations.",
+      "When a complete shell-operation sequence is already known in advance, prefer one native command call over several separate native command calls only when doing so preserves the required ordering, failure handling, output visibility, approval boundary, sandbox policy, and rollback meaning.",
+      ...nativeParallelExecBatchGuidance(parsed),
+      ...nativeExecCommandShellGuidance(parsed),
+      "If a native command call returns a live session identifier and the next required step is interaction with that same process, prefer the attached native session-continuation capability for that existing session instead of starting a replacement process.",
+      "Do not deliberately create a live or TTY command session merely to make unrelated or one-shot commands faster. Initial live-session creation can carry substantial Windows process/sandbox/yield overhead before its session identifier is returned; create a persistent session only when later steps genuinely need the same process or its in-process state, and otherwise prefer ordinary one-shot commands, safe command merging, or the independent-call batching guidance above.",
+      "Do not batch, merge, or parallelize actions when a later input depends on an earlier result, side-effect ordering matters, or combining them could change approval, failure, output, sandbox, or rollback semantics.",
       "Continue using the available tools until the requested work is complete and verified.",
       "Write the user-facing final answer only after the last required tool result has settled. Do not call another tool after beginning that final answer.",
     ]

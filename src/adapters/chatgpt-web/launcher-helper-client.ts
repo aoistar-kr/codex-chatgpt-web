@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
+import type { CodexOutputTextAnnotation } from "../../types";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
@@ -30,7 +31,7 @@ type HelperMessage =
   | { type: "event"; id: string; event: "completion_fence_commit"; requestId: number; revision: number }
   | { type: "event"; id: string; event: "prepared_selected"; reused: boolean }
   | { type: "event"; id: string; event: "luna_checkpoint"; checkpoint: ChatGptLunaCheckpoint; answerHash: string }
-  | { type: "result"; id: string; text: string }
+  | { type: "result"; id: string; text: string; annotations?: CodexOutputTextAnnotation[] }
   | {
       type: "error";
       id: string;
@@ -41,6 +42,37 @@ type HelperMessage =
       code?: string;
       retryable?: boolean;
     };
+
+function parseOutputAnnotations(value: unknown): CodexOutputTextAnnotation[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 256) {
+    throw new Error("Launcher browser helper output annotations are invalid");
+  }
+  return value.map(entry => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error("Launcher browser helper output annotation is invalid");
+    }
+    const annotation = entry as Record<string, unknown>;
+    const start = annotation.start_index;
+    const end = annotation.end_index;
+    const url = annotation.url;
+    const title = annotation.title;
+    if (annotation.type !== "url_citation"
+      || !Number.isSafeInteger(start) || (start as number) < 0
+      || !Number.isSafeInteger(end) || (end as number) <= (start as number)
+      || typeof url !== "string" || url.length === 0 || url.length > 16_384
+      || typeof title !== "string" || title.length > 4_096) {
+      throw new Error("Launcher browser helper URL citation is invalid");
+    }
+    return {
+      type: "url_citation" as const,
+      start_index: start as number,
+      end_index: end as number,
+      url,
+      title,
+    };
+  });
+}
 
 function parseHelperMessage(line: string): HelperMessage {
   const value = JSON.parse(line) as unknown;
@@ -128,7 +160,13 @@ function parseHelperMessage(line: string): HelperMessage {
     if (typeof text !== "string") {
       throw new Error("Launcher browser helper result text is invalid");
     }
-    return { type: "result", id: message.id, text };
+    const annotations = parseOutputAnnotations(message.annotations);
+    return {
+      type: "result",
+      id: message.id,
+      text,
+      ...(annotations.length > 0 ? { annotations } : {}),
+    };
   }
   if (message.type === "error") {
     const errorMessage = message.message;
@@ -518,7 +556,10 @@ export class LauncherBrowserHelperClient {
     if (message.type === "result") {
       this.finish(message.id);
       if (pending.localFailure) pending.reject(pending.localFailure);
-      else pending.resolve(message.text);
+      else {
+        if (message.annotations) pending.turn.onOutputAnnotations?.(message.annotations);
+        pending.resolve(message.text);
+      }
     } else if (message.type === "error") {
       const error = message.status !== undefined
         ? new ChatGptWebAdapterError(message.message, {

@@ -140,8 +140,17 @@ class BrowserControlServer {
       if (body.requireRetainedConversation === true && body.conversationKey === undefined) {
         throw new Error("requireRetainedConversation requires conversationKey");
       }
-      if (body.connectorIdentity !== undefined && body.conversationKey === undefined) {
-        throw new Error("connectorIdentity requires conversationKey");
+      if (body.modelId !== undefined
+        && (typeof body.modelId !== "string" || !body.modelId.trim() || body.modelId.length > 128)) {
+        throw new Error("modelId is invalid");
+      }
+      if (body.reasoning !== undefined
+        && (typeof body.reasoning !== "string" || !body.reasoning.trim() || body.reasoning.length > 40)) {
+        throw new Error("reasoning is invalid");
+      }
+      if ((body.modelId !== undefined || body.reasoning !== undefined)
+        && request.url !== "/v1/turn/start") {
+        throw new Error("model prewarm metadata is only valid for a turn start");
       }
       if (body.retain !== undefined && typeof body.retain !== "boolean") {
         throw new Error("retain is invalid");
@@ -157,14 +166,28 @@ class BrowserControlServer {
       }
       const preferences = this.getPreferences();
       if (request.url === "/v1/turn/start") {
-        const lease = host.beginTurn(
+        if (typeof host.waitForWarmingHotTemporarySurfaceForTurn === "function") {
+          await host.waitForWarmingHotTemporarySurfaceForTurn({
+            traceId: body.traceId,
+            conversationKey: body.conversationKey,
+            connectorIdentity: body.connectorIdentity,
+            requireRetainedConversation: body.requireRetainedConversation === true,
+            modelId: body.modelId,
+            reasoning: body.reasoning,
+          });
+        }
+        const beginArgs = [
           body.traceId,
           preferences.showBrowserDuringTurns === true,
           body.helperPid,
           body.conversationKey,
           body.connectorIdentity,
           body.requireRetainedConversation === true,
-        );
+        ];
+        if (body.modelId !== undefined || body.reasoning !== undefined) {
+          beginArgs.push(body.modelId, body.reasoning);
+        }
+        const lease = host.beginTurn(...beginArgs);
         this.logger.info("browser.turn_started", { traceId: body.traceId });
         writeJson(response, 200, { ok: true, ...lease });
         return;

@@ -22,6 +22,21 @@ test("pathological repeated text is counted in bounded chunks", () => {
   expect(estimateTokens("a".repeat(32_768))).toBe(4_096);
 });
 
+test("repeated chunk accounting preserves distinct chunks and the final partial chunk", () => {
+  const first = "a".repeat(4_096);
+  const second = "b".repeat(4_096);
+  const tail = "hello world";
+  expect(estimateTokens(first.repeat(60) + second.repeat(60) + tail)).toBe(
+    60 * estimateTokens(first) + 60 * estimateTokens(second) + estimateTokens(tail),
+  );
+});
+
+test("chunk cache saturation preserves exact independent chunk accounting", () => {
+  const chunks = Array.from({ length: 65 }, (_, index) => `${index}:`.padEnd(4_096, " word"));
+  const expected = chunks.reduce((sum, chunk) => sum + estimateTokens(chunk), 0);
+  expect(estimateTokens(chunks.join("").repeat(2))).toBe(expected * 2);
+});
+
 test("large ordinary prose is not inflated by a character-ratio heuristic", () => {
   const prose = `${"word ".repeat(97_999)}word`;
   expect(prose.length).toBe(489_999);

@@ -66,6 +66,46 @@ test("forwards native Codex compaction requests to the official compact endpoint
   expect(await response.json()).toEqual({ output: [] });
 });
 
+test("forwards native Image Gen bytes without Responses rewriting or redirect replay", async () => {
+  for (const operation of ["generations", "edits"] as const) {
+    const body = operation === "generations"
+      ? '{"model":"gpt-image-1","prompt":"A blue square"}'
+      : '{"model":"gpt-image-1","prompt":"Make it green","image":"opaque-native-payload"}';
+    const request = new Request(`http://127.0.0.1:17841/v1/images/${operation}?fixture=1`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer codex-oauth-token",
+        "content-type": "application/json",
+        "chatgpt-account-id": "account-native",
+        host: "127.0.0.1:17841",
+      },
+      body,
+    });
+    let upstreamRequest: Request | undefined;
+    const response = await forwardNativeCodexRequest(request, `images/${operation}`, async input => {
+      upstreamRequest = input;
+      return new Response('{"data":[]}', {
+        status: operation === "generations" ? 200 : 429,
+        headers: {
+          "content-type": "application/json",
+          "content-encoding": "gzip",
+          "x-codex-imagegen-request-id": "native-image-request",
+        },
+      });
+    });
+    expect(upstreamRequest!.url).toBe(`https://chatgpt.com/backend-api/codex/images/${operation}?fixture=1`);
+    expect(upstreamRequest!.method).toBe("POST");
+    expect(upstreamRequest!.redirect).toBe("manual");
+    expect(upstreamRequest!.headers.get("authorization")).toBe("Bearer codex-oauth-token");
+    expect(upstreamRequest!.headers.get("chatgpt-account-id")).toBe("account-native");
+    expect(upstreamRequest!.headers.get("host")).toBeNull();
+    expect(await upstreamRequest!.text()).toBe(body);
+    expect(response.status).toBe(operation === "generations" ? 200 : 429);
+    expect(response.headers.get("content-encoding")).toBeNull();
+    expect(response.headers.get("x-codex-imagegen-request-id")).toBe("native-image-request");
+  }
+});
+
 test("forwards standalone Web Search through the authenticated native Codex route", async () => {
   const body = JSON.stringify({ query: "Codex Web Search passthrough" });
   const request = new Request("http://127.0.0.1:17841/v1/alpha/search?locale=en", {

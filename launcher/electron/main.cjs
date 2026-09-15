@@ -25,10 +25,10 @@ const {
   registerLoggedIpc,
 } = require("./logging.cjs");
 const { RuntimeHost } = require("./runtime.cjs");
-const { ensurePackagedRuntime, waitForPackagedRuntimeSource } = require("./runtime-install.cjs");
+const { ensurePackagedRuntime, preparePackagedRuntimeConcurrent } = require("./runtime-install.cjs");
 const { RuntimeSupervisor } = require("./runtime-supervisor.cjs");
 const { DEVELOPMENT_PROFILE, resolveLauncherProfile } = require("./profile.cjs");
-const { runtimeBundlePaths } = require("./runtime-command.cjs");
+const { runtimeBundlePaths, runtimeInvocation } = require("./runtime-command.cjs");
 const { createUpdateController } = require("./update.cjs");
 const {
   createStateStore,
@@ -624,8 +624,8 @@ function registerIpc({ logger, stateStore }) {
     const result = IS_DEV_PROFILE ? await runtimeHost.setupDevCore() : await runtimeHost.setupCore();
     stateStore.update({
       coreSetupComplete: true,
-      codexCatalogVerified: IS_DEV_PROFILE ? true : false,
-      codexRestartRequired: IS_DEV_PROFILE ? false : true,
+      codexCatalogVerified: true,
+      codexRestartRequired: false,
       ...(result.mode === "full" ? {
         mcpRuntimeInstalled: true,
         mcpSetupComplete: false,
@@ -641,8 +641,7 @@ function registerIpc({ logger, stateStore }) {
         message: error instanceof Error ? error.message : String(error),
       });
     });
-    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
-    return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE };
+    return { ok: true, stdout: result.stdout, restartRequired: false };
   });
   handle("launcher:setup-mcp", async (_event, input) => {
     await browserHost.reveal();
@@ -658,7 +657,7 @@ function registerIpc({ logger, stateStore }) {
       mcpRuntimeInstalled: true,
       mcpSetupComplete: false,
       mcpGuideStep: 2,
-      codexRestartRequired: IS_DEV_PROFILE ? false : true,
+      codexRestartRequired: false,
     });
     return { ok: true, stdout: result.stdout };
   });
@@ -680,11 +679,10 @@ function registerIpc({ logger, stateStore }) {
     const result = await runtimeHost.setBiggerContext(enabled === true);
     const state = stateStore.update({
       experimentalBiggerContext: result.enabled,
-      codexCatalogVerified: IS_DEV_PROFILE ? true : false,
-      codexRestartRequired: IS_DEV_PROFILE ? false : true,
+      codexCatalogVerified: true,
+      codexRestartRequired: false,
     });
     send("launcher:state-changed", state);
-    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return state;
   });
   handle("launcher:set-preference", (_event, key, value) => {
@@ -770,10 +768,27 @@ async function start() {
     return;
   }
   app.on("second-instance", () => showMainWindow());
+  const launcherSmokeTest = process.argv.includes("--launcher-smoke-test");
 
-  await waitForPackagedRuntimeSource({ app, resourcesPath: process.resourcesPath });
-  let installedRuntimeRoot = null;
-  let runtimeRootResolved = false;
+  // Chromium consumes remote-debugging switches during browser-process startup. Configure them
+  // before asynchronous packaged-runtime preparation can yield past that startup phase. Runtime
+  // verification still completes before the launcher window, control server, or browser surfaces
+  // are created below. Package smoke does not need CDP.
+  if (!launcherSmokeTest) {
+    cdpPort = await findFreePort();
+    if (process.platform === "linux") {
+      app.commandLine.appendSwitch("class", IS_DEV_PROFILE ? "codex-web-gpt-dev" : "codex-web-gpt");
+    }
+    app.commandLine.appendSwitch("remote-debugging-address", "127.0.0.1");
+    app.commandLine.appendSwitch("remote-debugging-port", String(cdpPort));
+  }
+
+  let installedRuntimeRoot = await preparePackagedRuntimeConcurrent({
+    app,
+    coreHome: CORE_HOME,
+    resourcesPath: process.resourcesPath,
+  });
+  let runtimeRootResolved = true;
   const runtimeRootProvider = () => {
     const packagedRuntimeWasRemoved = app.isPackaged
       && (!installedRuntimeRoot || !fs.existsSync(installedRuntimeRoot));
@@ -789,12 +804,46 @@ async function start() {
   };
   installedRuntimeRoot = runtimeRootProvider();
 
-  cdpPort = await findFreePort();
-  if (process.platform === "linux") {
-    app.commandLine.appendSwitch("class", IS_DEV_PROFILE ? "codex-web-gpt-dev" : "codex-web-gpt");
+  if (launcherSmokeTest) {
+    await app.whenReady();
+    if (app.isPackaged && !installedRuntimeRoot) {
+      throw new Error("Packaged launcher smoke test could not install its durable runtime");
+    }
+    const versionInvocation = runtimeInvocation({
+      app,
+      sourceRoot: SOURCE_ROOT,
+      installedRuntimeRoot,
+      args: ["--version"],
+    });
+    const versionResult = spawnSync(versionInvocation.executable, versionInvocation.args, {
+      cwd: versionInvocation.cwd,
+      encoding: "utf8",
+      timeout: 30_000,
+      windowsHide: true,
+    });
+    if (versionResult.error) throw versionResult.error;
+    if (versionResult.status !== 0 || versionResult.stdout.trim() !== app.getVersion()) {
+      throw new Error(
+        `Installed launcher runtime is not executable`
+        + ` (status=${versionResult.status ?? "unknown"}, stdout=${JSON.stringify(versionResult.stdout.trim())},`
+        + ` stderr=${JSON.stringify(versionResult.stderr.trim())})`,
+      );
+    }
+    const markerPath = process.env.CODEX_WEB_GPT_SMOKE_FILE?.trim();
+    if (!markerPath || !path.isAbsolute(markerPath)) {
+      throw new Error("Packaged launcher smoke test requires an absolute CODEX_WEB_GPT_SMOKE_FILE");
+    }
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+    fs.writeFileSync(markerPath, `${JSON.stringify({
+      ok: true,
+      version: app.getVersion(),
+      platform: process.platform,
+      packaged: app.isPackaged,
+      runtimeVerified: true,
+    })}\n`);
+    app.exit(0);
+    return;
   }
-  app.commandLine.appendSwitch("remote-debugging-address", "127.0.0.1");
-  app.commandLine.appendSwitch("remote-debugging-port", String(cdpPort));
 
   await app.whenReady();
 
@@ -872,6 +921,8 @@ async function start() {
     control: browserControl.descriptor(),
     cancelTurn: IS_DEV_PROFILE ? undefined : traceId => runtimeSupervisor.cancelBrowserTurn(traceId),
     getConnectorName: () => runtimeHost.browserConnectorName(),
+    getConnectorPluginId: () => stateStore.read().connectorPluginId,
+    setConnectorPluginId: connectorPluginId => stateStore.update({ connectorPluginId }),
     helper: { executable: process.execPath, script: BROWSER_HELPER_PATH },
     logger,
     loginWithPasskey: () => runtimeHost.capturePasskeyLogin(),
@@ -897,55 +948,14 @@ async function start() {
   registerIpc({ logger, stateStore });
   const trayAvailable = createTray(logger, stateStore.read().language);
   if (startHidden && !trayAvailable) mainWindow.once("ready-to-show", () => showMainWindow());
-  const launcherSmokeTest = process.argv.includes("--launcher-smoke-test");
   let startupAuthenticationRefresh = Promise.resolve();
-  if (!launcherSmokeTest) {
-    startupAuthenticationRefresh = browserHost.refreshAuthentication().catch((error) => {
-      logger.warn("browser.session_refresh_failed", {
-        ...navigationErrorForLog(error),
-      });
+  startupAuthenticationRefresh = browserHost.refreshAuthentication().catch((error) => {
+    logger.warn("browser.session_refresh_failed", {
+      ...navigationErrorForLog(error),
     });
-  }
+  });
   await loadRenderer(mainWindow);
-  if (!launcherSmokeTest) void updateController.checkOnce();
-  if (launcherSmokeTest) {
-    const smokeRuntimeRoot = runtimeRootProvider();
-    if (app.isPackaged && !smokeRuntimeRoot) {
-      throw new Error("Packaged launcher smoke test could not install its durable runtime");
-    }
-    const versionInvocation = runtimeSupervisor.runtimeCommand(["--version"]);
-    const versionResult = spawnSync(versionInvocation.executable, versionInvocation.args, {
-      cwd: versionInvocation.cwd,
-      encoding: "utf8",
-      timeout: 30_000,
-      windowsHide: true,
-    });
-    if (versionResult.error) throw versionResult.error;
-    if (versionResult.status !== 0 || versionResult.stdout.trim() !== app.getVersion()) {
-      throw new Error(
-        `Installed launcher runtime is not executable`
-        + ` (status=${versionResult.status ?? "unknown"}, stdout=${JSON.stringify(versionResult.stdout.trim())},`
-        + ` stderr=${JSON.stringify(versionResult.stderr.trim())})`,
-      );
-    }
-    const markerPath = process.env.CODEX_WEB_GPT_SMOKE_FILE?.trim();
-    if (!markerPath || !path.isAbsolute(markerPath)) {
-      throw new Error("Packaged launcher smoke test requires an absolute CODEX_WEB_GPT_SMOKE_FILE");
-    }
-    fs.mkdirSync(path.dirname(markerPath), { recursive: true });
-    fs.writeFileSync(markerPath, `${JSON.stringify({
-      ok: true,
-      version: app.getVersion(),
-      platform: process.platform,
-      packaged: app.isPackaged,
-      runtimeVerified: true,
-    })}\n`);
-    browserHost.destroy();
-    await browserControl.close();
-    mainWindow.destroy();
-    app.quit();
-    return;
-  }
+  void updateController.checkOnce();
   if (IS_DEV_PROFILE) {
     let config = null;
     try {
@@ -985,8 +995,8 @@ async function start() {
     if (upgrade.updated) {
       const state = stateStore.update({
         coreSetupComplete: true,
-        codexCatalogVerified: false,
-        codexRestartRequired: true,
+        codexCatalogVerified: true,
+        codexRestartRequired: false,
         experimentalBiggerContext: runtimeHost.runtimeConfigSnapshot().config?.experimentalBiggerContext === true,
         ...(upgrade.mode === "full" ? {
           mcpRuntimeInstalled: true,
@@ -1006,6 +1016,17 @@ async function start() {
         connectorMigrated: upgrade.connectorMigrated,
       });
     }
+    const connectorState = stateStore.read();
+    if (connectorState.mcpSetupComplete === true && !connectorState.connectorPluginId) {
+      try {
+        await browserHost.verifyConnector(runtimeHost.mcpConnectorName());
+        logger.info("connector.identity_cached_at_startup", { verified: true });
+      } catch (error) {
+        logger.warn("connector.identity_cache_startup_failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
     const configuredRuntime = runtimeHost.runtimeConfigSnapshot();
     if (configuredRuntime.configured) {
       const enabled = configuredRuntime.config?.experimentalBiggerContext === true;
@@ -1015,21 +1036,17 @@ async function start() {
       }
     }
     const runtime = await runtimeSupervisor.startIfConfigured();
-    if (runtime.status !== "ready") return runtime;
-    const route = await runtimeHost.connectBridgeRoute();
-    return { ...runtime, bridgeRouteChanged: route.changed === true };
+    return runtime;
   })().then(async (runtime) => {
     if (runtime.status === "ready") {
       const config = runtimeSupervisor.readConfig();
       const current = stateStore.read();
       const patch = {
         coreSetupComplete: true,
+        codexCatalogVerified: true,
+        codexRestartRequired: false,
         mcpRuntimeInstalled: config.mode === "full",
         experimentalBiggerContext: config.experimentalBiggerContext === true,
-        ...(runtime.bridgeRouteChanged ? {
-          codexCatalogVerified: false,
-          codexRestartRequired: true,
-        } : {}),
         ...(config.mode === "browser-only" ? {
           mcpSetupComplete: false,
           mcpGuideStep: 0,
@@ -1039,11 +1056,9 @@ async function start() {
         const state = stateStore.update(patch);
         send("launcher:state-changed", state);
       }
-      startCatalogVerificationMonitor({ logger, stateStore });
       return;
     }
     if (runtime.status === "not-configured") {
-      const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
       const current = stateStore.read();
       if (current.coreSetupComplete || current.mcpRuntimeInstalled || current.mcpSetupComplete) {
         const state = stateStore.update({
@@ -1055,16 +1070,8 @@ async function start() {
         });
         send("launcher:state-changed", state);
       }
-      if (routeRecovery.error) {
-        publishOperation({
-          name: "runtime-start",
-          status: "failed",
-          message: `Local runtime is not configured; restoring the previous Codex route also failed: ${routeRecovery.error}`,
-        });
-      }
       return;
     }
-    const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
     const state = stateStore.update({ coreSetupComplete: false, codexCatalogVerified: false });
     send("launcher:state-changed", state);
     if (runtime.status === "external" || runtime.status === "needs-setup") {
@@ -1076,25 +1083,15 @@ async function start() {
       publishOperation({
         name: "runtime-start",
         status: "failed",
-        message: routeRecovery.error
-          ? `${detail}; restoring the previous Codex route also failed: ${routeRecovery.error}`
-          : routeRecovery.restored
-            ? `${detail}; the previous Codex route was restored, restart Codex once`
-            : detail,
+        message: detail,
       });
     }
-  }).catch(async (error) => {
+  }).catch((error) => {
     const primary = error instanceof Error ? error.message : String(error);
-    const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
-    const message = routeRecovery.error
-      ? `${primary}; restoring the previous Codex route also failed: ${routeRecovery.error}`
-      : routeRecovery.restored
-        ? `${primary}; the previous Codex route was restored, restart Codex once`
-        : primary;
-    logger.error("runtime.startup_failed", { message });
+    logger.error("runtime.startup_failed", { message: primary });
     const state = stateStore.update({ coreSetupComplete: false, codexCatalogVerified: false });
     send("launcher:state-changed", state);
-    publishOperation({ name: "runtime-start", status: "failed", message });
+    publishOperation({ name: "runtime-start", status: "failed", message: primary });
   });
 
   app.on("activate", () => showMainWindow());

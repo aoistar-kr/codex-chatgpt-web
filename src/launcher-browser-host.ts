@@ -23,7 +23,7 @@ export class LauncherRetainedConversationUnavailableError extends Error {
 }
 
 export interface LauncherBrowserHostDescriptor {
-  version: 2;
+  version: 3;
   kind: typeof LAUNCHER_BROWSER_HOST_KIND;
   profile: LauncherBrowserHostProfile;
   pid: number;
@@ -39,6 +39,7 @@ export interface LauncherBrowserHostDescriptor {
   partition: string;
   idleUrl: string;
   surfaceId: string;
+  surfaceTargets: Record<string, string>;
   createdAt: string;
 }
 
@@ -68,8 +69,8 @@ function assertDescriptorShape(value: unknown): LauncherBrowserHostDescriptor {
     throw new Error("Launcher browser descriptor is not an object");
   }
   const descriptor = value as Partial<LauncherBrowserHostDescriptor>;
-  if (descriptor.version !== 2 || descriptor.kind !== LAUNCHER_BROWSER_HOST_KIND) {
-    throw new Error("Launcher browser descriptor has an unsupported identity or version");
+  if (descriptor.version !== 3 || descriptor.kind !== LAUNCHER_BROWSER_HOST_KIND) {
+    throw new Error("Launcher browser descriptor has an unsupported identity or version; restart the updated launcher");
   }
   if (descriptor.profile !== "production" && descriptor.profile !== "development") {
     throw new Error("Launcher browser descriptor has an invalid profile");
@@ -108,11 +109,18 @@ function assertDescriptorShape(value: unknown): LauncherBrowserHostDescriptor {
   if (typeof descriptor.surfaceId !== "string" || !/^[A-Za-z0-9_-]{32}$/.test(descriptor.surfaceId)) {
     throw new Error("Launcher browser descriptor has an invalid owned surface id");
   }
+  const targets = descriptor.surfaceTargets;
+  if (!targets || typeof targets !== "object" || Array.isArray(targets)
+    || Object.entries(targets).some(([surface, target]) => !/^[A-Za-z0-9_-]{32}$/.test(surface)
+      || typeof target !== "string" || !target.trim())
+    || new Set(Object.values(targets)).size !== Object.keys(targets).length) {
+    throw new Error("Launcher browser descriptor has invalid or duplicated surface targets");
+  }
   if (typeof descriptor.createdAt !== "string" || Number.isNaN(Date.parse(descriptor.createdAt))) {
     throw new Error("Launcher browser descriptor has an invalid creation time");
   }
   return {
-    version: 2,
+    version: 3,
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile: descriptor.profile,
     pid: descriptor.pid!,
@@ -122,6 +130,7 @@ function assertDescriptorShape(value: unknown): LauncherBrowserHostDescriptor {
     partition: descriptor.partition,
     idleUrl: descriptor.idleUrl,
     surfaceId: descriptor.surfaceId,
+    surfaceTargets: targets,
     createdAt: descriptor.createdAt,
   };
 }
@@ -150,11 +159,13 @@ export function readLauncherBrowserHostDescriptor(configuredPath: string): Launc
   return descriptor;
 }
 
-async function assertCdpReady(descriptor: LauncherBrowserHostDescriptor, timeoutMs: number): Promise<void> {
+async function assertCdpReady(descriptor: LauncherBrowserHostDescriptor, timeoutMs: number, abortSignal?: AbortSignal): Promise<void> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`${descriptor.endpoint}/json/version`, { signal: controller.signal });
+    const response = await fetch(`${descriptor.endpoint}/json/version`, {
+      signal: abortSignal ? AbortSignal.any([controller.signal, abortSignal]) : controller.signal,
+    });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const body = await response.json() as Record<string, unknown>;
     if (typeof body.webSocketDebuggerUrl !== "string" || !body.webSocketDebuggerUrl.startsWith("ws://127.0.0.1:")) {
@@ -174,25 +185,37 @@ export async function selectLauncherPage(
   surfaceId = descriptor.surfaceId,
   abortSignal?: AbortSignal,
 ): Promise<{ context: BrowserContext; page: Page }> {
+  if (abortSignal?.aborted) {
+    throw new DOMException("Launcher browser connection aborted", "AbortError");
+  }
+  const targetId = descriptor.surfaceTargets[surfaceId];
+  if (!targetId) throw new Error("Launcher browser surface is no longer registered with its native target");
   const deadline = Date.now() + timeoutMs;
   do {
     if (abortSignal?.aborted) {
       throw new DOMException("Launcher browser connection aborted", "AbortError");
     }
     const candidates = browser.contexts().flatMap(context => context.pages().map(page => ({ context, page })));
-    const inspected = await Promise.all(candidates.map(async candidate => ({
-      ...candidate,
-      surfaceId: await candidate.page.evaluate(
-        () => (globalThis as typeof globalThis & { __CODEX_WEB_GPT_SURFACE_ID__?: unknown })
-          .__CODEX_WEB_GPT_SURFACE_ID__,
-      ).catch(() => undefined),
-    })));
-    const owned = inspected.filter(candidate => candidate.surfaceId === surfaceId);
+    // Target metadata belongs to Chromium itself. Avoid evaluating every renderer just to discover
+    // ownership: an unrelated busy/paused page must not block acquisition of the requested surface.
+    const inspected = await Promise.all(candidates.map(async candidate => {
+      const session = await candidate.context.newCDPSession(candidate.page).catch(() => undefined);
+      if (!session) return { ...candidate, targetId: undefined };
+      try {
+        const { targetInfo } = await session.send("Target.getTargetInfo");
+        return { ...candidate, targetId: targetInfo.targetId };
+      } catch {
+        return { ...candidate, targetId: undefined };
+      } finally {
+        await session.detach().catch(() => {});
+      }
+    }));
+    const owned = inspected.filter(candidate => candidate.targetId === targetId);
     if (owned.length === 1) {
       return { context: owned[0].context, page: owned[0].page };
     }
     if (owned.length > 1) {
-      throw new Error(`Launcher browser host exposed ${owned.length} surfaces with the same ownership id`);
+      throw new Error(`Launcher browser host exposed ${owned.length} surfaces with the same native target`);
     }
     await new Promise(resolve => setTimeout(resolve, 100));
   } while (Date.now() < deadline);
@@ -209,7 +232,10 @@ export async function connectLauncherBrowserHost(
     throw new DOMException("Launcher browser connection aborted", "AbortError");
   }
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
-  await assertCdpReady(descriptor, Math.min(timeoutMs, 5_000));
+  await assertCdpReady(descriptor, Math.min(timeoutMs, 5_000), abortSignal);
+  // Readiness can finish after cancellation (including transports that settle late).
+  // Never start a new CDP connection after that boundary.
+  if (abortSignal?.aborted) throw new DOMException("Launcher browser connection aborted", "AbortError");
   let browser: Browser;
   try {
     browser = await chromium.connectOverCDP(descriptor.endpoint, { timeout: timeoutMs });
@@ -311,6 +337,8 @@ export type LauncherTurnActivity =
       conversationKey?: string;
       connectorIdentity?: string;
       requireRetainedConversation?: boolean;
+      modelId?: string;
+      reasoning?: string;
     }
   | {
       phase: "heartbeat";
@@ -342,12 +370,16 @@ export async function notifyLauncherTurn(
     : activity.phase === "heartbeat"
       ? LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS
       : LAUNCHER_TURN_START_TIMEOUT_MS,
+  abortSignal?: AbortSignal,
 ): Promise<{
   surfaceId?: string;
   reused?: boolean;
   connectorBound?: boolean;
+  connectorPluginId?: string;
+  effortPrepared?: boolean;
   cancelledByUser?: boolean;
 }> {
+  if (abortSignal?.aborted) throw new DOMException("Launcher turn notification aborted", "AbortError");
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -359,7 +391,7 @@ export async function notifyLauncherTurn(
         "content-type": "application/json",
       },
       body: JSON.stringify(activity),
-      signal: controller.signal,
+      signal: abortSignal ? AbortSignal.any([controller.signal, abortSignal]) : controller.signal,
     });
     if (!response.ok) {
       const body = await response.json().catch(() => ({})) as Record<string, unknown>;
@@ -387,10 +419,20 @@ export async function notifyLauncherTurn(
       if (typeof body.connectorBound !== "boolean") {
         throw new Error("Launcher browser control channel returned an invalid connector state");
       }
+      if (body.connectorPluginId !== undefined
+        && (typeof body.connectorPluginId !== "string"
+          || !/^plugin:[A-Za-z0-9_-]{16,128}$/.test(body.connectorPluginId))) {
+        throw new Error("Launcher browser control channel returned an invalid connector plugin id");
+      }
+      if (body.effortPrepared !== undefined && typeof body.effortPrepared !== "boolean") {
+        throw new Error("Launcher browser control channel returned an invalid effort-prewarm state");
+      }
       return {
         surfaceId: body.surfaceId,
         reused: body.reused,
         connectorBound: body.connectorBound,
+        ...(typeof body.connectorPluginId === "string" ? { connectorPluginId: body.connectorPluginId } : {}),
+        ...(body.effortPrepared === true ? { effortPrepared: true } : {}),
       };
     }
     if (activity.phase === "end") {

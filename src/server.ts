@@ -3,8 +3,19 @@ import { closeChatGptBrowserWorkers } from "./adapters/chatgpt-web/browser-worke
 import { closeTurnBrokers, TurnBroker } from "./adapters/chatgpt-web/turn-broker";
 import { timingSafeEqual } from "node:crypto";
 import { chatGptTurnSessions } from "./adapters/chatgpt-web/turn-execution";
+import {
+  cancelAllStructuredCompactions,
+  cancelStructuredCompactionNativeTurn,
+  cancelStructuredCompactionTrace,
+} from "./adapters/chatgpt-web/compaction-handoff";
 import { chatGptBrowserTabClosedError } from "./adapters/chatgpt-web/adapter-error";
-import { CHATGPT_TURN_REVISION_CONFLICT_MESSAGE } from "./adapters/chatgpt-web/environment";
+import {
+  CHATGPT_TURN_REVISION_CONFLICT_MESSAGE,
+  extractChatGptCompactionSourceRevision,
+  extractChatGptTurnIdentity,
+  extractCodexTurnIdentityFromBody,
+} from "./adapters/chatgpt-web/environment";
+import { rememberCompactionContinuation } from "./adapters/chatgpt-web/compaction-continuation";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
 import type { AppConfig } from "./config";
 import { providerConfig } from "./config";
@@ -24,7 +35,7 @@ import {
   requireChatGptWebModelRoute,
   type ChatGptWebModelRoute,
 } from "./chatgpt-web-models";
-import { forwardNativeCodexRequest, type NativeFetch } from "./native-passthrough";
+import { forwardNativeCodexRequest, type NativeFetch, type NativeImageEndpoint } from "./native-passthrough";
 import {
   buildCompactV1Output,
   COMPACT_PROMPT,
@@ -38,7 +49,12 @@ import type { CodexProviderConfig } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
 import { VERSION } from "./version";
 
-type HttpTrackedEndpoint = "models" | "responses" | "compact" | "search" | "unspecified";
+type HttpTrackedEndpoint = "models" | "responses" | "compact" | "search" | "unspecified" | NativeImageEndpoint;
+
+export interface NativeCodexTurnIdentity {
+  threadId: string;
+  turnId: string;
+}
 
 export interface HttpStreamFailureEvidence {
   httpTurnId: number;
@@ -104,8 +120,25 @@ export class HttpTurnCounter {
     abort: AbortController;
     done: Promise<void>;
     finish: () => void;
+    identity?: NativeCodexTurnIdentity;
   }>();
+  private readonly interrupted = new Map<string, unknown>();
   private nextId = 1;
+
+  private identityKey(identity: NativeCodexTurnIdentity): string {
+    return `${identity.threadId}\u0000${identity.turnId}`;
+  }
+
+  private rememberInterrupted(identity: NativeCodexTurnIdentity, reason: unknown): void {
+    const key = this.identityKey(identity);
+    this.interrupted.delete(key);
+    this.interrupted.set(key, reason);
+    while (this.interrupted.size > 1_024) {
+      const oldest = this.interrupted.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.interrupted.delete(oldest);
+    }
+  }
 
   constructor(private readonly reportStreamFailure: HttpStreamFailureReporter = reportHttpStreamFailure) {}
 
@@ -122,8 +155,32 @@ export class HttpTurnCounter {
     return turns.length;
   }
 
+  async cancelTurn(
+    identity: NativeCodexTurnIdentity,
+    reason: unknown = new DOMException("Codex turn interrupted", "AbortError"),
+  ): Promise<number> {
+    const cancellation = this.beginCancelTurn(identity, reason);
+    await cancellation.settlement;
+    return cancellation.cancelled;
+  }
+
+  beginCancelTurn(
+    identity: NativeCodexTurnIdentity,
+    reason: unknown = new DOMException("Codex turn interrupted", "AbortError"),
+  ): { cancelled: number; settlement: Promise<void> } {
+    this.rememberInterrupted(identity, reason);
+    const turns = [...this.active.values()].filter(turn => (
+      turn.identity?.threadId === identity.threadId && turn.identity.turnId === identity.turnId
+    ));
+    for (const turn of turns) if (!turn.abort.signal.aborted) turn.abort.abort(reason);
+    return {
+      cancelled: turns.length,
+      settlement: Promise.all(turns.map(turn => turn.done)).then(() => undefined),
+    };
+  }
+
   async track(
-    run: (signal: AbortSignal) => Promise<Response>,
+    run: (signal: AbortSignal, bindIdentity: (identity: NativeCodexTurnIdentity) => void) => Promise<Response>,
     clientSignal?: AbortSignal,
     platform: NodeJS.Platform = process.platform,
     endpoint: HttpTrackedEndpoint = "unspecified",
@@ -132,7 +189,13 @@ export class HttpTurnCounter {
     const abort = new AbortController();
     let finish!: () => void;
     const done = new Promise<void>(resolve => { finish = resolve; });
-    this.active.set(id, { abort, done, finish });
+    const tracked: {
+      abort: AbortController;
+      done: Promise<void>;
+      finish: () => void;
+      identity?: NativeCodexTurnIdentity;
+    } = { abort, done, finish };
+    this.active.set(id, tracked);
     let released = false;
     let clientAbortListener: (() => void) | undefined;
     let streamAbortListener: (() => void) | undefined;
@@ -152,7 +215,18 @@ export class HttpTurnCounter {
     else clientSignal?.addEventListener("abort", clientAbortListener, { once: true });
 
     try {
-      const response = await run(abort.signal);
+      const response = await run(abort.signal, identity => {
+        if (!identity.threadId.trim() || !identity.turnId.trim()) {
+          throw new Error("Native Codex turn identity must contain a threadId and turnId");
+        }
+        if (tracked.identity
+          && (tracked.identity.threadId !== identity.threadId || tracked.identity.turnId !== identity.turnId)) {
+          throw new Error("An HTTP request cannot change its native Codex turn identity");
+        }
+        tracked.identity = identity;
+        const interruptedReason = this.interrupted.get(this.identityKey(identity));
+        if (interruptedReason !== undefined && !abort.signal.aborted) abort.abort(interruptedReason);
+      });
       if (!response.body) {
         release();
         return response;
@@ -278,6 +352,8 @@ export interface ResponseRequestOptions {
   rememberState?: boolean;
   /** Observe the exact production adapter stream when invoking the handler in-process. */
   onAdapterEvent?: (event: AdapterEvent) => void;
+  /** Bind the physical HTTP stream to the exact native Codex turn that owns it. */
+  onTurnIdentity?: (identity: NativeCodexTurnIdentity) => void;
 }
 
 export function routeChatGptWebRequest(parsed: CodexParsedRequest, config: AppConfig): ChatGptWebModelRoute {
@@ -326,6 +402,22 @@ export async function nativeSearchRequest(
   }
 }
 
+async function nativeImagesRequest(
+  req: Request,
+  endpoint: NativeImageEndpoint,
+  fetchUpstream?: NativeFetch,
+): Promise<Response> {
+  const authorization = req.headers.get("authorization") ?? "";
+  if (!authorization.startsWith("Bearer ") || authorization.length <= "Bearer ".length) {
+    return formatErrorResponse(401, "authentication_error", "Native image requests require incoming Codex Bearer authorization");
+  }
+  try {
+    return await forwardNativeCodexRequest(req, endpoint, fetchUpstream);
+  } catch (error) {
+    return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
+  }
+}
+
 function toolBridgeMaps(parsed: CodexParsedRequest): {
   toolNsMap: Map<string, { namespace: string; name: string }>;
   freeformToolNames: Set<string>;
@@ -358,6 +450,12 @@ export async function responseRequest(
       "invalid_request_error",
       error instanceof Error ? error.message : "Request body must be valid JSON",
     );
+  }
+  try {
+    const identity = extractCodexTurnIdentityFromBody(raw);
+    if (identity.threadId && identity.turnId) options.onTurnIdentity?.({ threadId: identity.threadId, turnId: identity.turnId });
+  } catch (error) {
+    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
   }
   const requestedModel = raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { model?: unknown }).model
@@ -398,6 +496,26 @@ export async function responseRequest(
   }
 
   const compaction = parsed._compactionRequest === true;
+  const rememberCompletedResponse = (response: Record<string, unknown>): void => {
+    if (!compaction) {
+      if (options.rememberState !== false) rememberResponseState(parsed._rawBody, response, { force: true });
+      return;
+    }
+    if (response.status !== "completed") return;
+    const identity = extractChatGptTurnIdentity(parsed);
+    if (!identity.threadId || !identity.turnId || !Array.isArray(response.output) || response.output.length !== 1) return;
+    const item = response.output[0] as Record<string, unknown> | undefined;
+    if (item?.type !== "compaction" || typeof item.encrypted_content !== "string") return;
+    const summary = decodeCompactionSummary(item.encrypted_content);
+    if (!summary) return;
+    const source = extractChatGptCompactionSourceRevision(parsed);
+    const body = parsed._rawBody as { input?: unknown[] };
+    const v1Source = extractChatGptCompactionSourceRevision({
+      ...parsed,
+      _rawBody: { ...body, input: buildCompactV1Output(extractCompactUserMessages(body.input), summary) },
+    });
+    rememberCompactionContinuation(parsed, identity, [source, v1Source], summary);
+  };
   if (compaction && route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) {
     return formatErrorResponse(
       409,
@@ -488,11 +606,8 @@ export async function responseRequest(
         ...(provider.chatgptWeb?.stallTimeoutSec !== undefined
           ? { stallTimeoutSec: provider.chatgptWeb.stallTimeoutSec }
           : {}),
-        ...(compaction ? { compaction: true } : {
-          ...(options.rememberState === false ? {} : {
-            onCompletedResponse: (response: Record<string, unknown>) => rememberResponseState(parsed._rawBody, response, { force: true }),
-          }),
-        }),
+        ...(compaction ? { compaction: true } : {}),
+        onCompletedResponse: rememberCompletedResponse,
       },
     );
     return new Response(stream, {
@@ -514,9 +629,7 @@ export async function responseRequest(
     toolSearchToolNames: maps.toolSearchToolNames,
     ...(compaction ? { compaction: true } : {}),
   });
-  if (!compaction && options.rememberState !== false) {
-    rememberResponseState(parsed._rawBody, json, { force: true });
-  }
+  rememberCompletedResponse(json);
   return Response.json(json);
 }
 
@@ -524,6 +637,7 @@ export async function compactRequest(
   req: Request,
   config: AppConfig,
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
+  options: Pick<ResponseRequestOptions, "onTurnIdentity"> = {},
 ): Promise<Response> {
   const nativeRequest = req.clone();
   let raw: Record<string, unknown>;
@@ -554,7 +668,12 @@ export async function compactRequest(
       },
     };
   }
-  if (typeof raw.model !== "string" || !raw.model) {
+  try {
+    const identity = extractCodexTurnIdentityFromBody(raw);
+    if (identity.threadId && identity.turnId) options.onTurnIdentity?.({ threadId: identity.threadId, turnId: identity.turnId });
+  } catch (error) {
+    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+  }  if (typeof raw.model !== "string" || !raw.model) {
     return formatErrorResponse(400, "invalid_request_error", "Compaction request requires a model");
   }
   if (!isChatGptWebModelSlug(raw.model)) {
@@ -586,7 +705,7 @@ export async function compactRequest(
     body: JSON.stringify({ ...raw, stream: false, input: [...input, { type: "compaction_trigger" }] }),
     signal: req.signal,
   });
-  const response = await responseRequest(internal, config, adapterFactory);
+  const response = await responseRequest(internal, config, adapterFactory, options);
   if (!response.ok) return response;
   let body: {
     output?: unknown[];
@@ -630,7 +749,7 @@ export async function compactRequest(
 
 export function startServer(
   config: AppConfig,
-  dependencies: { fetchUpstream?: NativeFetch } = {},
+  dependencies: { fetchUpstream?: NativeFetch; adapterFactory?: ChatGptWebAdapterFactory } = {},
 ): ReturnType<typeof Bun.serve> {
   if (config.purpose === "dev-harness") {
     throw new Error("DEV harness configuration cannot start a Responses listener");
@@ -700,24 +819,70 @@ export function startServer(
           );
         }
         const reason = chatGptBrowserTabClosedError();
-        const cancelledBrowserTurns = await chatGptTurnSessions.cancelTrace(traceId, reason);
+        const compactionCancellation = cancelStructuredCompactionTrace(traceId, reason);
+        const browserCancellation = chatGptTurnSessions.cancelTrace(traceId, reason);
+        const [cancelledBrowserTurns, cancelledCompactionRuns] = await Promise.all([
+          browserCancellation,
+          compactionCancellation,
+        ]);
         const cancelledBrokerTurns = turnBroker?.revokeTrace(traceId, reason) ?? 0;
         return Response.json({
           status: "ok",
           trace_id: traceId,
           cancelled_browser_turns: cancelledBrowserTurns,
           cancelled_broker_turns: cancelledBrokerTurns,
+          cancelled_compaction_runs: cancelledCompactionRuns,
           ...activity(),
+        });
+      }
+      if (req.method === "POST" && url.pathname === "/admin/interrupt-turn") {
+        if (!controlAuthorized(req)) return new Response("Unauthorized", { status: 401 });
+        let identity: NativeCodexTurnIdentity;
+        try {
+          const body = await req.json() as { threadId?: unknown; turnId?: unknown };
+          const threadId = typeof body?.threadId === "string" ? body.threadId.trim() : "";
+          const turnId = typeof body?.turnId === "string" ? body.turnId.trim() : "";
+          if (!/^[A-Za-z0-9_-]{6,128}$/.test(threadId) || !/^[A-Za-z0-9_-]{6,128}$/.test(turnId)) {
+            throw new Error("native Codex threadId or turnId is invalid");
+          }
+          identity = { threadId, turnId };
+        } catch (error) {
+          return Response.json({ status: "error", error: error instanceof Error ? error.message : String(error) }, { status: 400 });
+        }
+        const reason = new DOMException("Codex turn interrupted", "AbortError");
+        const browserCancellation = chatGptTurnSessions.cancelNativeTurn(identity.threadId, identity.turnId, reason);
+        const compactionCancellation = cancelStructuredCompactionNativeTurn(identity.threadId, identity.turnId, reason);
+        const httpCancellation = httpTurns.beginCancelTurn(identity, reason);
+        void Promise.allSettled([
+          browserCancellation.settlement,
+          compactionCancellation.settlement,
+          httpCancellation.settlement,
+        ]).then(results => {
+          for (const result of results) if (result.status === "rejected") {
+            console.error(`[chatgpt-web] interrupted turn cleanup failed: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
+          }
+        });
+        return Response.json({
+          status: "ok",
+          cancelled_http_turns: httpCancellation.cancelled,
+          cancelled_browser_turns: browserCancellation.cancelled,
+          cancelled_compaction_runs: compactionCancellation.cancelled,
         });
       }
       if (req.method === "POST" && url.pathname === "/admin/cancel-turns") {
         if (!controlAuthorized(req)) return new Response("Unauthorized", { status: 401 });
+        const reason = new Error("Active turn cancelled by launcher");
+        const compactionCancellation = cancelAllStructuredCompactions(reason);
         const cancelledBrowserTurns = chatGptTurnSessions.clear() + (turnBroker?.revokeExternalOwners() ?? 0);
-        const cancelledHttpTurns = await httpTurns.cancelAll(new Error("Active turn cancelled by launcher"));
+        const [cancelledHttpTurns, cancelledCompactionRuns] = await Promise.all([
+          httpTurns.cancelAll(reason),
+          compactionCancellation,
+        ]);
         return Response.json({
           status: "ok",
           cancelled_http_turns: cancelledHttpTurns,
           cancelled_browser_turns: cancelledBrowserTurns,
+          cancelled_compaction_runs: cancelledCompactionRuns,
           ...activity(),
         });
       }
@@ -781,7 +946,9 @@ export function startServer(
       if (req.method === "POST" && url.pathname === "/v1/responses") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
         return httpTurns.track(
-          signal => responseRequest(new Request(req, { signal }), config),
+          (signal, bindIdentity) => responseRequest(
+            new Request(req, { signal }), config, dependencies.adapterFactory, { onTurnIdentity: bindIdentity },
+          ),
           req.signal,
           process.platform,
           "responses",
@@ -790,7 +957,9 @@ export function startServer(
       if (req.method === "POST" && url.pathname === "/v1/responses/compact") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
         return httpTurns.track(
-          signal => compactRequest(new Request(req, { signal }), config),
+          (signal, bindIdentity) => compactRequest(
+            new Request(req, { signal }), config, dependencies.adapterFactory, { onTurnIdentity: bindIdentity },
+          ),
           req.signal,
           process.platform,
           "compact",
@@ -803,6 +972,19 @@ export function startServer(
           req.signal,
           process.platform,
           "search",
+        );
+      }
+      if (req.method === "POST"
+        && (url.pathname === "/v1/images/generations" || url.pathname === "/v1/images/edits")) {
+        if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
+        const endpoint: NativeImageEndpoint = url.pathname === "/v1/images/generations"
+          ? "images/generations"
+          : "images/edits";
+        return httpTurns.track(
+          signal => nativeImagesRequest(new Request(req, { signal }), endpoint, dependencies.fetchUpstream),
+          req.signal,
+          process.platform,
+          endpoint,
         );
       }
       return new Response("Not found", { status: 404 });

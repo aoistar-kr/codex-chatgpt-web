@@ -53,17 +53,21 @@ test("normal shutdown persists the ChatGPT session before closing browser views"
   assert.ok(destroy > persist, "browser views must close only after session persistence completes");
 });
 
-test("packaged runtime is verified before launcher browser surfaces can bind ports", () => {
+test("CDP switches are configured before runtime preparation while browser surfaces still wait for verification", () => {
   const start = electronMain.indexOf("async function start()");
-  const runtimeValidation = electronMain.indexOf("installedRuntimeRoot = runtimeRootProvider();", start);
   const cdpPortAllocation = electronMain.indexOf("cdpPort = await findFreePort();", start);
+  const cdpSwitch = electronMain.indexOf('app.commandLine.appendSwitch("remote-debugging-port", String(cdpPort));', start);
+  const runtimePreparation = electronMain.indexOf("let installedRuntimeRoot = await preparePackagedRuntimeConcurrent({", start);
+  const runtimeValidation = electronMain.indexOf("installedRuntimeRoot = runtimeRootProvider();", start);
   const windowCreation = electronMain.indexOf("mainWindow = createWindow({", start);
   const controlServerStart = electronMain.indexOf("browserControl = await new BrowserControlServer({", start);
   const browserReady = electronMain.indexOf("await browserHost.ready();", start);
 
+  assert.ok(cdpPortAllocation > start, "startup must reserve its CDP port");
+  assert.ok(cdpSwitch > cdpPortAllocation, "startup must configure the CDP switch after reserving the port");
+  assert.ok(runtimePreparation > cdpSwitch, "CDP switches must be configured before asynchronous runtime preparation");
   assert.ok(runtimeValidation > start, "startup must eagerly verify the packaged runtime");
   for (const [surface, position] of [
-    ["CDP port allocation", cdpPortAllocation],
     ["launcher window", windowCreation],
     ["browser control server", controlServerStart],
     ["embedded browser", browserReady],
@@ -125,11 +129,12 @@ test("MCP surfaces use the official local protocol mark", () => {
   assert.match(stylesSource, /mask:\s*url\("\.\.\/assets\/mcp-mark\.svg"\)/);
 });
 
-test("the configured launcher exposes no persistent bridge opt-out", () => {
+test("the configured launcher is provider-only and never takes over the Codex route", () => {
   assert.doesNotMatch(appSource, /setBridgeEnabled|bridgeRouteBody/);
   assert.doesNotMatch(preloadSource, /launcher:bridge-enabled|setBridgeEnabled/);
   assert.doesNotMatch(electronMain, /launcher:bridge-enabled|bridge-disabled|bridgeEnabled/);
-  assert.match(electronMain, /runtimeSupervisor\.startIfConfigured\(\)[\s\S]*?runtimeHost\.connectBridgeRoute\(\)/);
+  assert.match(electronMain, /runtimeSupervisor\.startIfConfigured\(\)/);
+  assert.doesNotMatch(electronMain, /runtimeHost\.connectBridgeRoute\(\)/);
 });
 
 test("MCP connection remains unavailable until the model catalog is verified", () => {
@@ -194,11 +199,11 @@ test("saved ChatGPT authentication is refreshed before setup is presented", () =
   const refreshBarrier = electronMain.indexOf("await startupAuthenticationRefresh", productionStartup);
   const upgrade = electronMain.indexOf("runtimeHost.upgradeManagedRuntime()", productionStartup);
   const runtimeStart = electronMain.indexOf("runtimeSupervisor.startIfConfigured()", upgrade);
-  const routeConnect = electronMain.indexOf("runtimeHost.connectBridgeRoute()", runtimeStart);
   assert.ok(refreshBarrier > productionStartup, "production startup must wait for saved-session refresh");
   assert.ok(upgrade > refreshBarrier, "runtime upgrade must not inspect the browser before refresh settles");
   assert.ok(runtimeStart > upgrade, "configured runtime must start after any upgrade");
-  assert.ok(routeConnect > runtimeStart, "Codex route must connect only after the runtime is healthy");
+  assert.equal(electronMain.indexOf("runtimeHost.connectBridgeRoute()", runtimeStart), -1,
+    "provider-only startup must never connect a direct Codex route");
   assert.match(appSource, /browser\?\.status === "loading" \? copy\.checkingSignIn/);
 });
 

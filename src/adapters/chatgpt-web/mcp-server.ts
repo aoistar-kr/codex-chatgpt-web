@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { win32 as win32Path } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
@@ -6,6 +7,11 @@ import { namespacedToolName, type CodexTool } from "../../types";
 import { VERSION } from "../../version";
 import type { ChatGptTurnEnvironment } from "./environment";
 import { CODEX_COMPACTION_CONTROL_WIRE_NAME } from "./native-compaction-control";
+import {
+  CODEX_PARALLEL_EXEC_BATCH_CONTROL_WIRE_NAME,
+  CODEX_PARALLEL_EXEC_BATCH_MAX_CALLS,
+  CODEX_PARALLEL_EXEC_BATCH_MIN_CALLS,
+} from "./native-parallel-batch-control";
 import { callTurnBroker, TurnBrokerTimeoutError, type BrokerToolResult } from "./turn-broker";
 
 interface ClaimedTurn {
@@ -20,6 +26,14 @@ const GATEWAY_AGENT_WAIT_TOOL_NAMES = new Set([
 ]);
 const turnTokenSchema = z.string().min(20).max(256);
 const jsonArgumentsSchema = z.record(z.string(), z.unknown()).default({});
+const parallelExecBatchArgumentsSchema = z.object({
+  calls: z.array(z.object({
+    wire_name: z.literal("exec_command"),
+    arguments: z.record(z.string(), z.unknown()),
+  }).strict())
+    .min(CODEX_PARALLEL_EXEC_BATCH_MIN_CALLS)
+    .max(CODEX_PARALLEL_EXEC_BATCH_MAX_CALLS),
+}).strict();
 export const CHATGPT_WEB_AGENT_WAIT_POLL_MS = 10_000;
 // The OpenAI tunnel currently owns a two-minute command-response deadline. The local MCP server
 // must settle first so an abandoned native tool call is returned as an MCP error instead of
@@ -73,6 +87,47 @@ function wireName(tool: CodexTool): string {
 
 function exactTool(environment: ChatGptTurnEnvironment, name: string): CodexTool | undefined {
   return environment.tools.find(tool => !tool.namespace && tool.name === name);
+}
+
+function toolAdvertisesProperty(tool: CodexTool, name: string): boolean {
+  const properties = tool.parameters.properties;
+  return Boolean(properties
+    && typeof properties === "object"
+    && !Array.isArray(properties)
+    && Object.prototype.hasOwnProperty.call(properties, name));
+}
+
+const SIMPLE_WINDOWS_NATIVE_COMMAND = /^[A-Za-z0-9_.:\\/+-]+\.(?:exe|com|cmd|bat)(?: [A-Za-z0-9_.:\\/@,=+-]+)*$/i;
+
+/**
+ * Select cmd.exe only for a deliberately tiny shell-neutral subset. The command text is never
+ * rewritten: anything that needs quoting, expansion, redirection, a pipeline, wildcard handling,
+ * PowerShell syntax, or another shell-specific feature remains on Codex's normal command path.
+ *
+ * This stays behind the exact outer exec_command schema so older Codex builds and alternate tool
+ * surfaces keep their existing behaviour. The outer Codex runtime still owns sandboxing,
+ * approvals, process creation, and the command lifecycle.
+ */
+export function withLowOverheadWindowsCommandShell(
+  tool: CodexTool,
+  args: Record<string, unknown>,
+  runtime: { platform?: string; comSpec?: string } = {},
+): Record<string, unknown> {
+  const platform = runtime.platform ?? process.platform;
+  if (platform !== "win32" || !toolAdvertisesProperty(tool, "shell")) return args;
+  const command = args.cmd;
+  if (typeof command !== "string" || !SIMPLE_WINDOWS_NATIVE_COMMAND.test(command)) return args;
+
+  const comSpec = runtime.comSpec ?? process.env.ComSpec;
+  if (typeof comSpec !== "string"
+    || !win32Path.isAbsolute(comSpec)
+    || win32Path.basename(comSpec).toLowerCase() !== "cmd.exe") return args;
+
+  return {
+    ...args,
+    shell: comSpec,
+    ...(toolAdvertisesProperty(tool, "login") ? { login: false } : {}),
+  };
 }
 
 function gatewayToolNameIsValid(name: string): boolean {
@@ -549,7 +604,9 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       };
       const tool = exactTool(bound, "exec_command") ?? exactTool(bound, "shell_command");
       if (tool) {
-        const args = tool.name === "exec_command" ? execCommandArguments : shellCommandArguments;
+        const args = tool.name === "exec_command"
+          ? withLowOverheadWindowsCommandShell(tool, execCommandArguments)
+          : shellCommandArguments;
         return invoke(claimed.bindingId, bound, tool, { arguments: args }, extra.signal);
       }
       const gateway = execGateway(bound);
@@ -763,6 +820,52 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       }
       return withClaimedTurn("codex_tool_call", turn_token, extra, async claimed => {
         const bound = claimed.environment;
+        if (wire_name === CODEX_PARALLEL_EXEC_BATCH_CONTROL_WIRE_NAME) {
+          if (input !== undefined) {
+            throw new Error("Parallel exec batch control does not accept freeform input");
+          }
+          const parsedBatch = parallelExecBatchArgumentsSchema.safeParse(args ?? {});
+          if (!parsedBatch.success) {
+            throw new Error(
+              `Parallel exec batch requires ${CODEX_PARALLEL_EXEC_BATCH_MIN_CALLS}-${CODEX_PARALLEL_EXEC_BATCH_MAX_CALLS}`
+              + " direct exec_command calls with structured arguments",
+            );
+          }
+          const execCommand = bound.tools.find(candidate => (
+            !candidate.namespace
+            && !candidate.freeform
+            && !candidate.toolSearch
+            && candidate.name === "exec_command"
+          ));
+          if (!execCommand) {
+            throw new Error("Parallel exec batch requires a direct exec_command tool in the current Codex turn");
+          }
+
+          // Validate every call before enqueueing any of them. The model declares independence;
+          // the bridge does not infer dependencies or silently execute a partial batch.
+          const prepared = parsedBatch.data.calls.map(call => {
+            assertBrowserToolArguments(execCommand, call.arguments);
+            return withLowOverheadWindowsCommandShell(execCommand, call.arguments);
+          });
+          const settled = await Promise.allSettled(prepared.map(arguments_ => (
+            invoke(claimed.bindingId, bound, execCommand, { arguments: arguments_ }, extra.signal)
+          )));
+          const rejected = settled.find(
+            (entry): entry is PromiseRejectedResult => entry.status === "rejected",
+          );
+          if (rejected) throw rejected.reason;
+          const responses = settled.map(entry => (entry as PromiseFulfilledResult<Awaited<ReturnType<typeof invoke>>>).value);
+          return result({
+            results: responses.map((response, index) => ({
+              index,
+              wire_name: "exec_command",
+              ...(response.structuredContent !== undefined
+                ? { structured_content: response.structuredContent }
+                : { content: response.content }),
+              ...(response.isError ? { is_error: true } : {}),
+            })),
+          });
+        }
         const tool = bound.tools
           .find(candidate => wireName(candidate) === wire_name);
         if (!tool) {

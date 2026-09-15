@@ -21,6 +21,14 @@ export class ChatGptWebAdapterError extends Error {
   }
 }
 
+// Only the compaction owner emits this after its one-shot handoff is accepted.
+// It stops browser observation without reclassifying the accepted native summary as a failure.
+export class ChatGptCompactionHandoffAccepted extends DOMException {
+  constructor() {
+    super("Structured compaction handoff accepted", "AbortError");
+  }
+}
+
 export function chatGptBrowserTabClosedError(): ChatGptWebAdapterError {
   return new ChatGptWebAdapterError(
     "The ChatGPT browser tab was closed, so the Codex turn was cancelled.",
@@ -54,5 +62,12 @@ export function chatGptRetainedConversationUnavailableError(): ChatGptWebAdapter
       code: "compaction_source_unavailable",
       retryable: false,
     },
+  );
+}
+
+export function chatGptTurnSupersededError(): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError(
+    "A newer Codex instruction superseded this ChatGPT response.",
+    { status: 499, errorType: "client_closed_request", code: "client_cancelled", retryable: false },
   );
 }

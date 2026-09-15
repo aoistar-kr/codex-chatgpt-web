@@ -1,12 +1,15 @@
 const { createHash } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { Worker } = require("node:worker_threads");
 const { renameAtomicFile } = require("./atomic-file.cjs");
 const { runtimeBundlePaths } = require("./runtime-command.cjs");
 
 const DEFAULT_SOURCE_WAIT_TIMEOUT_MS = 30_000;
 const DEFAULT_SOURCE_WAIT_INTERVAL_MS = 50;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const RUNTIME_INSTALL_WORKER_PATH = path.join(__dirname, "runtime-install-worker.cjs");
+const RUNTIME_VERIFY_CONCURRENCY = 16;
 
 function comparePaths(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -142,7 +145,32 @@ function validateRuntimeFile(runtimeRoot, canonicalRoot, file) {
   }
 }
 
-function inspectRuntimeBundle(runtimeRoot, identity) {
+async function validateRuntimeFileConcurrent(runtimeRoot, canonicalRoot, file) {
+  const absolutePath = path.join(runtimeRoot, ...file.path.split("/"));
+  let metadata;
+  try {
+    metadata = await fs.promises.stat(absolutePath);
+  } catch {
+    throw new Error(`Runtime bundle file is missing: ${absolutePath}`);
+  }
+  if (!metadata.isFile()) throw new Error(`Runtime bundle entry is not a file: ${absolutePath}`);
+  const linkMetadata = await fs.promises.lstat(absolutePath);
+  if (linkMetadata.isSymbolicLink()) {
+    const target = await fs.promises.realpath(absolutePath);
+    if (target !== canonicalRoot && !target.startsWith(`${canonicalRoot}${path.sep}`)) {
+      throw new Error(`Runtime bundle symlink escapes the bundle: ${absolutePath}`);
+    }
+  }
+  if (metadata.size !== file.size) {
+    throw new Error(`Runtime bundle file size mismatch: ${absolutePath}`);
+  }
+  const sha256 = createHash("sha256").update(await fs.promises.readFile(absolutePath)).digest("hex");
+  if (sha256 !== file.sha256) {
+    throw new Error(`Runtime bundle file checksum mismatch: ${absolutePath}`);
+  }
+}
+
+function runtimeBundleValidationContext(runtimeRoot, identity) {
   const manifest = readRuntimeManifest(runtimeRoot, identity);
   const expectedPaths = manifest.files.map(file => file.path);
   const expectedSet = new Set(expectedPaths);
@@ -171,8 +199,42 @@ function inspectRuntimeBundle(runtimeRoot, identity) {
     throw new Error(`Runtime bundle file count mismatch: expected ${expectedPaths.length}, received ${actualPaths.length}`);
   }
 
-  const canonicalRoot = fs.realpathSync(runtimeRoot);
+  return {
+    manifest,
+    paths,
+    canonicalRoot: fs.realpathSync(runtimeRoot),
+  };
+}
+
+function inspectRuntimeBundle(runtimeRoot, identity) {
+  const { manifest, paths, canonicalRoot } = runtimeBundleValidationContext(runtimeRoot, identity);
   for (const file of manifest.files) validateRuntimeFile(runtimeRoot, canonicalRoot, file);
+  if (identity.platform !== "win32" && (fs.statSync(paths.executable).mode & 0o111) === 0) {
+    throw new Error(`Bundled Bun runtime is not executable: ${paths.executable}`);
+  }
+  return { manifest, runtimeRoot: paths.runtimeRoot };
+}
+
+async function inspectRuntimeBundleConcurrent(runtimeRoot, identity) {
+  const { manifest, paths, canonicalRoot } = runtimeBundleValidationContext(runtimeRoot, identity);
+  let nextIndex = 0;
+  let firstError;
+  const workerCount = Math.min(RUNTIME_VERIFY_CONCURRENCY, manifest.files.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    for (;;) {
+      if (firstError) return;
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= manifest.files.length) return;
+      try {
+        await validateRuntimeFileConcurrent(runtimeRoot, canonicalRoot, manifest.files[index]);
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
+  });
+  await Promise.all(workers);
+  if (firstError) throw firstError;
   if (identity.platform !== "win32" && (fs.statSync(paths.executable).mode & 0o111) === 0) {
     throw new Error(`Bundled Bun runtime is not executable: ${paths.executable}`);
   }
@@ -183,7 +245,133 @@ function validateRuntimeBundle(runtimeRoot, identity) {
   return inspectRuntimeBundle(runtimeRoot, identity).runtimeRoot;
 }
 
-async function waitForPackagedRuntimeSource({
+async function validateRuntimeBundleConcurrent(runtimeRoot, identity) {
+  return (await inspectRuntimeBundleConcurrent(runtimeRoot, identity)).runtimeRoot;
+}
+
+function runRuntimeInstallWorker(action, payload) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(RUNTIME_INSTALL_WORKER_PATH, {
+      workerData: { action, payload },
+    });
+    let settled = false;
+    const finish = (callback) => (value) => {
+      if (settled) return;
+      settled = true;
+      callback(value);
+    };
+    worker.once("message", finish((message) => {
+      if (message?.ok === true) {
+        resolve(message.result);
+        return;
+      }
+      reject(new Error(typeof message?.message === "string" ? message.message : "Runtime verification worker failed"));
+    }));
+    worker.once("error", finish(reject));
+    worker.once("exit", (code) => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`Runtime verification worker exited before returning a result (code=${code})`));
+    });
+  });
+}
+
+/**
+ * Healthy packaged startups execute only from the durable runtime. Verify that exact runtime
+ * against the packaged manifest before use, but defer the expensive source-tree content walk until
+ * the source is actually needed for a repair. This keeps every executed runtime file behind the
+ * same full SHA-256 validation while avoiding a second 5k+ file walk on ordinary launches.
+ *
+ * If the durable runtime is missing/corrupt, the source is fully verified before the existing
+ * bounded/transactional repair path is allowed to consume it. Manifest parsing remains eager so a
+ * package identity mismatch still fails closed before any durable runtime is accepted.
+ */
+async function preparePackagedRuntimeConcurrent({
+  app,
+  coreHome,
+  resourcesPath,
+  timeoutMs = DEFAULT_SOURCE_WAIT_TIMEOUT_MS,
+  intervalMs = DEFAULT_SOURCE_WAIT_INTERVAL_MS,
+}) {
+  if (!app.isPackaged) return null;
+  const identity = {
+    version: app.getVersion(),
+    platform: process.platform,
+    arch: process.arch,
+  };
+  const source = path.join(resourcesPath, "runtime");
+
+  let manifest;
+  try {
+    // This validates the manifest structure and its bundle-id derivation only. File contents are
+    // still verified below by the source worker before any durable runtime is accepted.
+    manifest = readRuntimeManifest(source, identity);
+  } catch {
+    return runRuntimeInstallWorker("prepare", {
+      coreHome,
+      resourcesPath,
+      identity,
+      timeoutMs,
+      intervalMs,
+    });
+  }
+
+  const expectedIdentity = { ...identity, bundleId: manifest.bundleId };
+  const sourceBrowserHelper = manifest.files.find(file => file.path === "app/browser-helper.cjs");
+  if (!sourceBrowserHelper) {
+    throw new Error(`Runtime manifest does not declare required file: ${path.join(source, "app", "browser-helper.cjs")}`);
+  }
+  // The packaged Electron host launches browser-helper.cjs directly from resources/runtime even
+  // when the CLI/runtime itself comes from the durable copy. Keep that one source-side executable
+  // script behind a full checksum on every startup; the rest of the source tree is repair material
+  // and can be validated lazily if the durable runtime ever needs replacement.
+  validateRuntimeFile(source, fs.realpathSync(source), sourceBrowserHelper);
+  const destination = path.join(
+    coreHome,
+    "versions",
+    `${identity.version}-${identity.platform}-${identity.arch}`,
+  );
+  if (fs.existsSync(destination)) {
+    try {
+      return await runRuntimeInstallWorker("validate", {
+        runtimeRoot: destination,
+        identity: expectedIdentity,
+      });
+    } catch {
+      // A damaged durable copy must never be executed. Fall through to source verification and the
+      // existing transactional repair path below.
+    }
+  }
+
+  try {
+    await runRuntimeInstallWorker("validate", {
+      runtimeRoot: source,
+      identity: expectedIdentity,
+    });
+  } catch {
+    // Preserve the historical bounded source-materialization retry semantics. A genuinely corrupt
+    // source still fails closed after that bound; a package that is only finishing extraction can
+    // become valid without forcing a launcher restart.
+    return runRuntimeInstallWorker("prepare", {
+      coreHome,
+      resourcesPath,
+      identity,
+      timeoutMs,
+      intervalMs,
+    });
+  }
+
+  // The source has passed a full content verification because it is now needed as repair material.
+  // Reuse the existing transactional repair path; it intentionally revalidates its inputs rather
+  // than weakening exceptional repair semantics for the sake of a rare startup.
+  return runRuntimeInstallWorker("ensure", {
+    coreHome,
+    resourcesPath,
+    identity,
+  });
+}
+
+async function waitForPackagedRuntimeSourceBundle({
   app,
   resourcesPath,
   timeoutMs = DEFAULT_SOURCE_WAIT_TIMEOUT_MS,
@@ -203,7 +391,7 @@ async function waitForPackagedRuntimeSource({
   let lastError;
   for (;;) {
     try {
-      return validateRuntimeBundle(source, identity);
+      return { source, identity, sourceBundle: inspectRuntimeBundle(source, identity) };
     } catch (error) {
       lastError = error;
     }
@@ -215,15 +403,12 @@ async function waitForPackagedRuntimeSource({
   throw new Error(`Packaged runtime did not fully materialize within ${timeoutMs}ms: ${detail}`);
 }
 
-function ensurePackagedRuntime({ app, coreHome, resourcesPath }) {
-  if (!app.isPackaged) return null;
-  const identity = {
-    version: app.getVersion(),
-    platform: process.platform,
-    arch: process.arch,
-  };
-  const source = path.join(resourcesPath, "runtime");
-  const sourceBundle = inspectRuntimeBundle(source, identity);
+async function waitForPackagedRuntimeSource(options) {
+  const prepared = await waitForPackagedRuntimeSourceBundle(options);
+  return prepared?.sourceBundle.runtimeRoot ?? null;
+}
+
+function installPackagedRuntimeFromValidatedSource({ coreHome, source, identity, sourceBundle }) {
   const expectedIdentity = { ...identity, bundleId: sourceBundle.manifest.bundleId };
   const versionsRoot = path.join(coreHome, "versions");
   const destination = path.join(
@@ -274,8 +459,13 @@ function ensurePackagedRuntime({ app, coreHome, resourcesPath }) {
       throw error;
     }
     if (previousMoved) {
-      fs.rmSync(previous, { recursive: true, force: true });
       previousMoved = false;
+      try {
+        fs.rmSync(previous, { recursive: true, force: true });
+      } catch {
+        // The validated replacement is authoritative now. A locked old runtime is cleanup residue,
+        // not a failed installation; retry cleanup on a later successful startup.
+      }
     }
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
@@ -288,8 +478,40 @@ function ensurePackagedRuntime({ app, coreHome, resourcesPath }) {
   return validateRuntimeBundle(destination, expectedIdentity);
 }
 
+function ensurePackagedRuntime({ app, coreHome, resourcesPath }) {
+  if (!app.isPackaged) return null;
+  const identity = {
+    version: app.getVersion(),
+    platform: process.platform,
+    arch: process.arch,
+  };
+  const source = path.join(resourcesPath, "runtime");
+  const sourceBundle = inspectRuntimeBundle(source, identity);
+  return installPackagedRuntimeFromValidatedSource({ coreHome, source, identity, sourceBundle });
+}
+
+async function preparePackagedRuntime({
+  app,
+  coreHome,
+  resourcesPath,
+  timeoutMs = DEFAULT_SOURCE_WAIT_TIMEOUT_MS,
+  intervalMs = DEFAULT_SOURCE_WAIT_INTERVAL_MS,
+}) {
+  if (!app.isPackaged) return null;
+  const prepared = await waitForPackagedRuntimeSourceBundle({
+    app,
+    resourcesPath,
+    timeoutMs,
+    intervalMs,
+  });
+  return installPackagedRuntimeFromValidatedSource({ coreHome, ...prepared });
+}
+
 module.exports = {
   ensurePackagedRuntime,
+  preparePackagedRuntime,
+  preparePackagedRuntimeConcurrent,
   validateRuntimeBundle,
+  validateRuntimeBundleConcurrent,
   waitForPackagedRuntimeSource,
 };

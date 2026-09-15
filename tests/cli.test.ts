@@ -196,7 +196,7 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
     mkdirSync(join(devHome, "runtime"), { recursive: true });
     writeFileSync(helperScript, "module.exports = {};\n", { mode: 0o700 });
     writeFileSync(descriptorPath, `${JSON.stringify({
-      version: 2,
+      version: 3,
       kind: "codex-web-gpt-launcher",
       profile: "development",
       pid: process.pid,
@@ -206,6 +206,7 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
       partition: "persist:codex-web-gpt-dev-chatgpt",
       idleUrl: LAUNCHER_BROWSER_IDLE_URL,
       surfaceId: "d".repeat(32),
+      surfaceTargets: { ["d".repeat(32)]: "target-dev-owned" },
       createdAt: new Date().toISOString(),
     })}\n`, { mode: 0o600 });
 
@@ -299,7 +300,7 @@ test("authorized launcher uninstall does not re-probe an already stopped full ru
   writeFileSync(helperScript, "module.exports = {};\n");
   writeFileSync(runtimeKeyFile, "test-key\n");
   writeFileSync(descriptorPath, `${JSON.stringify({
-    version: 2,
+    version: 3,
     kind: "codex-web-gpt-launcher",
     profile: "production",
     pid: process.pid,
@@ -309,6 +310,7 @@ test("authorized launcher uninstall does not re-probe an already stopped full ru
     partition: "persist:codex-web-gpt-chatgpt",
     idleUrl: LAUNCHER_BROWSER_IDLE_URL,
     surfaceId: "a".repeat(32),
+    surfaceTargets: { ["a".repeat(32)]: "target-production-owned" },
     createdAt: new Date().toISOString(),
   })}\n`, { mode: 0o600 });
   writeFileSync(join(appHome, "config.json"), `${JSON.stringify({

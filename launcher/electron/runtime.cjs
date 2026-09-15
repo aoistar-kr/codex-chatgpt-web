@@ -931,14 +931,13 @@ class RuntimeHost {
       "--browser-host-descriptor",
       this.browserDescriptorPath,
       "--refresh-account-capabilities",
-      "--replace-codex-route",
       "--acknowledge-unofficial",
       "--restart-service",
     ];
     if (mode === "full") args.push("--app-name", this.browserConnectorName());
     const result = await this.runSetup("core-setup", args, {
-      message: "Installing ChatGPT Web models into Codex",
-      successMessage: "Codex integration installed",
+      message: "Configuring the ChatGPT Web provider runtime",
+      successMessage: "ChatGPT Web provider runtime configured",
       timeoutMs: CORE_SETUP_TIMEOUT_MS,
     });
     return { ...result, mode };
@@ -1000,7 +999,6 @@ class RuntimeHost {
       mode === "full" ? "--full" : "--browser-only",
       "--browser-host-descriptor",
       this.browserDescriptorPath,
-      "--replace-codex-route",
       "--acknowledge-unofficial",
       "--restart-service",
       contextFlag,
@@ -1009,7 +1007,7 @@ class RuntimeHost {
     if (mode === "full") args.push("--app-name", this.browserConnectorName());
     const result = await this.runSetup("bigger-context", args, {
       message: enabled ? "Enabling Bigger Context" : "Disabling Bigger Context",
-      successMessage: enabled ? "Bigger Context enabled; restart Codex" : "Standard context restored; restart Codex",
+      successMessage: enabled ? "Bigger Context enabled" : "Standard context restored",
       timeoutMs: CORE_SETUP_TIMEOUT_MS,
     });
     return { ...result, mode, enabled: enabled === true };
@@ -1069,7 +1067,6 @@ class RuntimeHost {
       this.browserDescriptorPath,
       "--app-name",
       this.browserConnectorName(),
-      "--replace-codex-route",
     ];
     if (reuseSavedCredentials) {
       args.push("--acknowledge-unofficial", "--restart-service");

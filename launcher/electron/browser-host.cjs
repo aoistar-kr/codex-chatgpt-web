@@ -39,6 +39,7 @@ const TURN_HEARTBEAT_SWEEP_MS = 5_000;
 const TURN_HEARTBEAT_TIMEOUT_MS = 60_000;
 const TURN_TAB_BOOTSTRAP_TIMEOUT_MS = 120_000;
 const RETAINED_TURN_TAB_TTL_MS = 30 * 60 * 1000;
+const HOT_TEMPORARY_SURFACE_HANDOFF_TIMEOUT_MS = 2_500;
 const BROWSER_NAVIGATION_TIMEOUT_MS = 60_000;
 const CHATGPT_AUTH_SESSION_TIMEOUT_MS = 5_000;
 const WINDOW_VISIBILITY_EVENTS = ["show", "hide", "minimize", "restore"];
@@ -275,6 +276,8 @@ class BrowserHost {
     control,
     cancelTurn,
     getConnectorName,
+    getConnectorPluginId,
+    setConnectorPluginId,
     helper,
     logger,
     loginWithPasskey,
@@ -294,6 +297,8 @@ class BrowserHost {
     this.control = control;
     this.cancelTurn = cancelTurn;
     this.getConnectorName = getConnectorName;
+    this.getConnectorPluginId = typeof getConnectorPluginId === "function" ? getConnectorPluginId : () => undefined;
+    this.setConnectorPluginId = typeof setConnectorPluginId === "function" ? setConnectorPluginId : () => {};
     this.helper = helper;
     this.logger = logger;
     this.loginWithPasskey = loginWithPasskey;
@@ -313,6 +318,13 @@ class BrowserHost {
     this.visible = false;
     this.surfaceActive = true;
     this.turnTabs = new Map();
+    this.hotTemporarySurfacePending = false;
+    this.hotTemporarySurfaceTask = null;
+    this.hotTemporarySurfaceQueued = null;
+    // Measurement-only baseline switch for the controlled Codex UI A/B. Production keeps the
+    // active-turn document-only replacement overlap enabled unless it is explicitly disabled.
+    // Idle hot-surface creation, turn-release warming, and bounded handoff remain unchanged.
+    this.hotTemporaryOverlapEnabled = process.env.CODEX_WEB_GPT_HOT_OVERLAP?.trim() !== "0";
     this.closedTurnOwners = new Map();
     this.userCancelledTurnOwners = new Map();
     this.selectedTabId = "home";
@@ -423,7 +435,297 @@ class BrowserHost {
     return this.turnTabs.get(this.selectedTabId) || null;
   }
 
-  createTurnTab(traceId, helperPid, conversationKey, connectorIdentity) {
+  queueHotTemporarySurface(reason, modeHint, options = {}) {
+    const allowActiveTurn = options.allowActiveTurn === true;
+    if (this.hotTemporarySurfacePending) {
+      // A real turn can evict a warming reservation before its async helper/navigation work has
+      // settled. If that turn completes first, preserve the newest replenish request instead of
+      // dropping it behind the old pending flag and leaving the next request on the cold path.
+      if (this.state?.authenticated === true
+        && (!this.activeTraceId || allowActiveTurn)
+        && !this.manualOperation) {
+        this.hotTemporarySurfaceQueued = { reason, modeHint, allowActiveTurn };
+      }
+      return;
+    }
+    if (this.state?.authenticated !== true
+      || (!allowActiveTurn && this.activeTraceId)
+      || this.manualOperation) return;
+    if (allowActiveTurn) {
+      const runningTurns = [...this.turnTabs.values()].filter(tab => tab.status === "running");
+      if (runningTurns.length !== 1) return;
+    }
+    if (this.turnTabs.size >= MAX_BROWSER_TABS) return;
+    this.hotTemporarySurfaceQueued = null;
+    this.hotTemporarySurfacePending = true;
+    const task = Promise.resolve(this.createHotTemporarySurface(reason, modeHint, { allowActiveTurn }));
+    this.hotTemporarySurfaceTask = task;
+    void task.finally(() => {
+      if (this.hotTemporarySurfaceTask === task) this.hotTemporarySurfaceTask = null;
+      this.hotTemporarySurfacePending = false;
+      const queued = this.hotTemporarySurfaceQueued;
+      this.hotTemporarySurfaceQueued = null;
+      if (queued) {
+        this.queueHotTemporarySurface(
+          queued.reason,
+          queued.modeHint,
+          { allowActiveTurn: queued.allowActiveTurn === true },
+        );
+      }
+    });
+  }
+
+  async createHotTemporarySurface(reason, modeHint, options = {}) {
+    const allowActiveTurn = options.allowActiveTurn === true;
+    let tab = null;
+    try {
+      if (this.state?.authenticated !== true
+        || (!allowActiveTurn && this.activeTraceId)
+        || this.manualOperation) return;
+      if (allowActiveTurn) {
+        const runningTurns = [...this.turnTabs.values()].filter(candidate => candidate.status === "running");
+        if (runningTurns.length !== 1) return;
+      }
+      if ([...this.turnTabs.values()].some(candidate => candidate.hotTemporarySurface === true)) return;
+      if (this.turnTabs.size >= MAX_BROWSER_TABS) return;
+      tab = this.createTurnTab(
+        `hot_${randomBytes(12).toString("hex")}`,
+        process.pid,
+        undefined,
+        undefined,
+        { deferInitialNavigation: true },
+      );
+      // A warming surface reserves one browser slot and never submits a prompt. Most reservations
+      // are idle-only; after leasing an already-ready hot surface we may hydrate exactly one
+      // replacement document alongside that single active turn so the next request does not inherit
+      // the page-bootstrap cost. It is never eligible for lease until the exact Temporary Chat
+      // document has committed.
+      tab.hotTemporarySurface = "warming";
+      tab.hotTemporarySurfaceStartedAt = Date.now();
+      tab.hotTemporarySurfaceModeHint = modeHint;
+      tab.status = "warming";
+      tab.message = "Preparing Temporary Chat for the next request";
+      if (this.descriptorPath) this.writeDescriptor();
+      await tab.view.webContents.loadURL(TEMPORARY_CHAT_URL);
+      await this.waitForHotTemporaryComposer(tab);
+      if (tab.view.webContents.isDestroyed()
+        || !isTemporaryChatUrl(tab.view.webContents.getURL())
+        || tab.bootstrapReady !== true
+        || tab.rendererReady !== true) {
+        throw new Error("Hot Temporary Chat did not commit a ready owned document");
+      }
+      // A turn may have arrived while the page was warming and evicted this reservation.
+      if (this.turnTabs.get(tab.id) !== tab) return;
+      let prewarmedMode = null;
+      if (modeHint) {
+        try {
+          prewarmedMode = await this.prewarmHotTemporaryMode(tab, modeHint);
+        } catch (error) {
+          this.logger.warn("browser.hot_temporary_mode_prewarm_failed", {
+            tabId: tab.id,
+            reason,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      if (this.turnTabs.get(tab.id) !== tab) return;
+      tab.hotTemporarySurface = true;
+      tab.prewarmedMode = prewarmedMode;
+      tab.connectorIdentity = prewarmedMode?.connectorIdentity;
+      tab.connectorBound = prewarmedMode?.connectorBound === true;
+      tab.status = "ready";
+      tab.loading = false;
+      tab.message = "Temporary Chat is ready for the next request";
+      tab.lastHeartbeatAt = Date.now();
+      tab.view.webContents.setBackgroundThrottling(true);
+      // Keep the primary/home WebContents alive as an internal auth/session surface, but do not
+      // leave it as the user-facing selection once a hot Temporary Chat is actually ready.
+      if (this.selectedTabId === "home" && !this.activeTraceId && !this.manualOperation) {
+        this.selectedTabId = tab.id;
+        this.syncViewVisibility();
+      }
+      this.publishState?.(this.snapshot());
+      this.logger.info("browser.hot_temporary_surface_ready", {
+        tabId: tab.id,
+        reason,
+        surfaceOrigin: navigationOriginForLog(tab.url),
+      });
+    } catch (error) {
+      if (tab && this.turnTabs.get(tab.id) === tab) this.removeTurnTab(tab, false);
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn("browser.hot_temporary_surface_failed", { reason, message });
+    }
+  }
+
+  async waitForHotTemporaryComposer(tab, timeoutMs = 30_000) {
+    const contents = tab?.view?.webContents;
+    if (!contents || contents.isDestroyed()) {
+      throw new Error("Hot Temporary Chat browser surface is unavailable");
+    }
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (contents.isDestroyed() || this.turnTabs.get(tab.id) !== tab) {
+        throw new Error("Hot Temporary Chat prewarm was superseded by an active turn");
+      }
+      const ready = await contents.executeJavaScript(`(() => {
+        if (location.origin !== ${JSON.stringify(CHATGPT_ORIGIN)}
+          || location.pathname !== "/"
+          || new URLSearchParams(location.search).get("temporary-chat") !== "true") return false;
+        const candidates = [...document.querySelectorAll(${JSON.stringify(COMPOSER_SELECTOR)})];
+        const visible = candidates.filter((element) => {
+          const style = getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return style.display !== "none"
+            && style.visibility !== "hidden"
+            && rect.width > 0
+            && rect.height > 0;
+        });
+        return visible.length === 1;
+      })()`, true).catch(() => false);
+      if (ready === true) return;
+      await sleep(50);
+    }
+    throw new Error("Hot Temporary Chat composer did not hydrate before the readiness deadline");
+  }
+
+  async prewarmHotTemporaryMode(tab, modeHint) {
+    if (!modeHint
+      || typeof modeHint.modelId !== "string"
+      || !modeHint.modelId.trim()
+      || modeHint.modelId.length > 128
+      || (modeHint.reasoning !== undefined
+        && (typeof modeHint.reasoning !== "string" || modeHint.reasoning.length > 40))
+      || (modeHint.connectorIdentity !== undefined
+        && (typeof modeHint.connectorIdentity !== "string"
+          || !modeHint.connectorIdentity.trim()
+          || modeHint.connectorIdentity.length > 80))) {
+      throw new Error("Hot Temporary Chat mode hint is invalid");
+    }
+    if (this.state?.authenticated !== true || this.activeTraceId || this.manualOperation) return null;
+    if (this.turnTabs.get(tab.id) !== tab || tab.hotTemporarySurface !== "warming") return null;
+    const result = await this.runBrowserHelperOperation({
+      helper: this.helper,
+      descriptorPath: this.descriptorPath,
+      appName: this.connectorName(),
+      operation: "prewarm",
+      payload: {
+        surfaceId: tab.surfaceId,
+        modelId: modeHint.modelId,
+        ...(modeHint.reasoning !== undefined ? { reasoning: modeHint.reasoning } : {}),
+        ...(modeHint.connectorIdentity !== undefined ? { connectorIdentity: modeHint.connectorIdentity } : {}),
+      },
+      logger: this.logger,
+    });
+    const value = result?.value;
+    if (!value
+      || value.modelId !== modeHint.modelId
+      || value.reasoning !== (modeHint.reasoning ?? null)
+      || typeof value.effort !== "string"
+      || !value.effort
+      || value.connectorBound !== (modeHint.connectorIdentity !== undefined)) {
+      throw new Error("Browser helper returned invalid hot-surface mode evidence");
+    }
+    if (this.state?.authenticated !== true || this.activeTraceId || this.manualOperation) return null;
+    if (this.turnTabs.get(tab.id) !== tab || tab.hotTemporarySurface !== "warming") return null;
+    this.logger.info("browser.hot_temporary_mode_prewarmed", {
+      tabId: tab.id,
+      modelId: value.modelId,
+      effort: value.effort,
+      connectorBound: value.connectorBound,
+    });
+    return {
+      modelId: value.modelId,
+      reasoning: value.reasoning,
+      effort: value.effort,
+      ...(modeHint.connectorIdentity !== undefined ? { connectorIdentity: modeHint.connectorIdentity } : {}),
+      connectorBound: value.connectorBound === true,
+    };
+  }
+
+  findHotTemporarySurface(connectorIdentity) {
+    const candidates = [...this.turnTabs.values()].filter((tab) => (
+      tab.status === "ready"
+      && tab.hotTemporarySurface === true
+      && tab.conversationKey === undefined
+      && !tab.view.webContents.isDestroyed()
+      && tab.bootstrapReady === true
+      && tab.rendererReady === true
+      && tab.loading !== true
+      && isTemporaryChatUrl(tab.view.webContents.getURL())
+    ));
+    if (connectorIdentity) {
+      return candidates.find(tab => tab.connectorIdentity === connectorIdentity && tab.connectorBound === true)
+        || candidates.find(tab => tab.connectorIdentity === undefined && tab.connectorBound !== true)
+        || null;
+    }
+    return candidates.find(tab => tab.connectorIdentity === undefined && tab.connectorBound !== true) || null;
+  }
+
+  async waitForWarmingHotTemporarySurfaceForTurn({
+    traceId,
+    conversationKey,
+    connectorIdentity,
+    requireRetainedConversation = false,
+    modelId,
+    reasoning,
+  }, timeoutMs = HOT_TEMPORARY_SURFACE_HANDOFF_TIMEOUT_MS) {
+    if (requireRetainedConversation || this.manualOperation) return false;
+    if ([...this.turnTabs.values()].some(tab => tab.traceId === traceId)) return false;
+    if (conversationKey && [...this.turnTabs.values()].some(tab => (
+      tab.status === "ready"
+      && tab.conversationKey === conversationKey
+      && tab.connectorIdentity === connectorIdentity
+      && (!connectorIdentity || tab.connectorBound === true)
+    ))) return false;
+    if (BrowserHost.prototype.findHotTemporarySurface.call(this, connectorIdentity)) return true;
+
+    const warming = [...this.turnTabs.values()].filter(tab => tab.hotTemporarySurface === "warming");
+    if (warming.length !== 1) return false;
+    const tab = warming[0];
+    const hint = tab.hotTemporarySurfaceModeHint;
+    if (hint && (hint.modelId !== modelId
+      || (hint.reasoning ?? null) !== (reasoning ?? null)
+      || (hint.connectorIdentity ?? null) !== (connectorIdentity ?? null))) return false;
+    const task = this.hotTemporarySurfaceTask;
+    if (!task || typeof task.then !== "function") return false;
+
+    const startedAt = Number.isFinite(tab.hotTemporarySurfaceStartedAt)
+      ? tab.hotTemporarySurfaceStartedAt
+      : Date.now();
+    const remainingMs = Math.max(0, timeoutMs - Math.max(0, Date.now() - startedAt));
+    if (remainingMs <= 0) return false;
+    const waitStartedAt = Date.now();
+    this.logger.info("browser.hot_temporary_surface_handoff_wait_started", {
+      tabId: tab.id,
+      remainingMs,
+    });
+    let timedOut = false;
+    try {
+      await Promise.race([
+        Promise.resolve(task).catch(() => undefined),
+        sleep(remainingMs).then(() => { timedOut = true; }),
+      ]);
+    } catch {
+      return false;
+    }
+    const ready = BrowserHost.prototype.findHotTemporarySurface.call(this, connectorIdentity);
+    this.logger.info("browser.hot_temporary_surface_handoff_wait_finished", {
+      tabId: tab.id,
+      waitedMs: Date.now() - waitStartedAt,
+      outcome: ready ? "ready" : timedOut ? "timeout" : "unavailable",
+    });
+    return ready !== null;
+  }
+
+  discardWarmingHotTemporarySurfaces(reason) {
+    for (const tab of [...this.turnTabs.values()]) {
+      if (tab.hotTemporarySurface !== "warming") continue;
+      this.logger.info("browser.hot_temporary_surface_discarded", { tabId: tab.id, reason });
+      this.removeTurnTab(tab, false);
+    }
+  }
+
+  createTurnTab(traceId, helperPid, conversationKey, connectorIdentity, options = {}) {
     if (this.turnTabs.size >= MAX_BROWSER_TABS
       && !BrowserHost.prototype.evictOldestRetainedTurnTab.call(this)) {
       throw new Error(
@@ -475,15 +777,20 @@ class BrowserHost {
     view.webContents.setZoomFactor(this.state.zoomFactor);
     this.bindShellZoomShortcuts(view.webContents);
     this.bindTurnContents(tab);
-    void view.webContents.loadURL(IDLE_BROWSER_URL).catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      this.logger.error("browser.tab_initialization_failed", {
-        tabId: tab.id,
-        traceId: tab.traceId,
-        message,
-      });
-      this.removeTurnTab(tab, true);
-    });
+    if (options.deferInitialNavigation !== true) {
+      void view.webContents
+        .loadURL(IDLE_BROWSER_URL)
+        .then(() => this.queueHotTemporarySurface?.("initial_tab_ready"))
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          this.logger.error("browser.tab_initialization_failed", {
+            tabId: tab.id,
+            traceId: tab.traceId,
+            message,
+          });
+          this.removeTurnTab(tab, true);
+        });
+    }
     return tab;
   }
 
@@ -557,6 +864,7 @@ class BrowserHost {
       if (!inPlace) {
         tab.rendererReady = false;
         tab.deviceEmulationDirty = true;
+        tab.prewarmedMode = null;
       }
       this.publishState?.(this.snapshot());
     });
@@ -887,15 +1195,6 @@ class BrowserHost {
   snapshot() {
     const contents = this.activeView()?.webContents;
     const selected = this.selectedTurnTab();
-    const homeTab = {
-      id: "home",
-      traceId: null,
-      title: this.state.title || "ChatGPT",
-      status: this.state.status,
-      loading: this.state.loading === true,
-      active: this.selectedTabId === "home",
-      closable: false,
-    };
     const state = selected
       ? {
           ...this.state,
@@ -913,12 +1212,9 @@ class BrowserHost {
       surfaceActive: this.surfaceActive,
       }),
       activeTabId: this.selectedTabId,
-      tabs: this.turnTabs.size > 0
-        ? [
-            ...(this.selectedTabId === "home" ? [homeTab] : []),
-            ...[...this.turnTabs.values()].map((tab) => this.tabSnapshot(tab)),
-          ]
-        : [homeTab],
+      // `home` is an internal primary/auth surface. The launcher tab strip exposes only actual
+      // prewarm/turn surfaces, so idle authenticated state presents a single Hot Temporary Chat.
+      tabs: [...this.turnTabs.values()].map((tab) => this.tabSnapshot(tab)),
       maxTabs: MAX_BROWSER_TABS,
     };
   }
@@ -994,6 +1290,11 @@ class BrowserHost {
     }
     for (const tab of [...this.turnTabs.values()]) {
       if (tab.status === "ready") {
+        // The retained-conversation TTL must not reap the one-slot hot Temporary Chat. It carries
+        // no conversation authority and is intentionally kept for the next fresh request; lease
+        // eligibility is re-checked against the live owned document before use. Reaping it here
+        // creates a deterministic cold miss for the first request after thirty minutes of idle.
+        if (tab.hotTemporarySurface === true) continue;
         if (now - (tab.lastHeartbeatAt ?? 0) < RETAINED_TURN_TAB_TTL_MS) continue;
         this.logger.info("browser.retained_tab_expired", { tabId: tab.id, traceId: tab.traceId });
         this.removeTurnTab(tab, false);
@@ -1433,6 +1734,8 @@ class BrowserHost {
     conversationKey,
     connectorIdentity,
     requireRetainedConversation = false,
+    modelId,
+    reasoning,
   ) {
     if (this.manualOperation) {
       throw new Error(`ChatGPT browser is busy with ${this.manualOperation}`);
@@ -1458,6 +1761,61 @@ class BrowserHost {
     if (sameTrace?.status === "ready" && sameTrace !== exactRetained) {
       throw new Error(`ChatGPT browser turn ${traceId} is retained under different conversation metadata`);
     }
+    if (!requireRetainedConversation && !exactRetained) {
+      const hot = BrowserHost.prototype.findHotTemporarySurface.call(this, connectorIdentity);
+      if (hot) {
+        const effortPrepared = typeof modelId === "string"
+          && hot.prewarmedMode?.modelId === modelId
+          && hot.prewarmedMode?.reasoning === (reasoning ?? null);
+        const connectorPrepared = Boolean(connectorIdentity
+          && hot.connectorIdentity === connectorIdentity
+          && hot.connectorBound === true);
+        hot.traceId = traceId;
+        hot.helperPid = helperPid;
+        hot.conversationKey = conversationKey;
+        hot.connectorIdentity = connectorIdentity;
+        hot.modelId = modelId;
+        hot.reasoning = reasoning;
+        hot.prewarmedMode = null;
+        hot.connectorBound = connectorPrepared;
+        hot.hotTemporarySurface = false;
+        hot.status = "running";
+        hot.loading = true;
+        hot.message = "ChatGPT is working";
+        hot.lastHeartbeatAt = Date.now();
+        hot.view.webContents.setBackgroundThrottling(false);
+        this.selectedTabId = hot.id;
+        if (reveal) this.show();
+        else this.syncViewVisibility();
+        this.publishState?.(this.snapshot());
+        this.logger.info("browser.hot_temporary_surface_leased", { tabId: hot.id, traceId });
+        // Hide the next document's page/bootstrap latency under the current model response. This
+        // overlap is intentionally document-only: active-turn mode/connector prewarm remains
+        // disabled by prewarmHotTemporaryMode, and queueHotTemporarySurface admits it only while
+        // exactly one real turn is running. No conversation POST or prompt is ever issued here.
+        if (this.hotTemporaryOverlapEnabled !== false) {
+          this.queueHotTemporarySurface?.("turn_started_overlap", undefined, { allowActiveTurn: true });
+        } else {
+          this.logger.info("browser.hot_temporary_surface_overlap_skipped", {
+            traceId,
+            reason: "measurement_disabled",
+          });
+        }
+        const connectorPluginId = connectorIdentity ? this.connectorPluginId() : undefined;
+        return {
+          surfaceId: hot.surfaceId,
+          tabId: hot.id,
+          reused: false,
+          connectorBound: connectorPrepared,
+          ...(connectorPluginId ? { connectorPluginId } : {}),
+          ...(effortPrepared ? { effortPrepared: true } : {}),
+        };
+      }
+    }
+    // A completed hot surface was either leased above or remains unrelated to a retained turn.
+    // The only active-turn prewarm admitted above is one document-only replacement after a proven
+    // hot lease; any other incomplete reservation is discarded before allocating a cold turn.
+    BrowserHost.prototype.discardWarmingHotTemporarySurfaces.call(this, "turn_started");
     const existing = sameTrace?.status === "running" ? sameTrace : exactRetained;
     if (existing) {
       const reused = existing.status === "ready";
@@ -1475,6 +1833,8 @@ class BrowserHost {
       }
       existing.helperPid = helperPid;
       existing.traceId = traceId;
+      existing.modelId = modelId;
+      existing.reasoning = reasoning;
       existing.status = "running";
       existing.loading = true;
       existing.message = "ChatGPT is working";
@@ -1492,11 +1852,13 @@ class BrowserHost {
       this.publishState?.(this.snapshot());
       this.writeDescriptor();
       this.logger.info("browser.tab_reused", { tabId: existing.id, traceId });
+      const connectorPluginId = connectorIdentity ? this.connectorPluginId() : undefined;
       return {
         surfaceId: existing.surfaceId,
         tabId: existing.id,
         reused,
         connectorBound: existing.connectorBound === true,
+        ...(connectorPluginId ? { connectorPluginId } : {}),
       };
     }
     if (requireRetainedConversation) {
@@ -1505,12 +1867,22 @@ class BrowserHost {
       throw error;
     }
     const tab = this.createTurnTab(traceId, helperPid, conversationKey, connectorIdentity);
+    tab.modelId = modelId;
+    tab.reasoning = reasoning;
     this.selectedTabId = tab.id;
     if (reveal) this.show();
     else this.syncViewVisibility();
     this.publishState?.(this.snapshot());
+    if (this.descriptorPath) this.writeDescriptor();
     this.logger.info("browser.tab_created", { tabId: tab.id, traceId, tabCount: this.turnTabs.size });
-    return { surfaceId: tab.surfaceId, tabId: tab.id, reused: false, connectorBound: false };
+    const connectorPluginId = connectorIdentity ? this.connectorPluginId() : undefined;
+    return {
+      surfaceId: tab.surfaceId,
+      tabId: tab.id,
+      reused: false,
+      connectorBound: false,
+      ...(connectorPluginId ? { connectorPluginId } : {}),
+    };
   }
 
   async endTurn(
@@ -1562,7 +1934,23 @@ class BrowserHost {
     // tabs leaked one slot per response/compaction until the bounded tab limit made later
     // turns fail. The result already lives in Codex; release the browser document on every
     // terminal path while leaving other concurrently running tabs untouched.
+    // High is request-owned: the browser worker injects model/effort/connector metadata into the
+    // generated /conversation request. Prewarming those controls through DOM would reintroduce the
+    // exact slider/@mention path this fast route is designed to remove. Keep only the hot document.
+    const requestOwnedHigh = tab.modelId === "gpt-5.6-sol"
+      && (tab.reasoning === undefined || tab.reasoning === "high");
+    const modeHint = status === "completed"
+      && !requestOwnedHigh
+      && typeof tab.modelId === "string"
+      && tab.modelId
+      ? {
+        modelId: tab.modelId,
+        ...(typeof tab.reasoning === "string" ? { reasoning: tab.reasoning } : {}),
+        ...(connectorBound && tab.connectorIdentity ? { connectorIdentity: tab.connectorIdentity } : {}),
+      }
+      : undefined;
     this.removeTurnTab(tab, false);
+    this.queueHotTemporarySurface?.("turn_released", modeHint);
     if (hideAfterTurn && !this.activeTraceId) this.hide();
     this.logger.info("browser.tab_released", { tabId: tab.id, traceId, status: tab.status });
     return { cancelledByUser };
@@ -1614,7 +2002,10 @@ class BrowserHost {
         return authenticated;
       });
     })();
-    const tracked = operation.finally(() => {
+    const tracked = operation.then((state) => {
+      if (state?.authenticated === true) this.queueHotTemporarySurface?.("login_complete");
+      return state;
+    }).finally(() => {
       if (this.loginOperation === tracked) this.loginOperation = null;
     });
     this.loginOperation = tracked;
@@ -1650,7 +2041,10 @@ class BrowserHost {
         return await this.installPasskeyLogin(transfer);
       });
     })();
-    const tracked = operation.finally(() => {
+    const tracked = operation.then((state) => {
+      if (state?.authenticated === true) this.queueHotTemporarySurface?.("passkey_login_complete");
+      return state;
+    }).finally(() => {
       if (this.loginOperation === tracked) this.loginOperation = null;
     });
     this.loginOperation = tracked;
@@ -1788,7 +2182,14 @@ class BrowserHost {
       return this.snapshot();
     });
     let tracked;
-    tracked = operation.finally(() => {
+    tracked = operation.then((state) => {
+      // probeAuthentication() may discover the persisted session while the enclosing
+      // manual operation is still active. Its ordinary authentication-triggered hot-surface
+      // queue is intentionally suppressed in that state, so replenish once the manual
+      // ownership boundary has been released.
+      if (state?.authenticated === true) this.queueHotTemporarySurface?.("session_refresh_complete");
+      return state;
+    }).finally(() => {
       if (this.sessionRefreshOperation === tracked) this.sessionRefreshOperation = null;
     });
     this.sessionRefreshOperation = tracked;
@@ -1899,7 +2300,10 @@ class BrowserHost {
           ? {}
           : { status: "ready", message: "ChatGPT is ready" };
       this.setState({ ...availability, authenticated: true, url: result.url });
-      if (!wasAuthenticated) this.logger.info("browser.authenticated", { url: result.url });
+      if (!wasAuthenticated) {
+        this.logger.info("browser.authenticated", { url: result.url });
+        this.queueHotTemporarySurface?.("authenticated");
+      }
     } else {
       const loaded = result.readyState === "complete";
       this.setState({
@@ -1929,6 +2333,12 @@ class BrowserHost {
 
   async smokeTest() {
     return await this.withManualOperation("browser smoke test", () => this.runSmokeTest());
+  }
+
+  connectorPluginId() {
+    if (typeof this.getConnectorPluginId !== "function") return undefined;
+    const value = this.getConnectorPluginId();
+    return typeof value === "string" && /^plugin:[A-Za-z0-9_-]{16,128}$/.test(value) ? value : undefined;
   }
 
   connectorName() {
@@ -1977,7 +2387,8 @@ class BrowserHost {
       appName: connectorName,
       logger: this.logger,
     });
-    this.logger.info("connector.verified", { appName: connectorName });
+    this.setConnectorPluginId(result.pluginId);
+    this.logger.info("connector.verified", { appName: connectorName, pluginIdentityCached: true });
     this.setState({ status: "ready", message: "ChatGPT connector is available", authenticated: true });
     return result;
   }
@@ -2039,8 +2450,16 @@ class BrowserHost {
   }
 
   writeDescriptor() {
+    const surfaceTargets = {};
+    const surfaces = [[this.surfaceId, this.view?.webContents],
+      ...[...this.turnTabs.values()].map(tab => [tab.surfaceId, tab.view?.webContents])];
+    for (const [surfaceId, contents] of surfaces) {
+      if (!surfaceId || !contents || contents.isDestroyed()) continue;
+      if (Object.hasOwn(surfaceTargets, surfaceId)) throw new Error("Browser surface ownership is duplicated");
+      surfaceTargets[surfaceId] = contents.getOrCreateDevToolsTargetId();
+    }
     const descriptor = {
-      version: 2,
+      version: 3,
       kind: "codex-web-gpt-launcher",
       profile: this.profile,
       pid: process.pid,
@@ -2050,6 +2469,7 @@ class BrowserHost {
       partition: this.partition,
       idleUrl: IDLE_BROWSER_URL,
       surfaceId: this.surfaceId,
+      surfaceTargets,
       createdAt: new Date().toISOString(),
     };
     writePrivateFileAtomic(this.descriptorPath, `${JSON.stringify(descriptor, null, 2)}\n`);

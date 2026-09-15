@@ -59,7 +59,7 @@ test("Bun daemon streams a prepared browser turn through the persistent Node hel
   writeFileSync(descriptorHelper, "process.exit(99);\n", { mode: 0o700 });
   const descriptorPath = join(root, "launcher.json");
   writeFileSync(descriptorPath, `${JSON.stringify({
-    version: 2,
+    version: 3,
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile: "production",
     pid: process.pid,
@@ -72,6 +72,7 @@ test("Bun daemon streams a prepared browser turn through the persistent Node hel
     partition: "persist:codex-web-gpt-chatgpt",
     idleUrl: LAUNCHER_BROWSER_IDLE_URL,
     surfaceId: "launcher_surface_id_0123456789AB",
+    surfaceTargets: { launcher_surface_id_0123456789AB: "target-helper-owned" },
     createdAt: new Date().toISOString(),
   })}\n`, { mode: 0o600 });
   const config: ResolvedBrowserConfig = {

@@ -18,6 +18,24 @@ export const CHATGPT_EFFORT_MENU_SELECTOR = [
 ].join(", ");
 export const CHATGPT_EFFORT_ITEM_SELECTOR = '[role="menuitemradio"]';
 export const CHATGPT_EFFORT_SLIDER_SELECTOR = '[data-model-reasoning-effort-slider] [role="slider"]';
+
+function effortMenuSelectorForId(menuId: string): string {
+  return `[id=${JSON.stringify(menuId)}]`;
+}
+
+/** Resolve the effort surface owned by this exact control instead of an unrelated/closing menu. */
+export async function chatGptEffortMenuForControl(page: Page, control: Locator): Promise<Locator> {
+  const menuId = await control.getAttribute("aria-controls").catch(() => null);
+  if (menuId) return page.locator(effortMenuSelectorForId(menuId));
+  return page.locator(CHATGPT_EFFORT_MENU_SELECTOR).last();
+}
+
+/** Radix keeps a closing slider visible briefly; owner state outranks that exit animation. */
+export async function chatGptEffortSurfaceIsOpen(control: Locator): Promise<boolean> {
+  const expanded = await control.getAttribute("aria-expanded").catch(() => null);
+  const state = await control.getAttribute("data-state").catch(() => null);
+  return expanded !== "false" && state !== "closed";
+}
 export const CHATGPT_EFFORT_SLIDER_MAX_OPTIONS = 5;
 export const CHATGPT_STOP_BUTTON_SELECTOR = '[data-testid="stop-button"]';
 export const CHATGPT_COMPLETION_ACTION_SELECTOR = 'button[data-testid="copy-turn-action-button"]';
@@ -122,13 +140,17 @@ export async function detectChatGptAccountCapabilities(
     }
     await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
   }
-  const menu = page.locator(CHATGPT_EFFORT_MENU_SELECTOR).last();
-  const menuVisible = await menu.isVisible().catch(() => false);
+  const menu = await chatGptEffortMenuForControl(page, effortButton);
+  const ownerOpen = await chatGptEffortSurfaceIsOpen(effortButton);
+  const menuVisible = ownerOpen && await menu.isVisible().catch(() => false);
   const menuExpanded = await effortButton.getAttribute("aria-expanded").catch(() => null);
   if (!menuVisible && menuExpanded !== "true") await effortButton.press("Enter");
   try {
     const efforts = menu.locator(CHATGPT_EFFORT_ITEM_SELECTOR);
-    const slider = page.locator(CHATGPT_EFFORT_SLIDER_SELECTOR).filter({ visible: true }).last();
+    const ownedSliders = menu.locator(CHATGPT_EFFORT_SLIDER_SELECTOR);
+    const slider = await ownedSliders.count().catch(() => 0) === 1
+      ? ownedSliders
+      : page.locator(CHATGPT_EFFORT_SLIDER_SELECTOR).filter({ visible: true }).last();
     const waitAbort = new AbortController();
     try {
       const ready = await Promise.race([

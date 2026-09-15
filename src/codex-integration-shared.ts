@@ -1,11 +1,14 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { AppConfig, SubagentProtocol } from "./config";
 import { atomicWriteFile, expandUserPath, getConfigDir } from "./config";
 
 export const MANAGED_COMMENT = "# Managed by codex-chatgpt-web; `codex-chatgpt-web uninstall` restores prior values.";
+export const MANAGED_ROUTE_COMMENT =
+  "# Managed by codex-chatgpt-web: Responses use the local bridge; Voice stays on ChatGPT.";
+export const CODEX_REALTIME_WEBRTC_CALL_BASE_URL = "https://chatgpt.com/backend-api/codex";
 export const MANAGED_REMOTE_COMPACTION_LINE =
   "remote_compaction_v2 = false # Managed by codex-chatgpt-web: bounds retained Web image history.";
 export const MANAGED_MULTI_AGENT_LINE =
@@ -30,6 +33,8 @@ export type ManagedAssignmentKey = "openai_base_url" | "model_provider" | "model
 export interface PreviousFeatureAssignment extends PreviousAssignment {
   tablePresent: boolean;
   tableName?: "features" | "features.multi_agent_v2";
+  inlineTable?: boolean;
+  separatorInserted?: boolean;
 }
 
 export interface PreviousAgentAssignment extends PreviousAssignment {
@@ -37,7 +42,58 @@ export interface PreviousAgentAssignment extends PreviousAssignment {
   separatorInserted?: boolean;
 }
 
+export interface InstalledCodexInterruptHook {
+  command: string;
+  groupIndex: number;
+  stateKey: string;
+  trustedHash: string;
+  fragment: string;
+}
+
 export interface CodexIntegrationJournal {
+  version: 10;
+  active: boolean;
+  configPath: string;
+  installed: {
+    openai_base_url: string;
+    experimental_realtime_webrtc_call_base_url: string;
+    subagent_protocol: SubagentProtocol;
+    agent_max_depth?: number;
+  };
+  previous: Record<ManagedAssignmentKey, PreviousAssignment>;
+  previousRealtimeWebrtcCallBaseUrl: PreviousAssignment;
+  interruptHook: InstalledCodexInterruptHook;
+  previousMultiAgent?: PreviousFeatureAssignment;
+  previousMultiAgentV2?: PreviousFeatureAssignment;
+  previousAgentMaxDepth?: PreviousAgentAssignment;
+  format?: {
+    lineEnding: "\n" | "\r\n" | "\r";
+    trailingNewline: boolean;
+  };
+}
+
+export interface LegacyCodexIntegrationJournalV9 {
+  version: 9;
+  active: boolean;
+  configPath: string;
+  installed: {
+    openai_base_url: string;
+    experimental_realtime_webrtc_call_base_url: string;
+    subagent_protocol: SubagentProtocol;
+    agent_max_depth?: number;
+  };
+  previous: Record<ManagedAssignmentKey, PreviousAssignment>;
+  previousRealtimeWebrtcCallBaseUrl: PreviousAssignment;
+  previousMultiAgent?: PreviousFeatureAssignment;
+  previousMultiAgentV2?: PreviousFeatureAssignment;
+  previousAgentMaxDepth?: PreviousAgentAssignment;
+  format?: {
+    lineEnding: "\n" | "\r\n" | "\r";
+    trailingNewline: boolean;
+  };
+}
+
+export interface LegacyCodexIntegrationJournalV8 {
   version: 8;
   active: boolean;
   configPath: string;
@@ -153,6 +209,8 @@ export interface LegacyCodexIntegrationJournal {
 
 export type ManagedRouteJournal =
   | CodexIntegrationJournal
+  | LegacyCodexIntegrationJournalV9
+  | LegacyCodexIntegrationJournalV8
   | LegacyCodexIntegrationJournalV7
   | LegacyCodexIntegrationJournalV6
   | LegacyCodexIntegrationJournalV5
@@ -164,6 +222,7 @@ export interface FileSnapshot {
   path: string;
   exists: boolean;
   data?: Buffer;
+  symlink?: { link: string; target: string; mode: number };
 }
 
 export interface InstallCodexIntegrationOptions {
@@ -212,33 +271,63 @@ export function sha256(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-export function snapshotFile(path: string): FileSnapshot {
+export function snapshotFile(path: string, options?: { followSymlink?: boolean }): FileSnapshot {
+  if (options?.followSymlink) {
+    let stat;
+    try { stat = lstatSync(path); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (stat?.isSymbolicLink()) {
+      const link = readlinkSync(path);
+      const target = realpathSync(path);
+      const targetStat = lstatSync(target);
+      if (!targetStat.isFile()) throw new Error(`Codex config symlink target is not a regular file: ${path}`);
+      return { path, exists: true, data: readFileSync(target), symlink: { link, target, mode: targetStat.mode & 0o777 } };
+    }
+  }
   return existsSync(path)
     ? { path, exists: true, data: readFileSync(path) }
     : { path, exists: false };
 }
 
+/** Write the snapshotted config target, never replace its symbolic link or follow a new target. */
+export function writeFileSnapshot(snapshot: FileSnapshot, data: string | Uint8Array): void {
+  const symlink = snapshot.symlink;
+  if (!symlink) {
+    atomicWriteFile(snapshot.path, data);
+    return;
+  }
+  if (!lstatSync(snapshot.path).isSymbolicLink()
+    || readlinkSync(snapshot.path) !== symlink.link
+    || realpathSync(snapshot.path) !== symlink.target) {
+    throw new Error(`Codex config symlink changed during the operation: ${snapshot.path}`);
+  }
+  atomicWriteFile(symlink.target, data, { mode: symlink.mode, protectDirectory: false });
+}
+
 export function restoreFileSnapshot(snapshot: FileSnapshot): void {
   if (snapshot.exists) {
     if (!snapshot.data) throw new Error(`File snapshot is missing data: ${snapshot.path}`);
-    atomicWriteFile(snapshot.path, snapshot.data);
+    writeFileSnapshot(snapshot, snapshot.data);
   } else {
     rmSync(snapshot.path, { force: true });
   }
 }
 
 export function writeFilesWithCompensation(
-  writes: Array<{ path: string; data: string | Uint8Array }>,
+  writes: Array<{ path: string; data: string | Uint8Array; followSymlink?: boolean }>,
   removals: string[] = [],
 ): void {
   const paths = [...new Set([...writes.map(write => write.path), ...removals])];
-  const snapshots = paths.map(snapshotFile);
+  const snapshots = new Map(paths.map(path => [path, snapshotFile(path, {
+    followSymlink: writes.some(write => write.path === path && write.followSymlink === true),
+  })]));
   try {
-    for (const write of writes) atomicWriteFile(write.path, write.data);
+    for (const write of writes) writeFileSnapshot(snapshots.get(write.path)!, write.data);
     for (const removal of removals) rmSync(removal, { force: true });
   } catch (error) {
     const rollbackFailures: string[] = [];
-    for (const snapshot of [...snapshots].reverse()) {
+    for (const snapshot of [...snapshots.values()].reverse()) {
       try {
         restoreFileSnapshot(snapshot);
       } catch (rollbackError) {
@@ -268,7 +357,7 @@ export function writeIntegrationState(
   // between those writes, the physical config unambiguously selects the completed state.
   writeFilesWithCompensation([
     { path: getCodexJournalRecoveryPath(), data },
-    ...(configWrite ? [configWrite] : []),
+    ...(configWrite ? [{ ...configWrite, followSymlink: true }] : []),
     { path: getCodexJournalPath(), data },
   ], removals);
 }

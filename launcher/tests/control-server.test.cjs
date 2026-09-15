@@ -6,6 +6,10 @@ test("browser control server authenticates and owns turn visibility", async () =
   const calls = [];
   const logs = [];
   const host = {
+    waitForWarmingHotTemporarySurfaceForTurn: async (options) => {
+      calls.push(["wait", options]);
+      return false;
+    },
     beginTurn: (...args) => {
       calls.push(["start", ...args]);
       return {
@@ -104,6 +108,14 @@ test("browser control server authenticates and owns turn visibility", async () =
     });
     assert.equal(end.status, 200);
     assert.deepEqual(calls, [
+      ["wait", {
+        traceId: "abcdef123456",
+        conversationKey: "a".repeat(64),
+        connectorIdentity: "Codex Native2",
+        requireRetainedConversation: true,
+        modelId: undefined,
+        reasoning: undefined,
+      }],
       [
         "start",
         "abcdef123456",

@@ -56,12 +56,79 @@ test("Full-mode Pro prompts pass one stable turn token directly to native action
   expect(transportOnly).toContain("do not repeat the same call unless its inputs or observable state changed.");
   expect(transportOnly).toContain("Continue using the available tools until the requested work is complete and verified.");
   expect(transportOnly).toContain("Write the user-facing final answer only after the last required tool result has settled.");
+  expect(transportOnly).toContain("Do not deliberately create a live or TTY command session merely to make unrelated or one-shot commands faster");
+  expect(transportOnly).toContain("create a persistent session only when later steps genuinely need the same process or its in-process state");
   expect(transportOnly).toContain(`The task context is complete. Pass turn_token ${token} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`);
   expect(transportOnly).not.toMatch(/codex_bind_turn|binding_id|outer_tool_gateway|command_tool/);
   expect(transportOnly).not.toMatch(/codex_exec|codex_write_stdin|codex_apply_patch|codex_view_image|codex_tool_inventory|codex\.control\.turn_complete/);
   expect(transportOnly).not.toMatch(/expired|invalid|revoked|blocked|safety|security layer|permission gate/i);
   expect(compiled.text).not.toContain("CODEX_INTERNAL_CONTEXT_COMPACT");
   expect(compiled.text).not.toContain("internally compacts this response");
+});
+
+test("Full-mode prompts expose only the current outer command shell capability without changing the connector ABI", () => {
+  const token = "turn_12345678901234567890123456789012";
+  const parsed = request("high");
+  parsed.context.tools = [{
+    name: "exec_command",
+    description: "Run a native command",
+    parameters: {
+      type: "object",
+      properties: {
+        cmd: { type: "string" },
+        shell: { type: "string" },
+        login: { type: "boolean" },
+      },
+    },
+  }];
+  const compiled = compileChatGptWebPrompt(
+    parsed,
+    { localToolsEnabled: true, solAvailable: true, proAvailable: true },
+    token,
+  );
+  const transportOnly = compiled.text.replace(
+    /<codex_context_json>[\s\S]*<\/codex_context_json>/,
+    "<codex_context_json>[task context]</codex_context_json>",
+  );
+
+  expect(transportOnly).toContain("current outer Codex registry advertises exec_command with an explicit shell selector");
+  expect(transportOnly).toContain("codex.control.parallel_exec_batch");
+  expect(transportOnly).toContain("mutually independent but must remain separate commands");
+  expect(transportOnly).toContain('"wire_name":"exec_command"');
+  expect(transportOnly).toContain("every member still runs as its own outer Codex exec_command");
+  expect(transportOnly).toContain("prefer an explicit command name ending in .exe, .com, .cmd, or .bat");
+  expect(transportOnly).toContain("native command bridge may then select the lower-overhead cmd.exe path without rewriting the command text");
+  expect(transportOnly).toContain("same current schema also advertises login selection");
+  expect(transportOnly).toContain("Never convert or reinterpret a shell-specific command merely to qualify for the fast path");
+  expect(transportOnly).not.toMatch(/codex_exec|codex_write_stdin|codex_tool_inventory|codex_tool_call/);
+
+  const withoutShell = request("high");
+  withoutShell.context.tools = [{
+    name: "exec_command",
+    description: "Run a native command",
+    parameters: { type: "object", properties: { cmd: { type: "string" } } },
+  }];
+  const ordinary = compileChatGptWebPrompt(
+    withoutShell,
+    { localToolsEnabled: true, solAvailable: true, proAvailable: true },
+    token,
+  );
+  expect(ordinary.text).not.toContain("explicit shell selector");
+  expect(ordinary.text).not.toContain("lower-overhead cmd.exe path");
+  expect(ordinary.text).toContain("codex.control.parallel_exec_batch");
+
+  const withoutExecCommand = request("high");
+  withoutExecCommand.context.tools = [{
+    name: "view_image",
+    description: "View an image",
+    parameters: { type: "object", properties: { path: { type: "string" } } },
+  }];
+  const noCommandBatch = compileChatGptWebPrompt(
+    withoutExecCommand,
+    { localToolsEnabled: true, solAvailable: true, proAvailable: true },
+    token,
+  );
+  expect(noCommandBatch.text).not.toContain("codex.control.parallel_exec_batch");
 });
 
 test("Pro preserves the same native Codex delegation contract as Extra High", () => {

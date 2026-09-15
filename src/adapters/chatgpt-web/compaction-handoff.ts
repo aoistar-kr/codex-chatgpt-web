@@ -5,6 +5,7 @@ import type {
   CodexToolResultMessage,
 } from "../../types";
 import { extractChatGptCompactionSourceRevision } from "./environment";
+import { ChatGptCompactionHandoffAccepted } from "./adapter-error";
 import type { ChatGptBrowserWorker } from "./browser-worker";
 import type { CompactionTransactionHandle } from "./compaction-transaction";
 import type { ChatGptWebCapabilities } from "./model";
@@ -257,7 +258,7 @@ export async function requestRetainedCompactionHandoff(
     // The one-shot control submission is the terminal event for this purpose-built response.
     // ChatGPT may render no assistant text after a tool-only response, and therefore no Copy
     // action. End our owned turn explicitly and wait for the launcher/helper cleanup handshake.
-    browserAbort.abort(new DOMException("Structured compaction handoff accepted", "AbortError"));
+    browserAbort.abort(new ChatGptCompactionHandoffAccepted());
     await withCompactionAbort(
       browser.then(() => undefined, () => undefined),
       operationSignal,
@@ -279,16 +280,64 @@ export async function requestRetainedCompactionHandoff(
 
 interface CachedCompactionRun {
   createdAt: number;
+  ownerKey?: string;
+  traceIds: Set<string>;
+  nativeThreadId?: string;
+  nativeTurnId?: string;
+  abort: AbortController;
+  active: boolean;
   promise: Promise<string>;
+  settlement: Promise<void>;
+}
+
+interface StructuredCompactionInterruption {
+  createdAt: number;
+  reason: Error;
+}
+
+export interface StructuredCompactionOwner {
+  ownerKey: string;
+  traceIds: readonly string[];
+  nativeThreadId?: string;
+  nativeTurnId?: string;
 }
 
 const structuredCompactionRuns = new Map<string, CachedCompactionRun>();
+const structuredCompactionOwners = new Map<string, Promise<void>>();
+const structuredCompactionInterruptions = new Map<string, StructuredCompactionInterruption>();
 const STRUCTURED_COMPACTION_RUN_TTL_MS = 30 * 60_000;
 
-function pruneStructuredCompactionRuns(): void {
-  const cutoff = Date.now() - STRUCTURED_COMPACTION_RUN_TTL_MS;
+function nativeTurnIdentityKey(threadId: string, turnId: string): string {
+  if (!threadId.trim() || !turnId.trim()) {
+    throw new Error("Structured compaction requires non-empty native thread and turn ids");
+  }
+  return JSON.stringify([threadId, turnId]);
+}
+
+function rememberStructuredCompactionInterruption(threadId: string, turnId: string, reason: Error): void {
+  const identity = nativeTurnIdentityKey(threadId, turnId);
+  const now = Date.now();
+  pruneStructuredCompactionRuns(now);
+  const existing = structuredCompactionInterruptions.get(identity);
+  if (existing) {
+    existing.createdAt = now;
+    return;
+  }
+  structuredCompactionInterruptions.set(identity, { createdAt: now, reason });
+}
+
+function structuredCompactionInterruption(owner: StructuredCompactionOwner): Error | undefined {
+  if (!owner.nativeThreadId || !owner.nativeTurnId) return undefined;
+  return structuredCompactionInterruptions.get(nativeTurnIdentityKey(owner.nativeThreadId, owner.nativeTurnId))?.reason;
+}
+
+function pruneStructuredCompactionRuns(now = Date.now()): void {
+  const cutoff = now - STRUCTURED_COMPACTION_RUN_TTL_MS;
   for (const [candidate, run] of structuredCompactionRuns) {
-    if (run.createdAt < cutoff) structuredCompactionRuns.delete(candidate);
+    if (!run.active && run.createdAt < cutoff) structuredCompactionRuns.delete(candidate);
+  }
+  for (const [identity, interruption] of structuredCompactionInterruptions) {
+    if (interruption.createdAt < cutoff) structuredCompactionInterruptions.delete(identity);
   }
 }
 
@@ -298,19 +347,93 @@ export function existingStructuredCompactionRun(key: string): Promise<string> | 
   return structuredCompactionRuns.get(key)?.promise;
 }
 
+export function runStructuredCompactionOnce(key: string, start: () => Promise<string>): Promise<string>;
 export function runStructuredCompactionOnce(
   key: string,
-  start: () => Promise<string>,
+  owner: StructuredCompactionOwner,
+  start: (operatorSignal: AbortSignal, retainOwnershipUntil: (settlement: Promise<void>) => void) => Promise<string>,
+): Promise<string>;
+export function runStructuredCompactionOnce(
+  key: string,
+  ownerOrStart: StructuredCompactionOwner | (() => Promise<string>),
+  maybeStart?: (operatorSignal: AbortSignal, retainOwnershipUntil: (settlement: Promise<void>) => void) => Promise<string>,
 ): Promise<string> {
   pruneStructuredCompactionRuns();
   const existing = structuredCompactionRuns.get(key);
   if (existing) return existing.promise;
-  const promise = Promise.resolve().then(start);
-  structuredCompactionRuns.set(key, { createdAt: Date.now(), promise });
-  void promise.catch(() => {
-    if (structuredCompactionRuns.get(key)?.promise === promise) {
-      structuredCompactionRuns.delete(key);
+  const owner: StructuredCompactionOwner | undefined = typeof ownerOrStart === "function" ? undefined : ownerOrStart;
+  const start = typeof ownerOrStart === "function"
+    ? (_signal: AbortSignal, _retain: (settlement: Promise<void>) => void) => ownerOrStart()
+    : maybeStart!;
+  if (owner) {
+    const interrupted = structuredCompactionInterruption(owner);
+    if (interrupted) return Promise.reject(interrupted);
+  }
+  const abort = new AbortController();
+  const previousOwner = owner ? structuredCompactionOwners.get(owner.ownerKey) : undefined;
+  const physicalSettlements: Promise<void>[] = previousOwner ? [previousOwner] : [];
+  const promise = Promise.resolve().then(async () => {
+    if (previousOwner) await withCompactionAbort(previousOwner, abort.signal);
+    if (abort.signal.aborted) throw abortReason(abort.signal);
+    return start(abort.signal, settlement => { physicalSettlements.push(settlement); });
+  });
+  let run!: CachedCompactionRun;
+  const settlement = promise.then(() => undefined, () => undefined).then(async () => {
+    await Promise.allSettled(physicalSettlements);
+    run.active = false;
+    if (owner && structuredCompactionOwners.get(owner.ownerKey) === settlement) {
+      structuredCompactionOwners.delete(owner.ownerKey);
     }
   });
+  run = {
+    createdAt: Date.now(),
+    ...(owner ? { ownerKey: owner.ownerKey } : {}),
+    traceIds: new Set(owner?.traceIds ?? []),
+    ...(owner?.nativeThreadId ? { nativeThreadId: owner.nativeThreadId } : {}),
+    ...(owner?.nativeTurnId ? { nativeTurnId: owner.nativeTurnId } : {}),
+    abort,
+    active: true,
+    promise,
+    settlement,
+  };
+  structuredCompactionRuns.set(key, run);
+  if (owner) structuredCompactionOwners.set(owner.ownerKey, settlement);
+  void promise.catch(() => {
+    if (structuredCompactionRuns.get(key) === run) structuredCompactionRuns.delete(key);
+  });
   return promise;
+}
+
+async function cancelStructuredCompactionRuns(
+  matches: (run: CachedCompactionRun) => boolean,
+  reason: Error,
+): Promise<number> {
+  const runs = [...structuredCompactionRuns.values()].filter(run => run.active && matches(run));
+  for (const run of runs) if (!run.abort.signal.aborted) run.abort.abort(reason);
+  await Promise.allSettled(runs.map(run => run.settlement));
+  return runs.length;
+}
+
+export function cancelStructuredCompactionNativeTurn(
+  threadId: string,
+  turnId: string,
+  reason: Error,
+): { cancelled: number; settlement: Promise<void> } {
+  rememberStructuredCompactionInterruption(threadId, turnId, reason);
+  const runs = [...structuredCompactionRuns.values()].filter(run => (
+    run.active && run.nativeThreadId === threadId && run.nativeTurnId === turnId
+  ));
+  for (const run of runs) if (!run.abort.signal.aborted) run.abort.abort(reason);
+  return {
+    cancelled: runs.length,
+    settlement: Promise.allSettled(runs.map(run => run.settlement)).then(() => undefined),
+  };
+}
+
+export function cancelStructuredCompactionTrace(traceId: string, reason: Error): Promise<number> {
+  return cancelStructuredCompactionRuns(run => run.traceIds.has(traceId), reason);
+}
+
+export function cancelAllStructuredCompactions(reason: Error): Promise<number> {
+  return cancelStructuredCompactionRuns(() => true, reason);
 }

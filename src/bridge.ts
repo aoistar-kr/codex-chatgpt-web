@@ -1,4 +1,4 @@
-import type { AdapterEvent, CodexMessagePhase, CodexProviderContinuationState, CodexUsage } from "./types";
+import type { AdapterEvent, CodexMessagePhase, CodexOutputTextAnnotation, CodexProviderContinuationState, CodexUsage } from "./types";
 import { adapterFailureFromMessage, classifyError, type CodexErrorPayload } from "./lib/errors";
 import { encodeCompactionSummary } from "./responses/compaction";
 import { encodeReasoningEnvelope, type ReasoningEnvelope } from "./responses/reasoning-envelope";
@@ -209,7 +209,13 @@ export function bridgeToResponsesSSE(
       const stallSec = resolveStallTimeoutSec(options?.stallTimeoutSec);
       const stallTimeoutMs = stallSec * 1000;
 
-      let currentMsg: { itemId: string; outputIndex: number; text: string; phase?: CodexMessagePhase } | null = null;
+      let currentMsg: {
+        itemId: string;
+        outputIndex: number;
+        text: string;
+        phase?: CodexMessagePhase;
+        annotations?: CodexOutputTextAnnotation[];
+      } | null = null;
       let currentReasoning: { itemId: string; outputIndex: number; text: string } | null = null;
       let currentRawReasoning: { itemId: string; outputIndex: number; text: string } | null = null;
       // Opaque signed-reasoning round-trip state: the signature signs the CURRENT thinking
@@ -265,6 +271,7 @@ export function bridgeToResponsesSSE(
       let currentToolCall: { itemId: string; outputIndex: number; callId: string; name: string; args: string; namespace?: string; freeform?: boolean; toolSearch?: boolean; inputEmitted?: string } | null = null;
       const closeCurrentMessage = () => {
         if (!currentMsg) return;
+        const annotations = currentMsg.annotations?.map(annotation => ({ ...annotation })) ?? [];
         // Finalize the text part (Responses protocol). Without these .done events Codex never
         // commits the content part and renders the message as truncated / cut off.
         emit("response.output_text.done", {
@@ -272,11 +279,11 @@ export function bridgeToResponsesSSE(
         });
         emit("response.content_part.done", {
           item_id: currentMsg.itemId, output_index: currentMsg.outputIndex, content_index: 0,
-          part: { type: "output_text", text: currentMsg.text, annotations: [] },
+          part: { type: "output_text", text: currentMsg.text, annotations },
         });
         const item = {
           type: "message", id: currentMsg.itemId, status: "completed", role: "assistant",
-          content: [{ type: "output_text", text: currentMsg.text, annotations: [] }],
+          content: [{ type: "output_text", text: currentMsg.text, annotations }],
           ...(currentMsg.phase ? { phase: currentMsg.phase } : {}),
         };
         emit("response.output_item.done", { output_index: currentMsg.outputIndex, item });
@@ -583,6 +590,9 @@ export function bridgeToResponsesSSE(
               break;
             }
             case "done": {
+              if (currentMsg && event.annotations?.length) {
+                currentMsg.annotations = event.annotations.map(annotation => ({ ...annotation }));
+              }
               if (currentMsg) closeCurrentMessage();
               if (currentReasoning) closeCurrentReasoning();
               if (currentRawReasoning) closeCurrentRawReasoning();
@@ -871,6 +881,7 @@ export function buildResponseJSON(
 
   let currentText = "";
   let currentTextPhase: CodexMessagePhase | undefined;
+  let currentTextAnnotations: CodexOutputTextAnnotation[] = [];
   let currentSummaryReasoning = "";
   let currentRawReasoning = "";
   // Opaque signed-reasoning round-trip (batch): see bridgeToResponsesSSE counterpart.
@@ -889,13 +900,15 @@ export function buildResponseJSON(
 
   const flushText = () => {
     if (!currentText) return;
+    const annotations = currentTextAnnotations.map(annotation => ({ ...annotation }));
     output.push({
       type: "message", id: `msg_${uuid()}`, role: "assistant", status: "completed",
-      content: [{ type: "output_text", text: currentText, annotations: [] }],
+      content: [{ type: "output_text", text: currentText, annotations }],
       ...(currentTextPhase ? { phase: currentTextPhase } : {}),
     });
     currentText = "";
     currentTextPhase = undefined;
+    currentTextAnnotations = [];
   };
   const flushSummaryReasoning = () => {
     if (!currentSummaryReasoning && !batchSignature && batchRedacted.length === 0) return;
@@ -1032,6 +1045,9 @@ export function buildResponseJSON(
         if (e.providerState) options?.onProviderState?.(e.providerState);
         break;
       case "done":
+        if (currentText && e.annotations?.length) {
+          currentTextAnnotations = e.annotations.map(annotation => ({ ...annotation }));
+        }
         usage = e.usage;
         endTurn = e.endTurn;
         if (e.providerState) options?.onProviderState?.(e.providerState);

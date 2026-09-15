@@ -5,7 +5,13 @@ export interface ChatGptExternalTurnProgressSnapshot {
   lastProgressAt?: number;
 }
 
-/** Allows one bounded DOM probe plus cross-process delivery before failing the causal barrier. */
+/**
+ * Bound for the causal tool-dispatch barrier.
+ *
+ * Keep this fail-closed: Codex must not execute a tool until the browser has captured the pre-tool
+ * answer boundary. The progress-aware browser wait now wakes on the mirrored MCP batch itself, so
+ * the tighter 10s budget is intentionally exercised by installed Full/High E2E validation.
+ */
 export const CHATGPT_TOOL_BOUNDARY_OBSERVATION_TIMEOUT_MS = 10_000;
 
 interface ProgressWaiter {

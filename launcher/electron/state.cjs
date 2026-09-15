@@ -66,6 +66,11 @@ function readState(filePath) {
         || !Number.isFinite(Date.parse(state.sessionRefreshReminderAt)))) {
       state.sessionRefreshReminderAt = DEFAULT_STATE.sessionRefreshReminderAt;
     }
+    if (state.connectorPluginId !== undefined
+      && (typeof state.connectorPluginId !== "string"
+        || !/^plugin:[A-Za-z0-9_-]{16,128}$/.test(state.connectorPluginId))) {
+      delete state.connectorPluginId;
+    }
     for (const key of [
       "coreSetupComplete",
       "codexCatalogVerified",

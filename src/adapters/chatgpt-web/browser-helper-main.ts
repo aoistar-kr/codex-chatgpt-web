@@ -1,6 +1,6 @@
 import { createInterface } from "node:readline";
 import { stdin, stderr, stdout } from "node:process";
-import type { CodexProviderConfig } from "../../types";
+import type { CodexOutputTextAnnotation, CodexProviderConfig } from "../../types";
 import { ChatGptBrowserWorker, closeChatGptBrowserWorkers, type BrowserTurn } from "./browser-worker";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import type { ChatGptWebCapabilities } from "./model";
@@ -58,7 +58,17 @@ interface SmokeMessage {
   config: VerifyMessage["config"];
 }
 
-type MaintenanceMessage = VerifyMessage | InspectMessage | SmokeMessage;
+interface PrewarmMessage {
+  type: "prewarm";
+  id: string;
+  config: VerifyMessage["config"];
+  surfaceId: string;
+  modelId: string;
+  reasoning?: string;
+  connectorIdentity?: string;
+}
+
+type MaintenanceMessage = VerifyMessage | InspectMessage | SmokeMessage | PrewarmMessage;
 type InputMessage = RunMessage
   | MaintenanceMessage
   | { type: "prepared_selected_ack"; id: string; prepared: CompiledChatGptWebPrompt }
@@ -206,6 +216,7 @@ async function run(message: RunMessage): Promise<void> {
   const promptSelection = createBrowserHelperPromptSelection();
   preparedSelections.set(message.id, promptSelection);
   const prepareSelected = async () => ({ ...await promptSelection.wait(), release: () => {} });
+  let outputAnnotations: CodexOutputTextAnnotation[] = [];
   const turn: BrowserTurn = {
     traceId: message.turn.traceId,
     modelId: message.turn.modelId,
@@ -282,6 +293,9 @@ async function run(message: RunMessage): Promise<void> {
     }),
     onCommentary: (text, continuation) => writeProtocol({ type: "event", id: message.id, event: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
     onTextDelta: text => writeProtocol({ type: "event", id: message.id, event: "text", text }),
+    onOutputAnnotations: annotations => {
+      outputAnnotations = annotations.map(annotation => ({ ...annotation }));
+    },
     ...(message.turn.captureLunaCheckpoint ? {
       captureLunaCheckpoint: true,
       onLunaCheckpoint: captured => writeProtocol({
@@ -294,7 +308,12 @@ async function run(message: RunMessage): Promise<void> {
   };
   try {
     const text = await ChatGptBrowserWorker.forProvider(provider).run(turn);
-    writeProtocol({ type: "result", id: message.id, text });
+    writeProtocol({
+      type: "result",
+      id: message.id,
+      text,
+      ...(outputAnnotations.length > 0 ? { annotations: outputAnnotations } : {}),
+    });
   } catch (error) {
     writeProtocol({
       type: "error",
@@ -327,8 +346,8 @@ async function run(message: RunMessage): Promise<void> {
 
 async function verify(message: VerifyMessage): Promise<void> {
   try {
-    const selected = await maintenanceWorker(message).verifyConnector();
-    writeProtocol({ type: "result", id: message.id, text: selected });
+    const value = await maintenanceWorker(message).verifyConnector();
+    writeProtocol({ type: "result", id: message.id, value });
   } catch (error) {
     writeProtocol({
       type: "error",
@@ -356,7 +375,7 @@ function maintenanceWorker(message: MaintenanceMessage): ChatGptBrowserWorker {
   return ChatGptBrowserWorker.forProvider(provider);
 }
 
-async function maintain(message: InspectMessage | SmokeMessage): Promise<void> {
+async function maintain(message: InspectMessage | SmokeMessage | PrewarmMessage): Promise<void> {
   if (abortControllers.has(message.id)) throw new Error(`Browser helper maintenance operation already exists: ${message.id}`);
   const abortController = new AbortController();
   abortControllers.set(message.id, abortController);
@@ -364,7 +383,15 @@ async function maintain(message: InspectMessage | SmokeMessage): Promise<void> {
     const worker = maintenanceWorker(message);
     const value = message.type === "inspect"
       ? await worker.inspectSession(message.detectCapabilities)
-      : await worker.smokeTest(abortController.signal);
+      : message.type === "prewarm"
+        ? await worker.prewarmMode(
+          message.surfaceId,
+          message.modelId,
+          message.reasoning,
+          abortController.signal,
+          message.connectorIdentity,
+        )
+        : await worker.smokeTest(abortController.signal);
     writeProtocol({ type: "result", id: message.id, value });
   } catch (error) {
     writeProtocol({
@@ -479,7 +506,7 @@ input.on("line", line => {
       id: message.id,
       message: error instanceof Error ? error.message : String(error),
     }));
-  } else if (message.type === "inspect" || message.type === "smoke") {
+  } else if (message.type === "inspect" || message.type === "smoke" || message.type === "prewarm") {
     void maintain(message).catch(error => writeProtocol({
       type: "error",
       id: message.id,

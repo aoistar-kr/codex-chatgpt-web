@@ -140,11 +140,20 @@ export async function runDoctor(): Promise<DoctorReport> {
 
   const codex = inspectCodexIntegration();
   if (!codex.installed) {
-    checks.push({ id: "codex", status: "error", message: "Codex model route is not installed" });
+    checks.push({ id: "codex", status: "ok", message: "Provider-only mode does not own the Codex model route" });
   } else if (codex.errors.length > 0) {
-    checks.push({ id: "codex", status: "error", message: "Codex integration is inconsistent", detail: codex.errors.join("; ") });
+    checks.push({
+      id: "codex",
+      status: "warning",
+      message: "Legacy direct Codex integration metadata is still present; rerun setup to retire it",
+      detail: codex.errors.join("; "),
+    });
   } else {
-    checks.push({ id: "codex", status: "ok", message: "Codex native model route is installed" });
+    checks.push({
+      id: "codex",
+      status: "warning",
+      message: "Legacy direct Codex integration is still installed; provider-only setup will retire it",
+    });
   }
 
   const service = getServiceStatus();

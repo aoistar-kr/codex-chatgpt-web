@@ -183,6 +183,17 @@ export interface CodexProviderContinuationState {
   [provider: string]: Record<string, unknown> | undefined;
 }
 
+/** Responses-compatible citation annotation attached to one assistant output_text part. */
+export interface CodexUrlCitationAnnotation {
+  type: "url_citation";
+  start_index: number;
+  end_index: number;
+  url: string;
+  title: string;
+}
+
+export type CodexOutputTextAnnotation = CodexUrlCitationAnnotation;
+
 export type AdapterEvent =
   | { type: "heartbeat" }
   | { type: "text_delta"; text: string; phase?: CodexMessagePhase }
@@ -201,6 +212,8 @@ export type AdapterEvent =
       usage?: CodexUsage;
       stopReason?: string;
       endTurn?: boolean;
+      /** Final annotations for the current assistant text item; emitted only after indices are stable. */
+      annotations?: CodexOutputTextAnnotation[];
       providerState?: CodexProviderContinuationState;
     }
   | {

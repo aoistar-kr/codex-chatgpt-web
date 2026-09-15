@@ -926,6 +926,11 @@ export async function callTurnBroker<T>(
         return;
       }
       response = parsed;
+      // The complete response frame is already in the client buffer. Waiting for the named-pipe
+      // close event here can hang on Bun/Windows even though the server has called end() and the
+      // response is fully available. The server still owns write termination; resolving now only
+      // avoids coupling the RPC result to a delayed transport close notification.
+      finishResponse();
     });
   });
 }

@@ -155,6 +155,35 @@ async function control(config: AppConfig, action: "drain" | "resume" | "cancel-t
   }
 }
 
+export async function interruptActiveTurn(
+  config: AppConfig,
+  identity: { threadId: string; turnId: string },
+): Promise<{ cancelledHttpTurns: number; cancelledBrowserTurns: number; cancelledCompactionRuns: number }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  try {
+    const response = await fetch(`http://${config.host}:${config.port}/admin/interrupt-turn`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${config.controlToken}`, "content-type": "application/json" },
+      body: JSON.stringify(identity),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const result = await response.json() as Record<string, unknown>;
+    const http = result.cancelled_http_turns;
+    const browser = result.cancelled_browser_turns;
+    const compaction = result.cancelled_compaction_runs;
+    if (!Number.isInteger(http) || (http as number) < 0
+      || !Number.isInteger(browser) || (browser as number) < 0
+      || !Number.isInteger(compaction) || (compaction as number) < 0) {
+      throw new Error("daemon returned an invalid exact-turn interruption acknowledgement");
+    }
+    return { cancelledHttpTurns: http as number, cancelledBrowserTurns: browser as number, cancelledCompactionRuns: compaction as number };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function cancelActiveTurns(config: AppConfig): Promise<{
   cancelledHttpTurns: number;
   cancelledBrowserTurns: number;

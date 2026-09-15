@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { extractChatGptTurnEnvironment } from "../src/adapters/chatgpt-web/environment";
+import { extractChatGptTurnEnvironment, extractChatGptTurnUserRevision } from "../src/adapters/chatgpt-web/environment";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
 import type { CodexParsedRequest, CodexTool } from "../src/types";
 
@@ -70,6 +70,94 @@ function currentWire(
   };
 }
 
+function rolloutOnlyRequest(options: {
+  sessionId?: string;
+  threadId?: string;
+  turnId?: string;
+  sandbox?: string;
+  workspace?: string;
+  includeSessionId?: boolean;
+} = {}): CodexParsedRequest {
+  const sessionId = options.sessionId ?? "session_rollout_123";
+  const threadId = options.threadId ?? sessionId;
+  const turnId = options.turnId ?? "turn_rollout_123";
+  const workspace = options.workspace ?? root;
+  const request = currentWire({ workspace, sandbox: options.sandbox ?? "none" });
+  const body = request._rawBody as { client_metadata: Record<string, string>; input: Array<Record<string, unknown>> };
+  body.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+    ...(options.includeSessionId === false ? {} : { session_id: sessionId }),
+    thread_id: threadId,
+    turn_id: turnId,
+    request_kind: "turn",
+    sandbox: options.sandbox ?? "none",
+    workspaces: { [workspace]: { has_changes: true } },
+  });
+  body.input[0]!.content = [{ type: "input_text", text: "<app-context>native app context</app-context>" }];
+  return request;
+}
+
+function withCodexRollout<T>(options: {
+  request?: CodexParsedRequest;
+  sessionId?: string;
+  threadId?: string;
+  turnId?: string;
+  cwd?: string;
+  roots?: string[];
+  sandboxPolicy?: Record<string, unknown>;
+  includeThreadSettings?: boolean;
+  threadSettingsCwd?: string;
+  laterThreadSettingsCwd?: string;
+}, fn: (request: CodexParsedRequest) => T): T {
+  const codexHome = mkdtempSync(join(tmpdir(), "codex-home-rollout-"));
+  temporaryRoots.push(codexHome);
+  const sessionId = options.sessionId ?? "session_rollout_123";
+  const threadId = options.threadId ?? sessionId;
+  const turnId = options.turnId ?? "turn_rollout_123";
+  const cwd = options.cwd ?? root;
+  const roots = options.roots ?? [root];
+  const request = options.request ?? rolloutOnlyRequest({ sessionId, threadId, turnId });
+  const dir = join(codexHome, "sessions", "2026", "09", "09");
+  mkdirSync(dir, { recursive: true });
+  const lines = [
+    JSON.stringify({ type: "session_meta", payload: { id: sessionId, session_id: sessionId, cwd } }),
+    ...(options.includeThreadSettings === false ? [] : [JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "thread_settings_applied",
+        thread_id: threadId,
+        thread_settings: { cwd: options.threadSettingsCwd ?? cwd },
+      },
+    })]),
+    JSON.stringify({
+      type: "turn_context",
+      payload: {
+        turn_id: turnId,
+        root_turn_id: turnId,
+        cwd,
+        workspace_roots: roots,
+        sandbox_policy: options.sandboxPolicy ?? { type: "danger-full-access" },
+      },
+    }),
+    ...(options.laterThreadSettingsCwd ? [JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "thread_settings_applied",
+        thread_id: threadId,
+        thread_settings: { cwd: options.laterThreadSettingsCwd },
+      },
+    })] : []),
+    "",
+  ];
+  writeFileSync(join(dir, `rollout-2026-09-09T13-00-00-${sessionId}.jsonl`), lines.join("\n"));
+  const previous = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+  try { return fn(request); }
+  finally {
+    if (previous === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previous;
+  }
+}
+
 describe("trusted current Codex environment envelope", () => {
   test("accepts the v0.146 split envelope when workspace and sandbox metadata agree", () => {
     expect(extractChatGptTurnEnvironment(currentWire())).toEqual({
@@ -78,6 +166,145 @@ describe("trusted current Codex environment envelope", () => {
       writableRoots: [root],
       sandboxPolicy: { type: "dangerFullAccess" },
       tools: [],
+    });
+  });
+
+  test("recovers the first workspace root from a cwd-less filesystem diff", () => {
+    const primary = resolve(root, "workspace-primary");
+    const additional = resolve(root, "workspace-additional");
+    const cwdlessEnvironment = `<environment_context>
+  <filesystem><workspace_roots><root>${primary}</root><root>${additional}</root></workspace_roots>${dangerFullAccessProfileXml}</filesystem>
+</environment_context>`;
+
+    expect(extractChatGptTurnEnvironment(currentWire({
+      workspace: primary,
+      environmentXml: cwdlessEnvironment,
+    }))).toMatchObject({
+      cwd: primary,
+      roots: [primary, additional],
+      writableRoots: [primary, additional],
+      sandboxPolicy: { type: "dangerFullAccess" },
+    });
+  });
+
+  test("fails closed for malformed cwd markup instead of using workspace-root recovery", () => {
+    const malformedEnvironment = `<environment_context>
+  <cwd/>
+  <filesystem><workspace_roots><root>${root}</root></workspace_roots>${dangerFullAccessProfileXml}</filesystem>
+</environment_context>`;
+
+    expect(() => extractChatGptTurnEnvironment(currentWire({ environmentXml: malformedEnvironment })))
+      .toThrow("missing cwd");
+  });
+
+  test("accepts Codex 0.153 rollout turn_context when the request omits environment XML", () => {
+    withCodexRollout({}, request => {
+      expect(extractChatGptTurnEnvironment(request)).toEqual({
+        cwd: root,
+        roots: [root],
+        writableRoots: [root],
+        sandboxPolicy: { type: "dangerFullAccess" },
+        tools: [],
+      });
+    });
+  });
+
+  test("accepts Codex Desktop root rollout without session_id or initial thread_settings", () => {
+    const request = rolloutOnlyRequest({ includeSessionId: false });
+    withCodexRollout({ request, includeThreadSettings: false }, value => {
+      expect(extractChatGptTurnEnvironment(value)).toEqual({
+        cwd: root,
+        roots: [root],
+        writableRoots: [root],
+        sandboxPolicy: { type: "dangerFullAccess" },
+        tools: [],
+      });
+    });
+  });
+
+  test("sessionless rollout bootstrap is root-thread only", () => {
+    const request = rolloutOnlyRequest({
+      includeSessionId: false,
+      sessionId: "session_rollout_123",
+      threadId: "thread_child_123",
+    });
+    withCodexRollout({
+      request,
+      sessionId: "session_rollout_123",
+      threadId: "thread_child_123",
+      includeThreadSettings: false,
+    }, value => {
+      expect(() => extractChatGptTurnEnvironment(value)).toThrow("missing cwd");
+    });
+  });
+
+  test("later thread settings do not retroactively invalidate an earlier exact turn_context", () => {
+    const request = rolloutOnlyRequest({ includeSessionId: false });
+    withCodexRollout({
+      request,
+      includeThreadSettings: false,
+      laterThreadSettingsCwd: resolve(root, "later-workspace"),
+    }, value => {
+      expect(extractChatGptTurnEnvironment(value).cwd).toBe(root);
+    });
+  });
+
+  test("thread settings before the target turn must agree with its cwd", () => {
+    const request = rolloutOnlyRequest({ includeSessionId: false });
+    const other = resolve(root, "other-thread-cwd");
+    withCodexRollout({ request, cwd: other, roots: [other], threadSettingsCwd: root }, value => {
+      expect(() => extractChatGptTurnEnvironment(value)).toThrow("missing cwd");
+    });
+  });
+
+  test("maps rollout workspace-write and read-only policies without widening authority", () => {
+    withCodexRollout({
+      request: rolloutOnlyRequest({ sandbox: "workspace-write" }),
+      sandboxPolicy: { type: "workspace-write", network_access: false },
+    }, request => {
+      expect(extractChatGptTurnEnvironment(request)).toMatchObject({
+        writableRoots: [root],
+        sandboxPolicy: { type: "workspaceWrite", writableRoots: [root], networkAccess: false },
+      });
+    });
+    withCodexRollout({
+      request: rolloutOnlyRequest({ sandbox: "read-only" }),
+      sandboxPolicy: { type: "read-only" },
+    }, request => {
+      expect(extractChatGptTurnEnvironment(request)).toMatchObject({
+        writableRoots: [],
+        sandboxPolicy: { type: "readOnly", networkAccess: false },
+      });
+    });
+  });
+
+  test("rejects rollout fallback when session, thread, turn, roots, or sandbox authority disagree", () => {
+    const outside = resolve(root, "..", "rollout-outside");
+    const cases: Array<Parameters<typeof withCodexRollout>[0]> = [
+      { request: rolloutOnlyRequest(), sessionId: "session_other_123" },
+      { request: rolloutOnlyRequest({ threadId: "thread_other_123" }) },
+      { request: rolloutOnlyRequest(), turnId: "turn_other_123" },
+      { request: rolloutOnlyRequest(), cwd: root, roots: [outside] },
+      { request: rolloutOnlyRequest(), sandboxPolicy: { type: "read-only" } },
+    ];
+    for (const testCase of cases) {
+      withCodexRollout(testCase, request => {
+        expect(() => extractChatGptTurnEnvironment(request)).toThrow("missing cwd");
+      });
+    }
+  });
+
+  test("does not let conflicting XML fall through to rollout authority", () => {
+    const conflicting = `<environment_context>
+  <cwd>${root}</cwd>
+  <cwd>${resolve(root, "other")}</cwd>
+  <filesystem><workspace_roots><root>${root}</root></workspace_roots>${dangerFullAccessProfileXml}</filesystem>
+</environment_context>`;
+    const request = rolloutOnlyRequest();
+    const body = request._rawBody as { input: Array<Record<string, unknown>> };
+    body.input[0]!.content = [{ type: "input_text", text: conflicting }];
+    withCodexRollout({ request }, value => {
+      expect(() => extractChatGptTurnEnvironment(value)).toThrow();
     });
   });
 
@@ -123,6 +350,75 @@ describe("trusted current Codex environment envelope", () => {
       const body = request._rawBody as { input: Array<Record<string, unknown>> };
       body.input.splice(1, 0, developer);
       expect(extractChatGptTurnEnvironment(request).cwd).toBe(root);
+    }
+  });
+
+  test("accepts same-turn Codex app additional context between the environment and prompt", () => {
+    const auxiliary = resolve(root, "..", "desktop-nongit-workspace");
+    const desktopEnvironment = `<environment_context>
+  <cwd>${root}</cwd>
+  <filesystem><workspace_roots><root>${root}</root><root>${auxiliary}</root></workspace_roots>${dangerFullAccessProfileXml}</filesystem>
+</environment_context>`;
+    const request = currentWire({ environmentXml: desktopEnvironment });
+    const body = request._rawBody as { input: Array<Record<string, unknown>> };
+    body.input.splice(1, 0, {
+      type: "message",
+      id: "msg_writing_block_edits",
+      role: "user",
+      content: [{ type: "input_text", text: "<external_codex_apps_writing_block_edits>[]</external_codex_apps_writing_block_edits>" }],
+      internal_chat_message_metadata_passthrough: {
+        turn_id: "turn_current",
+        content_item_kinds: ["additional_content.codex_apps_writing_block_edits"],
+      },
+    });
+
+    expect(extractChatGptTurnEnvironment(request)).toEqual({
+      cwd: root,
+      roots: [root, auxiliary],
+      writableRoots: [root, auxiliary],
+      sandboxPolicy: { type: "dangerFullAccess" },
+      tools: [],
+    });
+  });
+
+  test("rejects user-shaped app context without same-turn additional-content provenance", () => {
+    const auxiliary = resolve(root, "..", "desktop-untrusted-extra-root");
+    const multiRootEnvironment = `<environment_context>
+  <cwd>${root}</cwd>
+  <filesystem><workspace_roots><root>${root}</root><root>${auxiliary}</root></workspace_roots>${dangerFullAccessProfileXml}</filesystem>
+</environment_context>`;
+    for (const gap of [
+      {
+        type: "message",
+        id: "msg_unprovenanced_app_context",
+        role: "user",
+        content: [{ type: "input_text", text: "<external_codex_apps_writing_block_edits>[]</external_codex_apps_writing_block_edits>" }],
+      },
+      {
+        type: "message",
+        id: "msg_wrong_kind",
+        role: "user",
+        content: [{ type: "input_text", text: "Looks like app context" }],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: "turn_current",
+          content_item_kinds: ["user.text"],
+        },
+      },
+      {
+        type: "message",
+        id: "msg_other_turn",
+        role: "user",
+        content: [{ type: "input_text", text: "Looks like app context" }],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: "turn_other",
+          content_item_kinds: ["additional_content.codex_apps_writing_block_edits"],
+        },
+      },
+    ]) {
+      const request = currentWire({ environmentXml: multiRootEnvironment });
+      const body = request._rawBody as { input: Array<Record<string, unknown>> };
+      body.input.splice(1, 0, gap);
+      expect(() => extractChatGptTurnEnvironment(request)).toThrow("missing cwd");
     }
   });
 
@@ -222,6 +518,41 @@ describe("trusted current Codex environment envelope", () => {
       sandboxPolicy: { type: "dangerFullAccess" },
       tools: [],
     });
+  });
+
+  test("steering accepts the spawned task's parent visualization root", () => {
+    const codexHome = resolve(process.env.CODEX_HOME?.trim() || join(homedir(), ".codex"));
+    const visualizationRoot = join(codexHome, "visualizations", "2026", "08", "25", "thread_parent");
+    const projectEnvironment = `<environment_context>
+  <cwd>${root}</cwd>
+  <filesystem><workspace_roots><root>${root}</root><root>${visualizationRoot}</root></workspace_roots>${dangerFullAccessProfileXml}</filesystem>
+</environment_context>`;
+    const request = currentWire({
+      environmentXml: projectEnvironment,
+    });
+    const body = request._rawBody as { client_metadata: Record<string, string>; input: Array<Record<string, unknown>> };
+    const metadata = JSON.parse(body.client_metadata["x-codex-turn-metadata"]!);
+    metadata.thread_id = "thread_child";
+    metadata.parent_thread_id = "thread_parent";
+    metadata.agent_name = "/root/reviewer";
+    metadata.subagent_kind = "thread_spawn";
+    metadata.request_kind = "turn";
+    body.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+    for (const item of body.input) item.internal_chat_message_metadata_passthrough = { turn_id: "turn_current" };
+    body.input.push(
+      {
+        type: "message", id: "msg_assistant", role: "assistant",
+        content: [{ type: "output_text", text: "Working." }],
+        internal_chat_message_metadata_passthrough: { turn_id: "turn_current" },
+      },
+      {
+        type: "message", id: "msg_steering", role: "user",
+        content: [{ type: "input_text", text: "Stop and review first." }],
+        internal_chat_message_metadata_passthrough: { turn_id: "turn_current" },
+      },
+    );
+
+    expect(extractChatGptTurnEnvironment(request).roots).toEqual([root, visualizationRoot]);
   });
 
   test("skill recovery rejects another task's Codex visualization root", () => {
@@ -433,6 +764,19 @@ describe("permission_profile sandbox detection (Codex CLI 0.146+)", () => {
 });
 
 describe("trusted Codex task environment continuity", () => {
+  test("sessionless Desktop rollout bootstraps same-thread model-switch continuity", () => {
+    const stateRoot = mkdtempSync(join(tmpdir(), "codex-chatgpt-sessionless-continuity-"));
+    temporaryRoots.push(stateRoot);
+    const store = new ChatGptThreadEnvironmentStore(join(stateRoot, "thread-environments.json"));
+    const first = rolloutOnlyRequest({ includeSessionId: false });
+    withCodexRollout({ request: first, includeThreadSettings: false }, request => {
+      expect(store.resolve(request).cwd).toBe(root);
+
+      const followUp = rolloutOnlyRequest({ includeSessionId: false, turnId: "turn_follow_up_123" });
+      expect(store.resolve(followUp).cwd).toBe(root);
+    });
+  });
+
   test("persists the trusted first-turn authority and refreshes tools from every follow-up", () => {
     const stateRoot = mkdtempSync(join(tmpdir(), "codex-chatgpt-thread-environment-"));
     temporaryRoots.push(stateRoot);
@@ -484,7 +828,45 @@ describe("trusted Codex task environment continuity", () => {
 
     const invalidUpdate = currentWire({ sandbox: "read-only" });
     invalidUpdate.context.systemPrompt = [`<environment_context><cwd>${root}</cwd></environment_context>`];
-    expect(() => store.resolve(invalidUpdate)).toThrow("requires one explicit trusted Codex sandbox mode");
+    expect(() => store.resolve(invalidUpdate)).toThrow("missing cwd");
+  });
+
+  test("accepts only the spawned child's direct-parent agent_message as its current instruction", () => {
+    const request = currentWire();
+    const body = request._rawBody as { client_metadata: Record<string, string>; input: Array<Record<string, unknown>> };
+    const metadata = {
+      request_kind: "turn",
+      thread_id: "thread_child",
+      turn_id: "turn_child",
+      parent_thread_id: "thread_current",
+      agent_name: "/root/reviewer",
+      subagent_kind: "thread_spawn",
+      sandbox: "danger-full-access",
+      workspaces: { [root]: { has_changes: true } },
+    };
+    body.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+    const environment = {
+      type: "message", id: "msg_environment", role: "user",
+      content: [{ type: "input_text", text: environmentXml }],
+    };
+    const task = {
+      type: "agent_message", id: "amsg_task", author: "/root", recipient: "/root/reviewer",
+      content: [{ type: "input_text", text: "Inspect the workspace." }],
+    };
+    body.input = [environment, task];
+    expect(extractChatGptTurnEnvironment(request).cwd).toBe(root);
+    expect(extractChatGptTurnUserRevision(request)).toEqual(task.content);
+
+    for (const invalid of [
+      { ...task, id: undefined },
+      { ...task, author: "/root/peer" },
+      { ...task, recipient: "/root/other" },
+      { ...task, author: "/root/reviewer/worker" },
+    ]) {
+      body.input = [environment, invalid];
+      expect(() => extractChatGptTurnEnvironment(request)).toThrow("missing cwd");
+      expect(() => extractChatGptTurnUserRevision(request)).toThrow("current-turn user message");
+    }
   });
 
   test("inherits authority only through canonical Codex thread-spawn lineage", () => {

@@ -31,7 +31,7 @@
     "test": "bun test tests/*.test.ts",
     "audit": "bun audit",
     "check-version": "bun run scripts/check-version.ts",
-    "typecheck": "bunx tsc --noEmit",
+    "typecheck": "bun x tsc --noEmit",
     "licenses": "bun run scripts/generate-third-party-notices.ts --include-launcher",
     "clean": "bun run scripts/clean.ts",
     "build": "bun run scripts/build-runtime-bundle.ts",
@@ -40,6 +40,7 @@
     "smoke:cancel": "bun run scripts/smoke-codex-cancel.ts",
     "smoke:subagents": "bun run scripts/smoke-codex-subagents.ts --v1 && bun run scripts/smoke-codex-subagents.ts --v2",
     "smoke:subagents:live": "bun run scripts/smoke-codex-web-subagents.ts",
+    "smoke:stream:live": "bun run scripts/smoke-chatgpt-web-stream.ts",
     "launcher": "bun run scripts/start-launcher.ts",
     "app": "bun run scripts/start-launcher.ts",
     "app:package": "bun run --cwd launcher package",
@@ -73,8 +74,9 @@
   },
   "overrides": {
     "@hono/node-server": "2.0.12",
-    "fast-uri": "3.1.5",
+    "fast-uri": "3.1.6",
     "hono": "4.12.34",
+    "qs": "6.16.0",
     "zod-to-json-schema": "3.25.1"
   },
   "keywords": [

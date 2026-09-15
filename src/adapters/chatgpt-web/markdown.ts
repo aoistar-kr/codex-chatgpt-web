@@ -75,6 +75,270 @@ export function chatGptHtmlToMarkdown(html: string): string {
   return html.trim() ? preserveObsidianWikiLinks(turndown.turndown(html)).trim() : "";
 }
 
+export type ChatGptMarkdownEquivalence = "exact" | "known-safe" | "different";
+
+export type ChatGptMarkdownCharClass =
+  | "end"
+  | "linebreak"
+  | "space"
+  | "backslash"
+  | "underscore"
+  | "asterisk"
+  | "backtick"
+  | "pipe"
+  | "angle"
+  | "bracket"
+  | "paren"
+  | "hash"
+  | "hyphen"
+  | "plus"
+  | "digit"
+  | "letter"
+  | "punctuation"
+  | "other";
+
+export interface ChatGptMarkdownDifferenceShape {
+  firstDifferenceOffset: number;
+  commonSuffixChars: number;
+  wireCharClass: ChatGptMarkdownCharClass;
+  domCharClass: ChatGptMarkdownCharClass;
+  wireLines: number;
+  domLines: number;
+  wireBlankLines: number;
+  domBlankLines: number;
+  wireTrailingSpaceLines: number;
+  domTrailingSpaceLines: number;
+  wireFenceLines: number;
+  domFenceLines: number;
+  wirePipeChars: number;
+  domPipeChars: number;
+  wireListMarkerLines: number;
+  domListMarkerLines: number;
+  wireBlockquoteLines: number;
+  domBlockquoteLines: number;
+  wireBackslashes: number;
+  domBackslashes: number;
+}
+
+export interface ChatGptMarkdownComparison {
+  equivalence: ChatGptMarkdownEquivalence;
+  normalizations: Array<"line-endings" | "outer-blank-lines" | "intraword-underscore-escape">;
+  difference?: ChatGptMarkdownDifferenceShape;
+}
+
+function normalizeDocumentLineEndings(markdown: string): string {
+  return markdown.replace(/\r\n?/g, "\n");
+}
+
+function trimOuterBlankLines(markdown: string): string {
+  const leadingTrimmed = markdown.replace(/^\n+/g, "");
+  // A trailing blank line can belong to an unclosed code/HTML block. Until block containment is
+  // parsed, preserve literal-tail whitespace rather than treating every EOF newline as padding.
+  return /(?:`{3,}|~{3,})|<[a-z/!?]/i.test(leadingTrimmed)
+    ? leadingTrimmed
+    : leadingTrimmed.replace(/\n+$/g, "");
+}
+
+function unicodeAlphaNumeric(value: string | undefined): boolean {
+  return value !== undefined && /^[\p{L}\p{N}]$/u.test(value);
+}
+
+/**
+ * Turndown escapes literal intraword underscores even though CommonMark does not treat an
+ * underscore surrounded by letters/numbers as an emphasis delimiter. Remove only that one known
+ * redundant escape, and only in ordinary prose. Code spans/fences, indented code, and link
+ * destinations are deliberately left untouched so this helper can never be used as a broad
+ * "looks equivalent" escape hatch.
+ */
+function normalizeKnownSafeIntrawordUnderscoreEscapes(markdown: string): string {
+  const lines = markdown.split("\n");
+  // This is a prose normalizer, not a CommonMark block parser. Container fences and raw HTML
+  // can keep later, unmarked lines literal (CommonMark 0.31.2 sections 4.5/4.6/5.2). Without a
+  // proven block boundary, decline underscore normalization for the document rather than erase
+  // a significant backslash. Byte-identical documents still take the comparator's exact path.
+  const containerLiteral = lines.some(line => (
+    /^[ \t]*(?:>|[-+*][ \t]|\d+[.)][ \t])/.test(line) && /(?:`{3,}|~{3,})/.test(line)
+  ) || /^[ \t]*(?:[-+*]|\d+[.)])(?: {5,}|\t)/.test(line));
+  if (containerLiteral || /<[a-z/!?]/i.test(markdown)) return markdown;
+  let fence: { marker: "`" | "~"; length: number } | undefined;
+  let inlineCodeTicks = 0;
+
+  return lines.map(line => {
+    if (fence) {
+      const close = line.match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/);
+      if (close) {
+        const run = close[1]!;
+        const marker = run[0] as "`" | "~";
+        if (fence.marker === marker && run.length >= fence.length) fence = undefined;
+      }
+      return line;
+    }
+    const open = inlineCodeTicks === 0 ? line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/) : null;
+    if (open) {
+      const run = open[1]!;
+      fence = { marker: run[0] as "`" | "~", length: run.length };
+      return line;
+    }
+    // Be deliberately conservative around any syntax where an underscore escape can participate in
+    // parsing or a target value rather than plain prose. A future promotion gate must never turn a
+    // changed URL/reference/autolink/raw-HTML attribute into a false "known-safe" match.
+    const syntaxSensitive = /^ {4}/.test(line)
+      || /^[ \t]*\t/.test(line)
+      || /[\[\]<>]/.test(line)
+      || /(?:[a-z][a-z\d+.-]*:\/\/|www\.|\/\/)[^\s]*/i.test(line)
+      || /[^\s@]+@[^\s@]+/.test(line);
+
+    let output = "";
+    for (let index = 0; index < line.length; index += 1) {
+      const char = line[index]!;
+      // Outside code, consume escaped backticks and paired backslashes before tick detection.
+      // Inside code, backslashes are literal and must not hide a real closing delimiter.
+      if (inlineCodeTicks === 0 && char === "\\" && /[\\`]/.test(line[index + 1] ?? "")) {
+        output += line.slice(index, index + 2);
+        index += 1;
+        continue;
+      }
+      if (char === "`") {
+        let end = index + 1;
+        while (line[end] === "`") end += 1;
+        const runLength = end - index;
+        if (inlineCodeTicks === 0) inlineCodeTicks = runLength;
+        else if (runLength === inlineCodeTicks) inlineCodeTicks = 0;
+        output += line.slice(index, end);
+        index = end - 1;
+        continue;
+      }
+      if (
+        !syntaxSensitive
+        &&
+        inlineCodeTicks === 0
+        && char === "\\"
+        && line[index + 1] === "_"
+        && unicodeAlphaNumeric(line[index - 1])
+        && unicodeAlphaNumeric(line[index + 2])
+      ) {
+        output += "_";
+        index += 1;
+        continue;
+      }
+      output += char;
+    }
+    return output;
+  }).join("\n");
+}
+
+function markdownCharClass(value: string | undefined): ChatGptMarkdownCharClass {
+  if (value === undefined) return "end";
+  if (value === "\n") return "linebreak";
+  if (value === " " || value === "\t") return "space";
+  if (value === "\\") return "backslash";
+  if (value === "_") return "underscore";
+  if (value === "*") return "asterisk";
+  if (value === "`") return "backtick";
+  if (value === "|") return "pipe";
+  if (value === "<" || value === ">") return "angle";
+  if (value === "[" || value === "]") return "bracket";
+  if (value === "(" || value === ")") return "paren";
+  if (value === "#") return "hash";
+  if (value === "-") return "hyphen";
+  if (value === "+") return "plus";
+  if (/^[0-9]$/.test(value)) return "digit";
+  if (/^\p{L}$/u.test(value)) return "letter";
+  if (/^[\p{P}\p{S}]$/u.test(value)) return "punctuation";
+  return "other";
+}
+
+function countMatchingLines(markdown: string, predicate: (line: string) => boolean): number {
+  return markdown.split("\n").filter(predicate).length;
+}
+
+function markdownDifferenceShape(wire: string, dom: string): ChatGptMarkdownDifferenceShape {
+  const limit = Math.min(wire.length, dom.length);
+  let firstDifferenceOffset = 0;
+  while (firstDifferenceOffset < limit && wire[firstDifferenceOffset] === dom[firstDifferenceOffset]) {
+    firstDifferenceOffset += 1;
+  }
+
+  let commonSuffixChars = 0;
+  const maxSuffix = Math.min(
+    wire.length - firstDifferenceOffset,
+    dom.length - firstDifferenceOffset,
+  );
+  while (
+    commonSuffixChars < maxSuffix
+    && wire[wire.length - 1 - commonSuffixChars] === dom[dom.length - 1 - commonSuffixChars]
+  ) {
+    commonSuffixChars += 1;
+  }
+
+  const wireLines = wire.split("\n");
+  const domLines = dom.split("\n");
+  return {
+    firstDifferenceOffset,
+    commonSuffixChars,
+    wireCharClass: markdownCharClass(wire[firstDifferenceOffset]),
+    domCharClass: markdownCharClass(dom[firstDifferenceOffset]),
+    wireLines: wireLines.length,
+    domLines: domLines.length,
+    wireBlankLines: wireLines.filter(line => line.length === 0).length,
+    domBlankLines: domLines.filter(line => line.length === 0).length,
+    wireTrailingSpaceLines: wireLines.filter(line => /[ \t]+$/.test(line)).length,
+    domTrailingSpaceLines: domLines.filter(line => /[ \t]+$/.test(line)).length,
+    wireFenceLines: countMatchingLines(wire, line => /^ {0,3}(`{3,}|~{3,})/.test(line)),
+    domFenceLines: countMatchingLines(dom, line => /^ {0,3}(`{3,}|~{3,})/.test(line)),
+    wirePipeChars: [...wire].filter(char => char === "|").length,
+    domPipeChars: [...dom].filter(char => char === "|").length,
+    wireListMarkerLines: countMatchingLines(wire, line => /^\s*(?:[-+*]|\d+[.)])\s+/.test(line)),
+    domListMarkerLines: countMatchingLines(dom, line => /^\s*(?:[-+*]|\d+[.)])\s+/.test(line)),
+    wireBlockquoteLines: countMatchingLines(wire, line => /^\s*>\s?/.test(line)),
+    domBlockquoteLines: countMatchingLines(dom, line => /^\s*>\s?/.test(line)),
+    wireBackslashes: [...wire].filter(char => char === "\\").length,
+    domBackslashes: [...dom].filter(char => char === "\\").length,
+  };
+}
+
+/**
+ * Conservative content-free classifier for wire Markdown vs the existing DOM/Turndown result.
+ * "known-safe" means the only differences are document line endings/outer blank lines and/or
+ * redundant intraword underscore escapes in ordinary prose. Everything else remains "different".
+ */
+export function compareChatGptWireAndDomMarkdown(
+  wireMarkdown: string,
+  domMarkdown: string,
+): ChatGptMarkdownComparison {
+  if (wireMarkdown === domMarkdown) return { equivalence: "exact", normalizations: [] };
+
+  const normalizations: ChatGptMarkdownComparison["normalizations"] = [];
+  let wire = wireMarkdown;
+  let dom = domMarkdown;
+
+  const wireLineEndings = normalizeDocumentLineEndings(wire);
+  const domLineEndings = normalizeDocumentLineEndings(dom);
+  if (wireLineEndings !== wire || domLineEndings !== dom) normalizations.push("line-endings");
+  wire = wireLineEndings;
+  dom = domLineEndings;
+
+  const wireOuterTrimmed = trimOuterBlankLines(wire);
+  const domOuterTrimmed = trimOuterBlankLines(dom);
+  if (wireOuterTrimmed !== wire || domOuterTrimmed !== dom) normalizations.push("outer-blank-lines");
+  wire = wireOuterTrimmed;
+  dom = domOuterTrimmed;
+
+  const wireUnderscores = normalizeKnownSafeIntrawordUnderscoreEscapes(wire);
+  const domUnderscores = normalizeKnownSafeIntrawordUnderscoreEscapes(dom);
+  if (wireUnderscores !== wire || domUnderscores !== dom) {
+    normalizations.push("intraword-underscore-escape");
+  }
+  wire = wireUnderscores;
+  dom = domUnderscores;
+
+  return {
+    equivalence: wire === dom ? "known-safe" : "different",
+    normalizations,
+    ...(wire === dom ? {} : { difference: markdownDifferenceShape(wire, dom) }),
+  };
+}
+
 export interface ChatGptMarkdownSegment {
   key: string;
   tag?: string;
@@ -200,6 +464,15 @@ export class ChatGptMarkdownBuffer {
 
   currentSnapshotIsConsistent(): boolean {
     return this.consistencyError === undefined;
+  }
+
+  /**
+   * Non-mutating compatibility check for a freshly rebound DOM projection. Recovery uses this
+   * before it is allowed to resume the existing append-only ledger; no candidate/commit state is
+   * changed until every independent identity proof has passed.
+   */
+  observationIsConsistent(segments: ChatGptMarkdownSegment[]): boolean {
+    return !(this.reconcile(segments) instanceof ChatGptMarkdownConsistencyError);
   }
 
   private reconcile(

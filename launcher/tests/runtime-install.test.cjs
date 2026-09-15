@@ -7,7 +7,10 @@ const path = require("node:path");
 const { runtimeInvocation } = require("../electron/runtime-command.cjs");
 const {
   ensurePackagedRuntime,
+  preparePackagedRuntime,
+  preparePackagedRuntimeConcurrent,
   validateRuntimeBundle,
+  validateRuntimeBundleConcurrent,
   waitForPackagedRuntimeSource,
 } = require("../electron/runtime-install.cjs");
 
@@ -288,6 +291,190 @@ test("packaged runtime transactionally repairs an incomplete installed bundle", 
       [],
     );
   } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("packaged runtime preparation reuses the source inspection that satisfied materialization", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-runtime-prepare-once-"));
+  const resourcesPath = runtimeFixture(root);
+  const coreHome = path.join(root, "core-home");
+  const sourceCli = path.resolve(resourcesPath, "runtime", "app", "cli.js");
+  const app = { isPackaged: true, getVersion: () => "0.2.0" };
+  const originalReadFileSync = fs.readFileSync;
+  let sourceCliReads = 0;
+  fs.readFileSync = (target, ...args) => {
+    if (path.resolve(String(target)) === sourceCli) sourceCliReads += 1;
+    return originalReadFileSync(target, ...args);
+  };
+  try {
+    const installed = await preparePackagedRuntime({ app, coreHome, resourcesPath });
+    assert.equal(
+      installed,
+      path.join(coreHome, "versions", `0.2.0-${process.platform}-${process.arch}`),
+    );
+    assert.equal(sourceCliReads, 1);
+    assert.equal(fs.readFileSync(path.join(installed, "app", "cli.js"), "utf8"), "cli");
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("concurrent packaged runtime preparation preserves full source and durable validation", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-runtime-concurrent-"));
+  const resourcesPath = runtimeFixture(root);
+  const coreHome = path.join(root, "core-home");
+  const app = { isPackaged: true, getVersion: () => "0.2.0" };
+  try {
+    const installed = ensurePackagedRuntime({ app, coreHome, resourcesPath });
+    assert.equal(
+      await preparePackagedRuntimeConcurrent({ app, coreHome, resourcesPath }),
+      installed,
+    );
+    assert.equal(
+      validateRuntimeBundle(installed, {
+        version: "0.2.0",
+        platform: process.platform,
+        arch: process.arch,
+      }),
+      installed,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("healthy durable runtime validates only the source browser helper until repair is required", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-runtime-lazy-source-"));
+  const resourcesPath = runtimeFixture(root);
+  const coreHome = path.join(root, "core-home");
+  const app = { isPackaged: true, getVersion: () => "0.2.0" };
+  try {
+    const installed = ensurePackagedRuntime({ app, coreHome, resourcesPath });
+    const sourceCli = path.join(resourcesPath, "runtime", "app", "cli.js");
+    fs.writeFileSync(sourceCli, "bad");
+
+    assert.equal(
+      await preparePackagedRuntimeConcurrent({ app, coreHome, resourcesPath }),
+      installed,
+    );
+    assert.equal(fs.readFileSync(path.join(installed, "app", "cli.js"), "utf8"), "cli");
+
+    const sourceBrowserHelper = path.join(resourcesPath, "runtime", "app", "browser-helper.cjs");
+    fs.writeFileSync(sourceBrowserHelper, "bad-helper");
+    await assert.rejects(
+      preparePackagedRuntimeConcurrent({ app, coreHome, resourcesPath }),
+      /browser-helper\.cjs.*(?:size|checksum) mismatch|(?:size|checksum) mismatch.*browser-helper\.cjs/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("concurrent runtime validation preserves checksum and unmanifested-file rejection", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-runtime-concurrent-validate-"));
+  const resourcesPath = runtimeFixture(root);
+  const runtimeRoot = path.join(resourcesPath, "runtime");
+  const identity = { version: "0.2.0", platform: process.platform, arch: process.arch };
+  const cliPath = path.join(runtimeRoot, "app", "cli.js");
+  try {
+    assert.equal(await validateRuntimeBundleConcurrent(runtimeRoot, identity), runtimeRoot);
+
+    fs.writeFileSync(cliPath, "bad");
+    await assert.rejects(
+      validateRuntimeBundleConcurrent(runtimeRoot, identity),
+      /checksum mismatch/,
+    );
+
+    fs.writeFileSync(cliPath, "cli");
+    fs.writeFileSync(path.join(runtimeRoot, "unexpected.txt"), "unexpected");
+    await assert.rejects(
+      validateRuntimeBundleConcurrent(runtimeRoot, identity),
+      /unmanifested file/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("concurrent packaged runtime preparation repairs a corrupt durable copy transactionally", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-runtime-concurrent-repair-"));
+  const resourcesPath = runtimeFixture(root);
+  const coreHome = path.join(root, "core-home");
+  const app = { isPackaged: true, getVersion: () => "0.2.0" };
+  try {
+    const installed = ensurePackagedRuntime({ app, coreHome, resourcesPath });
+    fs.writeFileSync(path.join(installed, "app", "cli.js"), "same-size-bad");
+    assert.equal(
+      await preparePackagedRuntimeConcurrent({ app, coreHome, resourcesPath }),
+      installed,
+    );
+    assert.equal(fs.readFileSync(path.join(installed, "app", "cli.js"), "utf8"), "cli");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("concurrent packaged runtime preparation fails closed on source corruption", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-runtime-concurrent-source-corrupt-"));
+  const resourcesPath = runtimeFixture(root);
+  const coreHome = path.join(root, "core-home");
+  const app = { isPackaged: true, getVersion: () => "0.2.0" };
+  fs.writeFileSync(path.join(resourcesPath, "runtime", "app", "cli.js"), "bad");
+  try {
+    await assert.rejects(
+      preparePackagedRuntimeConcurrent({
+        app,
+        coreHome,
+        resourcesPath,
+        timeoutMs: 20,
+        intervalMs: 5,
+      }),
+      /checksum mismatch/,
+    );
+    assert.equal(fs.existsSync(coreHome), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("validated runtime replacement tolerates a locked previous bundle without re-cleaning it on startup", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-runtime-locked-previous-"));
+  const resourcesPath = runtimeFixture(root, "0.2.0");
+  const coreHome = path.join(root, "core-home");
+  const app = { isPackaged: true, getVersion: () => "0.2.0" };
+  const originalRmSync = fs.rmSync;
+  try {
+    const installed = ensurePackagedRuntime({ app, coreHome, resourcesPath });
+    const source = path.join(resourcesPath, "runtime");
+    fs.writeFileSync(path.join(source, "app", "cli.js"), "new cli");
+    writeRuntimeManifest(source);
+
+    fs.rmSync = (target, options) => {
+      if (String(target).includes(".previous-")) {
+        const error = new Error("locked previous runtime");
+        error.code = "EPERM";
+        throw error;
+      }
+      return originalRmSync(target, options);
+    };
+
+    assert.equal(ensurePackagedRuntime({ app, coreHome, resourcesPath }), installed);
+    assert.equal(fs.readFileSync(path.join(installed, "app", "cli.js"), "utf8"), "new cli");
+    assert.equal(
+      fs.readdirSync(path.dirname(installed)).filter(name => name.includes(".previous-")).length,
+      1,
+    );
+
+    fs.rmSync = originalRmSync;
+    assert.equal(ensurePackagedRuntime({ app, coreHome, resourcesPath }), installed);
+    assert.equal(
+      fs.readdirSync(path.dirname(installed)).filter(name => name.includes(".previous-")).length,
+      1,
+    );
+  } finally {
+    fs.rmSync = originalRmSync;
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

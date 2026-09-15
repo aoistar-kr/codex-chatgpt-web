@@ -1,7 +1,31 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+
+test("completed diagnostic or enabled recovery uses an independent same-lease request observer before send", () => {
+  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const setup = source.slice(source.indexOf("await enableNetworkStreamTap();"), source.indexOf("const sendStartedAt = Date.now();"));
+  expect(setup).toContain("chatGptCompletedRebindDiagnosticsEnabled() || turnPlan.incompleteCaptureRecovery");
+  expect(setup).toContain("connectLauncherBrowserHost(this.config.browserHostDescriptorPath!, 5_000, launcherSurfaceId, signal)");
+  expect(setup).toContain("requestObservationConnection = connection.browser");
+  expect(setup).not.toMatch(/notifyLauncherTurn|newPage\(|\.goto\(/);
+  const rebind = source.slice(source.indexOf("const rebindLauncherPage ="), source.indexOf("const rebindLauncherPage =") + 4_000);
+  expect(rebind).not.toContain("requestObservationConnection");
+  expect(source).toContain("if (requestObservationConnection) await requestObservationConnection.close().catch(() => {})");
+});
+
+test("completed diagnostic can pass only through the persisted-detail or strict Temporary equivalent gate", () => {
+  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const start = source.indexOf("const persistedDetailStrict =");
+  const end = source.indexOf("});", source.indexOf("metric.passed =", start));
+  const acceptance = source.slice(start, end);
+  expect(start).toBeGreaterThan(0);
+  expect(acceptance).toContain("metric.evidenceEvaluated && metric.evidenceMatched && metric.evidenceReasons.length === 0");
+  expect(acceptance).toContain("&& metric.serverConversationProofExact");
+  expect(acceptance).toContain("metric.passed = persistedDetailStrict || (metric.equivalentEvidenceEvaluated");
+  expect(acceptance).toContain("&& metric.equivalentEvidenceMatched && metric.equivalentEvidenceReasons.length === 0");
+});
 import type { Page } from "playwright-core";
-import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptConnectorAttachmentMode, chatGptEffortSelectionRequired, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCaptureEnabled, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptConnectorAttachmentMode, chatGptEffortSelectionRequired, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptRecoverableIncompleteCaptureFailure, chatGptSameDocumentTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { ensureChatGptPersonalizedConnectorAccess } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -35,11 +59,11 @@ test("browser turn orchestration retains owned prompt insertion and semantic sub
     workerSource.indexOf("  private async sendAttachedPrompt("),
     workerSource.indexOf("  private async waitForMultipartAcknowledgement("),
   );
-  const sendSettled = sendAttachedPrompt.indexOf("await settleChatGptUi()");
-  const sendDeadline = sendAttachedPrompt.indexOf("CHATGPT_SEND_ENABLE_GRACE_MS", sendSettled);
+  const sendDeadline = sendAttachedPrompt.indexOf("CHATGPT_SEND_ENABLE_GRACE_MS");
   const sessionChecked = sendAttachedPrompt.indexOf("await throwIfChatGptSessionFailureAlert(page)", sendDeadline);
   const rateLimitChecked = sendAttachedPrompt.indexOf("await throwIfChatGptRateLimitDialog(page)", sessionChecked);
   const enabledChecked = sendAttachedPrompt.indexOf("if (await sendButton.isEnabled()) break;", rateLimitChecked);
+  const sendSettled = sendAttachedPrompt.indexOf("await settleChatGptUi()", enabledChecked);
   const sendReady = sendAttachedPrompt.indexOf('await captureDiagnostic?.("send-ready")');
   const sendActivated = sendAttachedPrompt.indexOf("submissionLifecycle?.onSendActivated?.()");
   const sendPressed = sendAttachedPrompt.indexOf('await sendButton.press("Enter", {');
@@ -49,12 +73,13 @@ test("browser turn orchestration retains owned prompt insertion and semantic sub
   expect(sendAttachedPrompt).toContain("noWaitAfter: true");
   expect(sendAttachedPrompt).toContain("signal: abortSignal");
   expect(sendAttachedPrompt).toContain("timeout: browserStageTimeouts.send");
-  expect(sendSettled).toBeGreaterThan(-1);
-  expect(sendDeadline).toBeGreaterThan(sendSettled);
+  expect(sendDeadline).toBeGreaterThan(-1);
   expect(sessionChecked).toBeGreaterThan(sendDeadline);
   expect(rateLimitChecked).toBeGreaterThan(sessionChecked);
   expect(enabledChecked).toBeGreaterThan(rateLimitChecked);
+  expect(sendSettled).toBeGreaterThan(enabledChecked);
   expect(sendReady).toBeGreaterThan(enabledChecked);
+  expect(sendSettled).toBeLessThan(sendReady);
   expect(sendActivated).toBeGreaterThan(sendReady);
   expect(sendAttachedPrompt).toContain("send button remained disabled after the complete prompt was attached");
   expect(sendAttachedPrompt).not.toContain("send button is disabled after the complete prompt was attached");
@@ -70,7 +95,7 @@ test("browser turn orchestration retains owned prompt insertion and semantic sub
   expect(runBrowserTurn).toContain('"final_part_effort_selection"');
   const promptAttached = runBrowserTurn.indexOf('await diagnostics.capture(page, "prompt-attachment-complete")');
   const finalEffortSelected = runBrowserTurn.indexOf('"final_part_effort_selection"');
-  const finalSend = runBrowserTurn.indexOf("const finalSubmissionEvidence");
+  const finalSend = runBrowserTurn.indexOf("let finalSubmissionEvidence");
   expect(promptAttached).toBeGreaterThan(-1);
   expect(finalEffortSelected).toBeGreaterThan(-1);
   expect(promptAttached).toBeGreaterThan(finalEffortSelected);
@@ -80,6 +105,71 @@ test("browser turn orchestration retains owned prompt insertion and semantic sub
   );
   expect(runBrowserTurn).not.toContain("userTurns.nth(initialUserTurnCount).waitFor");
   expect(workerSource).not.toMatch(/\bclipboard\b|pbcopy|pbpaste/i);
+});
+
+test("request-injection nonce uses bounded fill proof while ordinary prompts keep plain-text insertion", () => {
+  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const attachStart = source.indexOf("  private async attachPrompt(");
+  const sendStart = source.indexOf("  private async sendAttachedPrompt(", attachStart);
+  const attach = source.slice(attachStart, sendStart);
+
+  const placeholderBranch = attach.indexOf("if (isChatGptRequestInjectionPlaceholder(prompt))");
+  const ordinaryInsert = attach.indexOf("this.insertPromptText(page, prompt", placeholderBranch);
+  expect(placeholderBranch).toBeGreaterThan(-1);
+  expect(ordinaryInsert).toBeGreaterThan(placeholderBranch);
+  const fastPath = attach.slice(placeholderBranch, ordinaryInsert);
+  expect(fastPath).toContain("await composer.fill(prompt");
+  expect(fastPath).toContain('recordTiming("placeholder_readback_1")');
+  expect(fastPath).toContain("await withBrowserTurnAbort(settleChatGptUi(), abortSignal)");
+  expect(fastPath).toContain('recordTiming("placeholder_readback_2")');
+  expect(fastPath).toContain("await this.assertPromptAttached(page, prompt, abortSignal, composer)");
+  expect(fastPath).not.toContain("insertPlainTextIntoComposer");
+});
+
+test("submission and capture dispositions wrap the existing evidence boundaries without moving them", () => {
+  const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const trackedLifecycle = workerSource.indexOf("const trackedSubmissionLifecycle");
+  const dispositionActivated = workerSource.indexOf("submissionDisposition.sendActivated()", trackedLifecycle);
+  const callerActivated = workerSource.indexOf("turn.onSendActivated?.()", dispositionActivated);
+  const dispositionSubmitted = workerSource.indexOf("submissionDisposition.submitted()", callerActivated);
+  const recoveryCommitted = workerSource.indexOf("recoveryIdentity.commitSubmission()", dispositionSubmitted);
+  const callerSubmitted = workerSource.indexOf("turn.onSubmitted?.()", recoveryCommitted);
+  const fallbackProof = workerSource.indexOf("await this.assertRequestInjectionFallbackSafe(", callerSubmitted);
+  const rollback = workerSource.indexOf("submissionDisposition.proveRollback()", fallbackProof);
+  const recoveryReset = workerSource.indexOf("recoveryIdentity.resetAfterProvenRollback()", rollback);
+  const captureBegin = workerSource.indexOf("captureDisposition.beginAfterCommit(", recoveryReset);
+  const responseWait = workerSource.indexOf("const responseTurnPromise = this.waitForNewAssistantTurn(", captureBegin);
+  const incomplete = workerSource.indexOf("captureDisposition.failAfterCommit(", responseWait);
+  const recoveryFreeze = workerSource.indexOf("recoveryIdentity.freezeCommittedProof()", incomplete);
+  const recoveryDiagnostic = workerSource.indexOf('mode: "recovery-identity"', recoveryFreeze);
+
+  expect(trackedLifecycle).toBeGreaterThan(-1);
+  expect(dispositionActivated).toBeGreaterThan(trackedLifecycle);
+  expect(callerActivated).toBeGreaterThan(dispositionActivated);
+  expect(dispositionSubmitted).toBeGreaterThan(callerActivated);
+  expect(recoveryCommitted).toBeGreaterThan(dispositionSubmitted);
+  expect(callerSubmitted).toBeGreaterThan(recoveryCommitted);
+  expect(fallbackProof).toBeGreaterThan(callerSubmitted);
+  expect(rollback).toBeGreaterThan(fallbackProof);
+  expect(recoveryReset).toBeGreaterThan(rollback);
+  expect(captureBegin).toBeGreaterThan(recoveryReset);
+  expect(responseWait).toBeGreaterThan(captureBegin);
+  expect(incomplete).toBeGreaterThan(responseWait);
+  expect(recoveryFreeze).toBeGreaterThan(incomplete);
+  expect(recoveryDiagnostic).toBeGreaterThan(recoveryFreeze);
+  expect(workerSource.slice(incomplete, recoveryFreeze)).not.toContain("await ");
+  const afterIncomplete = workerSource.slice(incomplete, recoveryDiagnostic);
+  expect(afterIncomplete).not.toContain("this.sendAttachedPrompt(");
+  expect(afterIncomplete).not.toContain("this.attachPromptWithCompactionRetry(");
+});
+
+test("browser worker delegates network stream eligibility to the pure turn plan", () => {
+  const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  expect(workerSource).toContain("const turnPlan = resolveChatGptTurnPlan({");
+  expect(workerSource).toContain("networkStreamPrimary: chatGptNetworkStreamPrimaryEnabled(),");
+  expect(workerSource).toContain("networkStreamShadow: chatGptNetworkStreamShadowEnabled(),");
+  expect(workerSource).toContain('const networkStreamPrimary = turnPlan.networkStream === "primary";');
+  expect(workerSource).toContain('if (turnPlan.networkStream === "off") return;');
 });
 
 test("conversation turn identity survives ChatGPT DOM virtualization", () => {
@@ -115,6 +205,63 @@ test("assistant tracking rebinds only one proven replacement after React detache
   )).toThrow("2 new conversation turns");
 });
 
+test("same-document recovery proof rejects document replacement, extra users, and ambiguous assistants", () => {
+  const expectedDocument = "document-1";
+  const acceptedUsers = ["conversation-turn-user-1"];
+  const initialResponses = ["conversation-turn-assistant-old"];
+  const boundAssistant = "conversation-turn-assistant-1";
+
+  expect(chatGptSameDocumentTurnIdentity(
+    expectedDocument,
+    expectedDocument,
+    acceptedUsers,
+    acceptedUsers,
+    initialResponses,
+    boundAssistant,
+    [...initialResponses, boundAssistant],
+  )).toBe(boundAssistant);
+
+  expect(() => chatGptSameDocumentTurnIdentity(
+    expectedDocument,
+    "document-2",
+    acceptedUsers,
+    acceptedUsers,
+    initialResponses,
+    boundAssistant,
+    [...initialResponses, boundAssistant],
+  )).toThrow("no longer exposes the committed response document");
+
+  expect(() => chatGptSameDocumentTurnIdentity(
+    expectedDocument,
+    expectedDocument,
+    acceptedUsers,
+    [...acceptedUsers, "conversation-turn-user-2"],
+    initialResponses,
+    boundAssistant,
+    [...initialResponses, boundAssistant],
+  )).toThrow("opened another user turn");
+
+  expect(() => chatGptSameDocumentTurnIdentity(
+    expectedDocument,
+    expectedDocument,
+    acceptedUsers,
+    acceptedUsers,
+    initialResponses,
+    boundAssistant,
+    [...initialResponses, "conversation-turn-assistant-rebound-1", "conversation-turn-assistant-rebound-2"],
+  )).toThrow("2 new conversation turns");
+
+  expect(() => chatGptSameDocumentTurnIdentity(
+    expectedDocument,
+    expectedDocument,
+    acceptedUsers,
+    acceptedUsers,
+    initialResponses,
+    boundAssistant,
+    [...initialResponses, boundAssistant, "conversation-turn-assistant-extra"],
+  )).toThrow("2 new conversation turns");
+});
+
 test("a retained MCP conversation reuses its proven connector binding", () => {
   expect(chatGptConnectorAttachmentMode(true, false)).toBe("mention");
   expect(chatGptConnectorAttachmentMode(true, true)).toBe("retained");
@@ -125,6 +272,33 @@ test("a retained conversation preserves its proven effort unless multipart stagi
   expect(chatGptEffortSelectionRequired(false, "medium", "medium")).toBeTrue();
   expect(chatGptEffortSelectionRequired(true, "medium", "medium")).toBeFalse();
   expect(chatGptEffortSelectionRequired(true, "medium", "light")).toBeTrue();
+});
+
+test("a hot-surface mode proof skips only the matching initial effort selection", () => {
+  const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const runExclusive = workerSource.slice(
+    workerSource.indexOf("  private async runExclusive("),
+    workerSource.indexOf("  private async runBrowserTurn("),
+  );
+  const runBrowserTurn = workerSource.slice(workerSource.indexOf("  private async runBrowserTurn("));
+  const helper = readFileSync(new URL("../src/adapters/chatgpt-web/browser-helper-main.ts", import.meta.url), "utf8");
+  const launcherHelper = readFileSync(new URL("../launcher/electron/browser-helper-verifier.cjs", import.meta.url), "utf8");
+
+  expect(runExclusive).toContain("modelId: turn.modelId");
+  expect(runExclusive).toContain("reasoning: turn.reasoning");
+  expect(runExclusive).toContain("lease.effortPrepared === true");
+  expect(runBrowserTurn).toContain(
+    "prewarmedMode,",
+  );
+  expect(runBrowserTurn).toContain(
+    "if (turnPlan.initialEffortSelectionRequired && !directHighMode)",
+  );
+  expect(runBrowserTurn).toContain('mode: { model: "gpt-5-6-thinking", thinkingEffort: "extended" }');
+  expect(runBrowserTurn).toContain("connector: { pluginId: connectorPluginId!, appName: this.config.appName }");
+  expect(helper).toContain('type: "prewarm"');
+  expect(helper).toContain('message.type === "prewarm"');
+  expect(helper).toContain("worker.prewarmMode(");
+  expect(launcherHelper).toContain('["verify", "inspect", "smoke", "prewarm"]');
 });
 
 test("browser turns run concurrently up to the five-tab limit", async () => {
@@ -443,6 +617,8 @@ test("a stalled post-submit DOM probe is bounded before same-page launcher recov
   const runBrowserTurn = workerSource.slice(workerSource.indexOf("  private async runBrowserTurn("));
   const submissionAccepted = runBrowserTurn.indexOf("submission accepted evidence=");
   const recovery = runBrowserTurn.indexOf("await rebindLauncherPage(", submissionAccepted);
+  const freshDocument = runBrowserTurn.indexOf("this.submissionDomState(page, {}", recovery);
+  const documentProof = runBrowserTurn.indexOf("chatGptSameDocumentTurnIdentity(", freshDocument);
   const duplicateSend = runBrowserTurn.indexOf("sendAttachedPrompt(", recovery);
 
   const rebindDefinition = runBrowserTurn.indexOf("const rebindLauncherPage");
@@ -472,6 +648,8 @@ test("a stalled post-submit DOM probe is bounded before same-page launcher recov
   );
 
   expect(recovery).toBeGreaterThan(submissionAccepted);
+  expect(freshDocument).toBeGreaterThan(recovery);
+  expect(documentProof).toBeGreaterThan(freshDocument);
   expect(duplicateSend).toBe(-1);
   expect(rebindDefinition).toBeGreaterThan(-1);
   expect(previousConnection).toBeGreaterThan(rebindDefinition);
@@ -487,6 +665,82 @@ test("a stalled post-submit DOM probe is bounded before same-page launcher recov
     "if (!launcherSurfaceId || !this.config.browserHostDescriptorPath) throw cause",
   );
   expect(runBrowserTurn.slice(recovery)).toContain("responseTurn.identity");
+});
+
+test("H5 incomplete-capture recovery is wired through policy and never replays the committed prompt", () => {
+  const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  expect(workerSource).toContain("incompleteCaptureRecovery: chatGptIncompleteCaptureRecoveryEnabled()");
+  const branchStart = workerSource.indexOf("const attemptIncompleteCaptureRecovery = async");
+  const branchEnd = workerSource.indexOf("for (;;) {", branchStart);
+  const branch = workerSource.slice(branchStart, branchEnd);
+  expect(branchStart).toBeGreaterThan(-1);
+  expect(branch).toContain("turnPlan.incompleteCaptureRecovery");
+  expect(branch).toContain("evaluateChatGptRecoveryResumeEvidence");
+  expect(branch).toContain("captureDisposition.resumeAfterExactRecovery");
+  expect(branch).toContain("promptReplayAuthorized");
+  expect(branch).not.toContain("sendAttachedPrompt(");
+  expect(branch).not.toContain("attachPromptWithCompactionRetry(");
+});
+
+test("H5 recovery admission accepts only observation transport failures", () => {
+  expect(chatGptRecoverableIncompleteCaptureFailure(new ChatGptBrowserObservationTimeoutError(5))).toBeTrue();
+  expect(chatGptRecoverableIncompleteCaptureFailure(
+    new Error(`ChatGPT browser DOM remained unresponsive after ${MAX_CHATGPT_BROWSER_PAGE_REBINDS} same-page rebinds`),
+  )).toBeTrue();
+  expect(chatGptRecoverableIncompleteCaptureFailure(new Error("page.evaluate: Target page, context or browser has been closed"))).toBeTrue();
+  expect(chatGptRecoverableIncompleteCaptureFailure(new Error("ChatGPT completed without producing a final answer"))).toBeFalse();
+  expect(chatGptRecoverableIncompleteCaptureFailure(new TypeError("worker defect"))).toBeFalse();
+  expect(chatGptRecoverableIncompleteCaptureFailure(new DOMException("cancel", "AbortError"))).toBeFalse();
+  expect(chatGptRecoverableIncompleteCaptureFailure(chatGptStoppedThinkingError())).toBeFalse();
+});
+
+test("H5 live fault injection can only disconnect the observation transport after commit", () => {
+  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const injection = source.slice(
+    source.indexOf('process.env.CODEX_CHATGPT_WEB_INCOMPLETE_CAPTURE_RECOVERY_CANARY === "1"'),
+    source.indexOf("const domError = domHealthTracker.update", source.indexOf('process.env.CODEX_CHATGPT_WEB_INCOMPLETE_CAPTURE_RECOVERY_CANARY === "1"')),
+  );
+  expect(injection).toContain("requestObservation && generationTurnIdContinuityStarted");
+  expect(injection).toContain("wireCapture?.snapshot().assistantMessageId");
+  expect(injection).toContain("await staleConnection.close()");
+  expect(injection).toContain("throw new ChatGptIncompleteCaptureCanaryError()");
+  expect(injection).not.toContain("sendAttachedPrompt(");
+  expect(injection).not.toContain("attachPromptWithCompactionRetry(");
+});
+
+test("H5 recovery branch freezes committed provenance before its reconnect and resumes only after its pure gate", () => {
+  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const start = source.indexOf("const attemptIncompleteCaptureRecovery = async");
+  const end = source.indexOf("for (;;) {", start);
+  const branch = source.slice(start, end);
+  const fail = branch.indexOf("captureDisposition.failAfterCommit(");
+  const freeze = branch.indexOf("recoveryIdentity.freezeCommittedProof()", fail);
+  const rebind = branch.indexOf("rebindLauncherPage(1", freeze);
+  const evaluate = branch.indexOf("evaluateChatGptRecoveryResumeEvidence", rebind);
+  const resume = branch.indexOf("captureDisposition.resumeAfterExactRecovery", evaluate);
+  expect(fail).toBeGreaterThan(-1);
+  expect(freeze).toBeGreaterThan(fail);
+  expect(rebind).toBeGreaterThan(freeze);
+  expect(evaluate).toBeGreaterThan(rebind);
+  expect(resume).toBeGreaterThan(evaluate);
+  expect(branch.slice(fail, resume)).not.toContain("onTextDelta(");
+  expect(branch.slice(fail, resume)).not.toContain("sendAttachedPrompt(");
+});
+
+test("H5 recovery proof discovery diagnostic records attribute names and counts but never attribute values", () => {
+  const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const helperStart = workerSource.indexOf("  private async recoveryProofDomShape(");
+  const helperEnd = workerSource.indexOf("  private async assertRequestInjectionFallbackSafe(", helperStart);
+  const helper = workerSource.slice(helperStart, helperEnd);
+  expect(helperStart).toBeGreaterThan(-1);
+  expect(helper).toContain("attribute.name");
+  expect(helper).not.toContain("attribute.value");
+  expect(helper).toContain('idShape("data-message-id")');
+  expect(helper).toContain('idShape("data-turn-id")');
+  expect(helper).toContain("messageIdEqualsTurnId");
+  expect(helper).not.toContain("values: messageIds.values");
+  expect(helper).not.toContain("values: turnIds.values");
+  expect(workerSource).toContain('mode: "recovery-proof-shape"');
 });
 
 test("a failed stale-browser disconnect prevents the replacement connection", async () => {
@@ -525,11 +779,9 @@ test("closing the launcher page is an immediate terminal turn error", async () =
 });
 
 test("active composer resolution waits for exactly one visible editor", async () => {
-  const composer = { id: "active" };
   const counts = [2, 1];
   const visibleComposers = {
     count: async () => counts.shift() ?? 1,
-    first: () => composer,
   };
   const page = {
     locator: () => ({
@@ -543,7 +795,7 @@ test("active composer resolution waits for exactly one visible editor", async ()
     activeComposer(page: unknown, timeoutMs?: number): Promise<unknown>;
   }).activeComposer;
 
-  expect(await activeComposer.call({}, page, 500)).toBe(composer);
+  expect(await activeComposer.call({}, page, 500)).toBe(visibleComposers);
 });
 
 test("prompt verification accepts Lexical NBSP preservation without weakening other mismatches", async () => {
@@ -589,7 +841,7 @@ test("prompt verification accepts Lexical NBSP preservation without weakening ot
   ).resolves.toBeUndefined();
 });
 
-test("large Markdown-rich context uses one plain-text editing command before exact verification", async () => {
+test("large Markdown-rich context uses one plain-text editing command with same-renderer exact verification", async () => {
   const prompt = [
     "Act as the model backend for the Codex task encoded below.",
     "```ts",
@@ -606,7 +858,7 @@ test("large Markdown-rich context uses one plain-text editing command before exa
       calls.push(["evaluate", value]);
       calls.push(["evaluateOptions", options]);
       expect(typeof fn).toBe("function");
-      return true;
+      return { inserted: true, observed: prompt };
     },
   };
   const attachPrompt = (ChatGptBrowserWorker.prototype as unknown as {
@@ -616,12 +868,18 @@ test("large Markdown-rich context uses one plain-text editing command before exa
     insertPromptText(page: unknown, text: string): Promise<void>;
   }).insertPromptText;
 
+  let activeComposerCalls = 0;
   await attachPrompt.call({
-    activeComposer: async () => composer,
+    activeComposer: async () => {
+      activeComposerCalls += 1;
+      return composer;
+    },
     insertPromptText,
+    promptTextEquivalent: (expected: string, observed: string) => expected === observed,
     assertPromptAttached: async (_page: unknown, value: string) => { asserted = value; },
   }, {}, prompt, false);
 
+  expect(activeComposerCalls).toBe(1);
   expect(calls[0]).toEqual(["fill", ""]);
   expect(calls.filter(call => call[0] === "evaluate")).toEqual([["evaluate", prompt]]);
   expect(calls.filter(call => call[0] === "evaluateOptions")).toEqual([
@@ -629,7 +887,30 @@ test("large Markdown-rich context uses one plain-text editing command before exa
   ]);
   const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
   expect(workerSource).toContain('document.execCommand("insertText", false, value)');
-  expect(asserted).toBe(prompt);
+  expect(asserted).toBe("");
+});
+
+test("same-renderer prompt readback falls back to the existing strict assertion on any mismatch", async () => {
+  const prompt = "exact prompt body";
+  const composer = {
+    fill: async () => {},
+    focus: async () => {},
+  };
+  const attachPrompt = (ChatGptBrowserWorker.prototype as unknown as {
+    attachPrompt(page: unknown, prompt: string, localTools: boolean): Promise<void>;
+  }).attachPrompt;
+  const fallbackCalls: Array<{ prompt: string; composer: unknown }> = [];
+
+  await attachPrompt.call({
+    activeComposer: async () => composer,
+    insertPromptText: async () => "exact prompt bodx",
+    promptTextEquivalent: (expected: string, observed: string) => expected === observed,
+    assertPromptAttached: async (_page: unknown, value: string, _signal: AbortSignal | undefined, resolved: unknown) => {
+      fallbackCalls.push({ prompt: value, composer: resolved });
+    },
+  }, {}, prompt, false);
+
+  expect(fallbackCalls).toEqual([{ prompt, composer }]);
 });
 
 test("plain-text editing command fails closed when the focused composer rejects it", async () => {
@@ -637,7 +918,6 @@ test("plain-text editing command fails closed when the focused composer rejects 
     insertPromptText(page: unknown, text: string, abortSignal?: AbortSignal): Promise<void>;
   }).insertPromptText;
   const composer = {
-    focus: async () => {},
     evaluate: async () => false,
   };
 
@@ -977,7 +1257,7 @@ test("connector verification preserves the host-refreshed catalog evidence", asy
     connectorMentionFailure(menuRows: unknown, triggerAttempts: number): Promise<string>;
     connectorMentionRowTitles(menuRows: unknown): Promise<string[]>;
     selectConnector(page: unknown, capture?: unknown, refresh?: boolean): Promise<unknown>;
-    verifyConnectorExclusive(): Promise<string>;
+    verifyConnectorExclusive(): Promise<{ appName: string; pluginId: string }>;
   };
   let prepared = 0;
   const fixture = {
@@ -1121,7 +1401,7 @@ test("tool-capable prompts use the shared Playwright connector selection before 
     locator: () => ({ filter: () => selectedConnector }),
     evaluate: async (_fn: unknown, value: string) => {
       calls.push(["plainText", value]);
-      return true;
+      return { inserted: true, observed: null };
     },
   };
   const initialComposer = {
@@ -1191,7 +1471,6 @@ test("tool-capable prompts use the shared Playwright connector selection before 
     ["selectedConnector"],
     ["selectedFocus"],
     ["press", CHATGPT_COMPOSER_DOCUMENT_END_KEY],
-    ["selectedFocus"],
     ["plainText", " context"],
     ["assertPrompt"],
   ]);
@@ -1441,7 +1720,11 @@ test("retained tool turns insert into the connector-bound composer without selec
   await attachPrompt.call({
     activeComposer: async () => composer,
     selectConnector: async () => { throw new Error("retained connector must not be selected again"); },
-    insertPromptText: async (_page: unknown, text: string) => { expect(text).toBe("retained context"); calls.push("insert"); },
+    insertPromptText: async (_page: unknown, text: string) => {
+      expect(text).toBe("retained context");
+      calls.push("insert");
+      return null;
+    },
     assertPromptAttached: async () => { calls.push("assert"); },
   }, {}, "retained context", true, undefined, undefined, false, undefined, true);
   expect(calls).toEqual(["fill", "focus", "insert", "assert"]);
@@ -1723,6 +2006,7 @@ function dialogPage(text: string, buttonText = "Got it"): { page: Page; pressed:
     page: {
       locator: () => createDialog(),
       getByText: (hasText: string | RegExp) => createDialog().filter({ hasText }),
+      getByTestId: () => ({ last() { return this; }, isVisible: async () => false }),
     } as unknown as Page,
     pressed,
   };
@@ -1804,6 +2088,18 @@ test("the known terminal ChatGPT error alert returns a structured retryable fail
     retryable: true,
   });
   expect(fixture.pressed).toEqual([]);
+});
+
+test("the bound ChatGPT regenerate error control is a retryable terminal response error", async () => {
+  const invisibleText = { last() { return this; }, isVisible: async () => false };
+  const regenerate = { last() { return this; }, isVisible: async () => true };
+  const scope = {
+    getByText: () => invisibleText,
+    getByTestId: (id: string) => id === "regenerate-thread-error-button" ? regenerate : invisibleText,
+  };
+  await expect(throwIfChatGptTerminalErrorAlert(scope as never)).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError", status: 502, code: "upstream_server_error", retryable: true,
+  });
 });
 
 test("a failed subscription fetch is retryable and does not falsely invalidate ChatGPT login", async () => {
@@ -2011,13 +2307,14 @@ test("a proven current-turn MCP call accepts only the final browser submission",
     runBrowserTurn.indexOf("const responseTurn = await this.waitForNewAssistantTurn("),
   );
   const finalSend = runBrowserTurn.slice(
-    runBrowserTurn.indexOf("const finalSubmissionEvidence"),
+    runBrowserTurn.indexOf("let finalSubmissionEvidence"),
     runBrowserTurn.indexOf("console.info(`[chatgpt-web] browser turn ${turn.traceId} submission accepted"),
   );
   expect(stagingSend).not.toContain("turn.externalProgress");
   expect(finalSend).toContain("turn.externalProgress");
   expect(stagingSend).not.toMatch(/turn,\s*\n\s*\)/);
-  expect(finalSend).toMatch(/turn,\s*\n\s*completionTracker,\s*\n\s*\)/);
+  expect(finalSend).toMatch(/trackedSubmissionLifecycle,\s*\n\s*completionTracker,/);
+  expect(finalSend).not.toMatch(/turn,\s*\n\s*completionTracker,/);
 });
 
 test("unrelated ChatGPT alerts are not terminal", async () => {
@@ -2334,6 +2631,27 @@ test("routine browser diagnostics avoid screenshots unless full capture is reque
   expect(browserDiagnosticIncludesScreenshot("send-ready", true)).toBeTrue();
 });
 
+test("routine successful browser diagnostics are disabled unless full capture is requested", () => {
+  expect(browserDiagnosticCaptureEnabled("browser-page-acquired", undefined, false)).toBeFalse();
+  expect(browserDiagnosticCaptureEnabled("prompt-attachment-complete", undefined, false)).toBeFalse();
+  expect(browserDiagnosticCaptureEnabled("send-accepted", undefined, false)).toBeFalse();
+  expect(browserDiagnosticCaptureEnabled("response-stalled-30s", undefined, false)).toBeTrue();
+  expect(browserDiagnosticCaptureEnabled("turn-failed", undefined, false)).toBeTrue();
+  expect(browserDiagnosticCaptureEnabled("internal-observation-fault", new Error("bounded"), false)).toBeTrue();
+  expect(browserDiagnosticCaptureEnabled("send-accepted", undefined, true)).toBeTrue();
+
+  const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const captureMethod = workerSource.slice(
+    workerSource.indexOf("  async capture(page: Page, checkpoint: string, error?: unknown): Promise<void> {"),
+    workerSource.indexOf("\n  }\n}\n\nexport function resolveBrowserConfig", workerSource.indexOf("  async capture(page: Page, checkpoint: string, error?: unknown): Promise<void> {")),
+  );
+  const earlyGate = captureMethod.indexOf("if (!browserDiagnosticCaptureEnabled(checkpoint, error)) return;");
+  expect(earlyGate).toBeGreaterThan(-1);
+  expect(earlyGate).toBeLessThan(captureMethod.indexOf("privateDirectory(this.root)"));
+  expect(earlyGate).toBeLessThan(captureMethod.indexOf("page.evaluate"));
+  expect(earlyGate).toBeLessThan(captureMethod.indexOf("atomicWriteFile"));
+});
+
 test("visible DOM trace interleaves statuses and explicit intermediate commentary", () => {
   const tracker = new ChatGptVisibleTraceTracker(100);
   const initialBlocks = [
@@ -2446,6 +2764,8 @@ test("response DOM separates streaming commentary from the final Markdown answer
   expect(workerSource).toContain("__CODEX_WEB_GPT_RESPONSE_OBSERVERS__");
   expect(workerSource).toContain("if (options.knownKey === observerKey) return { key: observerKey }");
   expect(workerSource).toContain("new MutationObserver(() =>");
+  expect(workerSource).toContain("state.waiters.clear();");
+  expect(workerSource).toContain("waiters.forEach(resolveWaiter => resolveWaiter())");
   expect(workerSource).toContain('const allMarkdownRoots = [...root.querySelectorAll<HTMLElement>(".markdown")]');
   expect(workerSource).toContain("const selectChatGptAnswerRoots = (");
   expect(workerSource).toContain('candidate.closest("[data-streaming-response-status]") !== null');
@@ -2980,6 +3300,32 @@ test("proven MCP progress vetoes completion, not only the health verdicts", () =
   expect(tracker.update(finishedLooking, 5_600)).toBeTrue();
 });
 
+test("network-primary tool batches wake the browser before wire completion", () => {
+  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const start = source.indexOf('if (networkStreamPrimary && wireCapture)');
+  const end = source.indexOf('let responseTurn = await responseTurnPromise;', start);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  const networkPrimary = source.slice(start, end);
+
+  // A Full-mode MCP request can arrive while the conversation SSE is intentionally still open.
+  // The wire terminal therefore cannot be the only wake source for this branch.
+  expect(networkPrimary).toContain("let progressRevision = 0");
+  expect(networkPrimary).toContain("await observeExternalProgress(turn.externalProgress.snapshot())");
+  expect(networkPrimary).toContain("turn.externalProgress.waitForChange(progressRevision, waitSignal)");
+  expect(networkPrimary).toContain("await observeExternalProgress(observed.snapshot)");
+  expect(networkPrimary).toContain("completionTracker.needsToolBatchObservation");
+  expect(networkPrimary).toContain("turn.externalProgress!.acknowledgeToolBatch");
+});
+
+test("steady-state DOM observation is wakeable by mirrored MCP progress", () => {
+  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  expect(source).toContain("private async waitForResponseDomOrExternalProgress(");
+  expect(source).toContain("externalProgress.waitForChange(afterProgressRevision, waitSignal)");
+  expect(source).toContain("await this.waitForResponseDomOrExternalProgress(");
+  expect(source).toContain("externalProgressSnapshot?.revision ?? 0");
+});
+
 test("Full mode waits for a post-tool final answer without adding the old 60-second tail", () => {
   const progress = new ChatGptExternalTurnProgress();
   const tracker = new ChatGptCompletionTracker();
@@ -3107,6 +3453,69 @@ test("the bundled helper is adopted only for the packaged runtime layout", () =>
   expect(heartbeat).toBeGreaterThan(0);
   expect(tryStart).toBeGreaterThan(0);
   expect(heartbeat).toBeLessThan(tryStart);
+});
+
+test("response completion loop waits on response-scoped mutations instead of fixed idle polling", () => {
+  const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  expect(workerSource).toContain("private async waitForResponseDomMutation(");
+  expect(workerSource).toContain("CHATGPT_RESPONSE_DOM_MIN_OBSERVATION_INTERVAL_MS = 250");
+  expect(workerSource).toContain("CHATGPT_RESPONSE_DOM_IDLE_WAIT_MS = 1_000");
+  expect(workerSource).toContain("state.waiters?.add(wake)");
+  expect(workerSource).toContain("if (currentKey() !== options.knownKey) finish(\"mutation\")");
+  expect(workerSource).toContain('if (turnPlan.domObservation === "cadence")');
+  expect(workerSource).toContain("await this.waitForResponseDomMutation(");
+});
+
+test("prompt attachment timing is scalar-only and opt-in", () => {
+  const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
+  const start = worker.indexOf('process.env.CODEX_CHATGPT_WEB_PROMPT_ATTACHMENT_TIMING === "1"');
+  const end = worker.indexOf('recordTiming("assert")', start);
+  const block = worker.slice(start, end);
+
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  expect(block).toContain("performance.now()");
+  expect(block).toContain("durationMs=");
+  expect(block).not.toContain("prompt.length");
+  expect(block).not.toContain("JSON.stringify(prompt)");
+  expect(block).not.toContain("diagnostics.capture");
+});
+
+test("send timing is scalar-only and opt-in", () => {
+  const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
+  const start = worker.indexOf('process.env.CODEX_CHATGPT_WEB_SEND_TIMING === "1"');
+  const end = worker.indexOf('recordTiming("submission_evidence")', start);
+  const block = worker.slice(start, end);
+
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  expect(block).toContain("performance.now()");
+  expect(block).toContain("send_timing step=");
+  expect(block).toContain("durationMs=");
+  expect(block).not.toContain("finalPrompt");
+  expect(block).not.toContain("JSON.stringify(prompt)");
+  expect(block).not.toContain("requestBody");
+  expect(block).not.toContain('recordTiming("initial_settle")');
+  expect(block).toContain('recordTiming("disabled_settle")');
+});
+
+test("response DOM cache invalidates when Markdown link and source-range attributes hydrate", () => {
+  const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
+  const attributesStart = worker.indexOf("const CHATGPT_DOM_REVISION_ATTRIBUTES = [");
+  const attributesEnd = worker.indexOf("] as const;", attributesStart);
+  const attributes = worker.slice(attributesStart, attributesEnd);
+
+  expect(attributesStart).toBeGreaterThan(-1);
+  expect(attributes).toContain('"href"');
+  expect(attributes).toContain('"title"');
+  expect(attributes).toContain('"data-start"');
+  expect(attributes).toContain('"data-end"');
+
+  // These exact attributes are consumed later by Turndown/source-range extraction, so an
+  // attribute-only hydration must increment the observer revision rather than reuse stale HTML.
+  expect(worker).toContain('candidate.getAttribute("data-start")');
+  expect(worker).toContain('candidate.getAttribute("data-end")');
+  expect(worker).toContain("attributeFilter: options.attributeFilter");
 });
 
 test("Bigger Context stage sends get a budget sized for their payload", () => {

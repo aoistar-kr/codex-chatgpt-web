@@ -10,6 +10,7 @@ const launcherManifest = JSON.parse(
   fs.readFileSync(path.join(launcherRoot, "package.json"), "utf8"),
 );
 const expectedVersion = launcherManifest.version;
+const electronBuilderCli = require.resolve("electron-builder/out/cli/cli.js", { paths: [launcherRoot] });
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-package-smoke-"));
 const markerPath = path.join(scratch, "ready.json");
 const coreHome = path.join(scratch, "core-home");
@@ -30,24 +31,6 @@ function run(command, args, options = {}) {
       `${command} failed with status ${result.status}: ${result.stderr?.trim() || result.stdout?.trim() || "no output"}`,
     );
   }
-}
-
-function windowsInstallLocation() {
-  const guid = launcherManifest.build.nsis.guid;
-  const registryKey = `HKCU\\Software\\${guid}`;
-  const result = spawnSync("reg.exe", ["query", registryKey, "/v", "InstallLocation"], {
-    encoding: "utf8",
-    windowsHide: true,
-  });
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(`Windows installer did not register ${registryKey}: ${result.stderr?.trim() || "no output"}`);
-  }
-  const match = result.stdout.match(/^\s*InstallLocation\s+REG_SZ\s+(.+?)\s*$/mi);
-  if (!match || !path.win32.isAbsolute(match[1])) {
-    throw new Error(`Windows installer registered an invalid InstallLocation: ${result.stdout.trim()}`);
-  }
-  return match[1];
 }
 
 function artifact(pattern, label) {
@@ -97,8 +80,27 @@ try {
     env.APPIMAGE_EXTRACT_AND_RUN = "1";
   } else if (process.platform === "win32") {
     const installer = artifact(/-win-x64\.exe$/, "Windows installer");
-    run(installer, ["/S", "/currentuser"], { timeout: 120_000 });
-    executable = path.join(windowsInstallLocation(), `${launcherManifest.build.productName}.exe`);
+    if (fs.statSync(installer).size <= 0) {
+      throw new Error(`Windows installer artifact is empty: ${installer}`);
+    }
+    const unpackedRoot = path.join(scratch, "windows-unpacked");
+    const builderEnv = { ...process.env };
+    if (!builderEnv.CSC_LINK && !builderEnv.CSC_NAME) {
+      builderEnv.CSC_IDENTITY_AUTO_DISCOVERY = "false";
+    }
+    run("node", [
+      electronBuilderCli,
+      "--win",
+      "--dir",
+      "--publish",
+      "never",
+      `--config.directories.output=${unpackedRoot}`,
+    ], {
+      cwd: launcherRoot,
+      env: builderEnv,
+      timeout: 120_000,
+    });
+    executable = path.join(unpackedRoot, "win-unpacked", `${launcherManifest.build.productName}.exe`);
     command = executable;
     args = ["--launcher-smoke-test"];
   } else {
@@ -106,7 +108,10 @@ try {
   }
 
   if (!fs.existsSync(executable)) throw new Error(`Packaged launcher executable is missing: ${executable}`);
-  run(command, args, { env });
+  run(command, args, {
+    env,
+    timeout: process.platform === "win32" ? 240_000 : 45_000,
+  });
   if (!fs.existsSync(markerPath)) throw new Error("Packaged launcher did not write its readiness marker");
   const marker = JSON.parse(fs.readFileSync(markerPath, "utf8"));
   if (marker.ok !== true

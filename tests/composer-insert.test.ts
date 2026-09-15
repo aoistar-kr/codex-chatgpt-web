@@ -24,11 +24,20 @@ function harness(options: {
   caretInsideComposer: boolean;
   collapsed?: boolean;
   execCommandResult?: boolean;
+  connected?: boolean;
 }) {
   const inside = { name: "text-node-inside-composer" };
+  let composerText = "";
   const composer = {
     focus() { if (options.focusable) fakeDocument.activeElement = composer; },
     contains: (node: object | null) => node === inside || node === composer,
+    get isConnected() { return options.connected ?? true; },
+    cloneNode() {
+      return {
+        querySelectorAll: () => [],
+        childNodes: [{ textContent: composerText }],
+      };
+    },
   };
   const calls: Array<{ command: string; value: string }> = [];
   const selection: FakeSelection = {
@@ -42,7 +51,9 @@ function harness(options: {
     createRange: () => ({ selectNodeContents() {}, collapse() {} }),
     execCommand(command: string, _ui: boolean, value: string) {
       calls.push({ command, value });
-      return options.execCommandResult ?? true;
+      const accepted = options.execCommandResult ?? true;
+      if (accepted) composerText += value;
+      return accepted;
     },
   };
   (globalThis as Record<string, unknown>).document = fakeDocument;
@@ -50,38 +61,86 @@ function harness(options: {
   return { composer: composer as unknown as HTMLElement, calls, selection, fakeDocument };
 }
 
-test("places the caret itself when focus has not yet produced one in the composer", () => {
+test("places the caret itself when focus has not yet produced one in the composer", async () => {
   // The exact state left behind a tenth of a second after the effort menu closes.
   const { composer, calls, selection } = harness({ focusable: true, caretInsideComposer: false });
 
-  expect(insertPlainTextIntoComposer(composer, "staged part")).toBeTrue();
+  expect(await insertPlainTextIntoComposer(composer, "staged part")).toEqual({
+    inserted: true,
+    observed: "staged part",
+  });
   expect(calls).toEqual([{ command: "insertText", value: "staged part" }]);
   expect(selection.isCollapsed).toBeTrue();
 });
 
-test("leaves an existing caret inside the composer exactly where it is", () => {
+test("leaves an existing caret inside the composer exactly where it is", async () => {
   const { composer, calls, selection } = harness({ focusable: true, caretInsideComposer: true });
   const anchorBefore = selection.anchorNode;
 
-  expect(insertPlainTextIntoComposer(composer, "second part")).toBeTrue();
+  expect(await insertPlainTextIntoComposer(composer, "second part")).toEqual({
+    inserted: true,
+    observed: "second part",
+  });
   expect(selection.anchorNode).toBe(anchorBefore);
   expect(calls).toEqual([{ command: "insertText", value: "second part" }]);
 });
 
-test("refuses to insert when the composer cannot take focus at all", () => {
+test("refuses to insert when the composer cannot take focus at all", async () => {
   // A covered or detached composer must still fail rather than have text typed somewhere else.
   const { composer, calls } = harness({ focusable: false, caretInsideComposer: false });
 
-  expect(insertPlainTextIntoComposer(composer, "staged part")).toBeFalse();
+  expect(await insertPlainTextIntoComposer(composer, "staged part")).toEqual({
+    inserted: false,
+    observed: null,
+  });
   expect(calls).toEqual([]);
 });
 
-test("reports a genuinely rejected edit as a failure", () => {
+test("reports a genuinely rejected edit as a failure", async () => {
   const { composer } = harness({
     focusable: true,
     caretInsideComposer: true,
     execCommandResult: false,
   });
 
-  expect(insertPlainTextIntoComposer(composer, "staged part")).toBeFalse();
+  expect(await insertPlainTextIntoComposer(composer, "staged part")).toEqual({
+    inserted: false,
+    observed: null,
+  });
+});
+
+test("withholds the fast readback when the composer is replaced after insertion", async () => {
+  const { composer, calls } = harness({
+    focusable: true,
+    caretInsideComposer: true,
+    connected: false,
+  });
+
+  expect(await insertPlainTextIntoComposer(composer, "staged part")).toEqual({
+    inserted: true,
+    observed: null,
+  });
+  expect(calls).toEqual([{ command: "insertText", value: "staged part" }]);
+});
+
+test("withholds the fast readback when renderer text changes across task boundaries", async () => {
+  const { composer, calls } = harness({
+    focusable: true,
+    caretInsideComposer: true,
+  });
+  let reads = 0;
+  (composer as unknown as { cloneNode(): unknown }).cloneNode = () => {
+    reads += 1;
+    return {
+      querySelectorAll: () => [],
+      childNodes: [{ textContent: reads === 1 ? "staged part" : "rewritten later" }],
+    };
+  };
+
+  expect(await insertPlainTextIntoComposer(composer, "staged part")).toEqual({
+    inserted: true,
+    observed: null,
+  });
+  expect(reads).toBe(2);
+  expect(calls).toEqual([{ command: "insertText", value: "staged part" }]);
 });

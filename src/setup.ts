@@ -20,9 +20,8 @@ import {
   storedBrowserLoginCapabilities,
 } from "./browser-login";
 import {
-  installCodexIntegration,
-  preflightCodexIntegration,
   readCodexSubagentProtocol,
+  retireCodexIntegrationForProviderMode,
 } from "./codex-integration";
 import { inspectLauncherBrowserHost } from "./launcher-browser-host";
 import {
@@ -67,7 +66,7 @@ export interface SetupResult {
   loginCreated: boolean;
   serviceLoaded: boolean;
   tunnelReady: boolean | null;
-  codexRestartRequired: true;
+  codexRestartRequired: false;
   connectorSetupRequired: boolean;
 }
 
@@ -324,9 +323,6 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
       + "Use the Codex Web GPT launcher on Windows or Linux.",
     );
   }
-  preflightCodexIntegration(config, {
-    replaceExistingRoute: options.replaceCodexRoute,
-  });
   const refreshTunnelWorker = tunnelWorkerRuntimeChanged(existing, config);
   if (existing && options.restartService) config.controlToken = randomBytes(32).toString("base64url");
   const beforeService = getServiceStatus();
@@ -456,9 +452,10 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     launcherOwned && existing && existing.browserHost !== "launcher",
   );
   if (!migratingTerminalRuntime) removeLegacyRuntimeArtifacts(config);
-  installCodexIntegration(config, {
-    replaceExistingRoute: options.replaceCodexRoute,
-  });
+  // Production is provider-only by default. One-time migration removes only historical state
+  // owned by codex-chatgpt-web and deliberately preserves a newer external router such as
+  // OpenCodex. The runtime itself never installs or reconnects a Codex route.
+  retireCodexIntegrationForProviderMode();
 
   return {
     mode: config.mode,
@@ -466,7 +463,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     loginCreated,
     serviceLoaded: launcherOwned ? false : getServiceStatus().loaded,
     tunnelReady,
-    codexRestartRequired: true,
+    codexRestartRequired: false,
     connectorSetupRequired: config.mode === "full",
   };
 }

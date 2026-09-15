@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
-import { chatGptRetainedConversationUnavailableError } from "../src/adapters/chatgpt-web/adapter-error";
+import { ChatGptCompactionHandoffAccepted, chatGptRetainedConversationUnavailableError } from "../src/adapters/chatgpt-web/adapter-error";
 import {
   MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
   existingStructuredCompactionRun,
@@ -344,6 +344,7 @@ test("a completed retained agent returns an exact checkpoint and its browser is 
   expect(captured?.nativeConnector).toBeTrue();
   expect(captured?.capabilities.localToolsEnabled).toBeFalse();
   expect(browserRetired).toBeTrue();
+  expect(captured?.abortSignal?.reason).toBeInstanceOf(ChatGptCompactionHandoffAccepted);
   expect(transactionAborted).toBeTrue();
   expect(transactionTtl).toBe(MAX_COMPACTION_HANDOFF_TIMEOUT_MS);
 });

@@ -163,6 +163,42 @@ Use **Activity** for safe local diagnostics and **Settings → Run doctor** for 
 Settings can also cancel a retained browser turn or remove the Codex integration before uninstall.
 Set `CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS=1` only when every browser checkpoint needs a screenshot.
 
+The Temporary Chat network stream observer is enabled by default and can be disabled with
+`CODEX_CHATGPT_WEB_NETWORK_STREAM_SHADOW=0`. Network-primary return is also enabled by default inside
+its low/medium/high, no-local-tools, non-Luna-checkpoint eligibility boundary, so a definitive
+captured SSE answer can return without waiting for ChatGPT's final DOM controls. Extra-high/max and
+other ineligible turns remain on DOM/shadow authority. Set `CODEX_CHATGPT_WEB_NETWORK_STREAM_PRIMARY=0`
+as an explicit rollback kill switch.
+
+Incomplete-capture recovery is enabled by default for its narrow eligible launcher-owned simple-turn
+path. If an already-submitted turn loses only its observation transport, the worker may prove the exact
+same committed turn, rebind once to the same launcher surface, and continue the existing Markdown
+buffer without resubmitting the prompt. Set `CODEX_CHATGPT_WEB_INCOMPLETE_CAPTURE_RECOVERY=0` as an
+explicit rollback kill switch; failed proof remains fail-closed and never authorizes prompt replay.
+
+With the authenticated launcher running, `bun run smoke:stream:live` performs one browser-only
+Temporary Chat shadow turn and prints content-free timing metrics. Set
+`CODEX_CHATGPT_WEB_STREAM_CANARY_RUNS=3` to collect a small median sample. The canary's local state is
+created under the operating-system temporary directory and removed after the run. Set
+`CODEX_CHATGPT_WEB_STREAM_CANARY_PRIMARY=1` to verify the opt-in network return path.
+
+Set `CODEX_CHATGPT_WEB_REQUEST_INJECTION_SHADOW=1` to passively inspect the browser-created
+conversation request before any future placeholder rewrite is enabled. The shadow never changes the
+request body and logs only content-free shape metadata: whether the body was supported JSON and how
+many JSON string values exactly matched the submitted prompt. The live stream canary enables this
+shadow unless `CODEX_CHATGPT_WEB_STREAM_CANARY_REQUEST_SHADOW=0` is set.
+
+Request-injection primary is enabled by default for eligible simple fresh browser-only turns. Codex
+writes a one-use random placeholder into the normal ChatGPT composer,
+ChatGPT's own SPA builds and submits the request, and the wrapper replaces exactly one matching JSON
+string value immediately before `fetch`. Unsupported body transports, malformed/non-object JSON,
+duplicate value matches, or raw JSON-literal collisions are blocked before network transmission;
+the worker retries through the verified full DOM prompt path only after proving the blocked optimistic
+submission left no new user/assistant turn. Multipart, file, connector, retained-conversation, and
+compaction turns remain on the DOM path. Set `CODEX_CHATGPT_WEB_REQUEST_INJECTION_PRIMARY=0` as an
+explicit rollback kill switch. Use `CODEX_CHATGPT_WEB_STREAM_CANARY_REQUEST_PRIMARY=1` for a live
+Temporary Chat canary.
+
 New installs use **Compatibility V1** for cross-backend subagents. **Native** preserves Codex's own
 feature settings and enables plaintext Web-to-Web V2 delegation. Restart Codex and start a new task
 after changing the protocol:

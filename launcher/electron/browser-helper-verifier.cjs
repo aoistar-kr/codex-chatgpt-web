@@ -54,7 +54,7 @@ async function runBrowserHelperOperation({ helper, descriptorPath, appName, oper
   if (typeof descriptorPath !== "string" || !descriptorPath || typeof appName !== "string" || !appName) {
     throw new Error("Browser helper verification config is invalid");
   }
-  if (!["verify", "inspect", "smoke"].includes(operation)) {
+  if (!["verify", "inspect", "smoke", "prewarm"].includes(operation)) {
     throw new Error(`Unsupported browser helper operation: ${String(operation)}`);
   }
   const id = `${operation}-${randomBytes(12).toString("hex")}`;
@@ -162,10 +162,14 @@ async function runBrowserHelperOperation({ helper, descriptorPath, appName, oper
 
 async function verifyConnectorWithBrowserHelper(options) {
   const message = await runBrowserHelperOperation({ ...options, operation: "verify" });
-  if (message.text !== options.appName) {
+  const value = message?.value;
+  if (!value || typeof value !== "object"
+    || value.appName !== options.appName
+    || typeof value.pluginId !== "string"
+    || !/^plugin:[A-Za-z0-9_-]{16,128}$/.test(value.pluginId)) {
     throw new Error("Browser helper verified a different ChatGPT connector");
   }
-  return { ok: true, appName: options.appName };
+  return { ok: true, appName: options.appName, pluginId: value.pluginId };
 }
 
 module.exports = { runBrowserHelperOperation, verifyConnectorWithBrowserHelper };

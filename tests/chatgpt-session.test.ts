@@ -84,7 +84,8 @@ test("the new model rows cannot hide an authoritative five-step Pro effort slide
   const effortButton = {
     last() { return this; },
     isVisible: async () => true,
-    getAttribute: async () => "true",
+    getAttribute: async (name: string) => name === "aria-expanded" ? "true"
+      : name === "data-state" ? "open" : null,
   };
   const composerForm = {
     locator: () => effortButton,

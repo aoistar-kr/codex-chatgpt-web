@@ -19,7 +19,7 @@ test("launcher verification delegates exact connector selection to the browser h
       if (message.type !== "verify") return;
       if (message.config.appName !== "Codex Native2") process.exit(2);
       if (message.config.browserHostDescriptorPath !== "/runtime/launcher-browser.json") process.exit(3);
-      send({ type: "result", id: message.id, text: message.config.appName });
+      send({ type: "result", id: message.id, value: { appName: message.config.appName, pluginId: "plugin:0123456789abcdef" } });
     });
   `);
 
@@ -30,7 +30,7 @@ test("launcher verification delegates exact connector selection to the browser h
     logger: { info() {} },
   });
 
-  assert.deepEqual(result, { ok: true, appName: "Codex Native2" });
+  assert.deepEqual(result, { ok: true, appName: "Codex Native2", pluginId: "plugin:0123456789abcdef" });
 });
 
 test("launcher verification consumes a helper input EOF after the result", async (context) => {
@@ -44,7 +44,7 @@ test("launcher verification consumes a helper input EOF after the result", async
     input.on("line", line => {
       const message = JSON.parse(line);
       if (message.type !== "verify") return;
-      send({ type: "result", id: message.id, text: message.config.appName });
+      send({ type: "result", id: message.id, value: { appName: message.config.appName, pluginId: "plugin:0123456789abcdef" } });
       process.stdin.destroy();
       setTimeout(() => process.exit(0), 100);
     });
@@ -57,5 +57,5 @@ test("launcher verification consumes a helper input EOF after the result", async
     logger: { info() {} },
   });
 
-  assert.deepEqual(result, { ok: true, appName: "Codex Native2" });
+  assert.deepEqual(result, { ok: true, appName: "Codex Native2", pluginId: "plugin:0123456789abcdef" });
 });

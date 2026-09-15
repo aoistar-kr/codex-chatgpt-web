@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { createServer } from "node:http";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,14 +9,50 @@ import {
   LauncherRetainedConversationUnavailableError,
   LauncherBrowserTurnCancelledError,
   inspectLauncherBrowserHost,
+  connectLauncherBrowserHost,
   notifyLauncherTurn,
   readLauncherBrowserHostDescriptor,
   releaseLauncherRetainedConversation,
   selectLauncherPage,
 } from "../src/launcher-browser-host";
 import type { Browser, BrowserContext, Page } from "playwright-core";
+import { chromium } from "playwright-core";
 
 const roots: string[] = [];
+
+test("late CDP readiness cannot start an attach after caller cancellation", async () => {
+  const controller = new AbortController();
+  const attach = spyOn(chromium, "connectOverCDP").mockImplementation(async () => { throw new Error("unexpected attach"); });
+  const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async () => {
+    controller.abort();
+    return new Response(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1:39110/devtools/browser/fixture" }));
+  }) as unknown as typeof fetch);
+  try {
+    await expect(connectLauncherBrowserHost(descriptorFile(), 100, undefined, controller.signal)).rejects.toThrow("aborted");
+    expect(attach).not.toHaveBeenCalled();
+  } finally { fetchMock.mockRestore(); attach.mockRestore(); }
+});
+
+test("launcher heartbeat shares caller cancellation and pre-abort sends nothing", async () => {
+  const controller = new AbortController();
+  let observed: AbortSignal | null | undefined;
+  const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    observed = init?.signal;
+    return new Promise<Response>((_, reject) => {
+      observed?.addEventListener("abort", () => reject(new Error("fixture fetch aborted")), { once: true });
+    });
+  }) as unknown as typeof fetch);
+  try {
+    await expect(notifyLauncherTurn("must-not-be-read", { phase: "heartbeat", traceId: "fixture", helperPid: process.pid }, 100, AbortSignal.abort()))
+      .rejects.toThrow("aborted");
+    expect(fetchMock).not.toHaveBeenCalled();
+    const pending = notifyLauncherTurn(descriptorFile(), { phase: "heartbeat", traceId: "fixture", helperPid: process.pid, refreshViewport: true }, 1000, controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toThrow("aborted");
+    expect(observed?.aborted).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  } finally { fetchMock.mockRestore(); }
+});
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -30,7 +66,7 @@ function descriptorFile(
   roots.push(root);
   const path = join(root, "launcher-browser.json");
   writeFileSync(path, `${JSON.stringify({
-    version: 2,
+    version: 3,
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile,
     pid: process.pid,
@@ -48,6 +84,7 @@ function descriptorFile(
       : "persist:codex-web-gpt-chatgpt",
     idleUrl: LAUNCHER_BROWSER_IDLE_URL,
     surfaceId: "launcher_surface_id_0123456789AB",
+    surfaceTargets: { launcher_surface_id_0123456789AB: "target-owned" },
     createdAt: new Date().toISOString(),
   })}\n`, { mode: 0o600 });
   return path;
@@ -140,6 +177,41 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
       status: "completed",
       retain: true,
       connectorBound: true,
+    });
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test("launcher turn control exposes a proven hot-surface effort prewarm only when the launcher reports it", async () => {
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    expect(body.modelId).toBe("gpt-5.6-sol");
+    expect(body.reasoning).toBe("medium");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end('{"ok":true,"surfaceId":"launcher_surface_id_0123456789AB","reused":false,"connectorBound":false,"effortPrepared":true}\n');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const path = descriptorFile(`http://127.0.0.1:${address.port}`);
+    await expect(notifyLauncherTurn(path, {
+      phase: "start",
+      traceId: "prewarm123456",
+      helperPid: process.pid,
+      modelId: "gpt-5.6-sol",
+      reasoning: "medium",
+    })).resolves.toEqual({
+      surfaceId: "launcher_surface_id_0123456789AB",
+      reused: false,
+      connectorBound: false,
+      effortPrepared: true,
     });
   } finally {
     await new Promise<void>(resolve => server.close(() => resolve()));
@@ -310,43 +382,41 @@ test("launcher profile checks reject cross-profile browser ownership", async () 
     .rejects.toThrow("belongs to development");
 });
 
-test("launcher page selection uses the owned surface marker instead of URL order", async () => {
+test("launcher page selection uses the native target map instead of renderer evaluation or URL order", async () => {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorFile());
-  const hiddenPage = {
-    url: () => "https://chatgpt.com/?temporary-chat=true",
-    evaluate: async () => "another_surface_id_0123456789ABC",
-  } as unknown as Page;
-  const ownedPage = {
-    url: () => LAUNCHER_BROWSER_IDLE_URL,
-    evaluate: async () => descriptor.surfaceId,
-  } as unknown as Page;
+  const hiddenPage = { url: () => "https://chatgpt.com/?temporary-chat=true" } as unknown as Page;
+  const ownedPage = { url: () => LAUNCHER_BROWSER_IDLE_URL } as unknown as Page;
+  const sessions = new Map<Page, string>([[hiddenPage, "target-hidden"], [ownedPage, "target-owned"]]);
   const context = {
     pages: () => [hiddenPage, ownedPage],
+    newCDPSession: async (page: Page) => ({
+      send: async (method: string) => {
+        expect(method).toBe("Target.getTargetInfo");
+        return { targetInfo: { targetId: sessions.get(page)! } };
+      },
+      detach: async () => {},
+    }),
   } as unknown as BrowserContext;
-  const browser = {
-    contexts: () => [context],
-  } as unknown as Browser;
+  const browser = { contexts: () => [context] } as unknown as Browser;
 
-  expect(await selectLauncherPage(browser, descriptor, 20)).toEqual({
-    context,
-    page: ownedPage,
-  });
+  expect(await selectLauncherPage(browser, descriptor, 20)).toEqual({ context, page: ownedPage });
 });
 
-test("launcher page selection rejects duplicated ownership markers", async () => {
+test("launcher page selection rejects duplicated native target ownership", async () => {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorFile());
-  const page = () => ({
-    evaluate: async () => descriptor.surfaceId,
-  }) as unknown as Page;
+  const page = () => ({}) as unknown as Page;
+  const pages = [page(), page()];
   const context = {
-    pages: () => [page(), page()],
+    pages: () => pages,
+    newCDPSession: async () => ({
+      send: async () => ({ targetInfo: { targetId: "target-owned" } }),
+      detach: async () => {},
+    }),
   } as unknown as BrowserContext;
-  const browser = {
-    contexts: () => [context],
-  } as unknown as Browser;
+  const browser = { contexts: () => [context] } as unknown as Browser;
 
   expect(selectLauncherPage(browser, descriptor, 20)).rejects.toThrow(
-    "2 surfaces with the same ownership id",
+    "2 surfaces with the same native target",
   );
 });
 

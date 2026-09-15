@@ -1,15 +1,24 @@
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { atomicWriteFile } from "../../config";
+import { getCodexHome } from "../../codex-integration-shared";
 import type { CodexParsedRequest } from "../../types";
 import {
   extractChatGptTurnEnvironment,
   extractChatGptTurnIdentity,
   extractChatGptThreadSpawnLineage,
+  extractChatGptRootThreadMetadata,
+  extractChatGptContinuationEnvironmentClaim,
+  extractChatGptCompactionSourceRevision,
+  hasCurrentChatGptEnvironmentContext,
+  hasRawChatGptEnvironmentContext,
+  unattributedChatGptEnvironmentMessages,
+  isChatGptCompactionContinuation,
   MissingTrustedCodexEnvironmentError,
   type ChatGptSandboxPolicy,
   type ChatGptTurnEnvironment,
 } from "./environment";
+import { resolveCurrentCodexRolloutEnvironment } from "./codex-rollout-environment";
 
 interface StoredThreadEnvironment {
   cwd: string;
@@ -108,6 +117,19 @@ function authority(environment: ChatGptTurnEnvironment, updatedAt: number): Stor
   };
 }
 
+function sameAuthority(left: ChatGptTurnEnvironment, right: ChatGptTurnEnvironment): boolean {
+  const samePaths = (a: string[], b: string[]): boolean => {
+    const expected = new Set(b.map(pathIdentity));
+    return a.length === expected.size && a.every(path => expected.has(pathIdentity(path)));
+  };
+  return pathIdentity(left.cwd) === pathIdentity(right.cwd)
+    && samePaths(left.roots, right.roots)
+    && samePaths(left.writableRoots, right.writableRoots)
+    && left.sandboxPolicy.type === right.sandboxPolicy.type
+    && (left.sandboxPolicy.type === "dangerFullAccess" || (right.sandboxPolicy.type !== "dangerFullAccess"
+      && left.sandboxPolicy.networkAccess === right.sandboxPolicy.networkAccess));
+}
+
 /**
  * Codex emits its trusted environment envelope when a task starts or its environment changes,
  * not on every follow-up. This store carries only that trusted authority across turns. Tool
@@ -120,16 +142,77 @@ export class ChatGptThreadEnvironmentStore {
   constructor(
     private readonly path?: string,
     private readonly now: () => number = Date.now,
+    private readonly codexHome: string = getCodexHome(),
+    private readonly sqliteHome?: string,
   ) {}
 
   resolve(parsed: CodexParsedRequest): ChatGptTurnEnvironment {
     const identity = extractChatGptTurnIdentity(parsed);
+    const continuation = isChatGptCompactionContinuation(parsed);
+    const rolloutIdentity = continuation
+      ? (extractChatGptThreadSpawnLineage(parsed) ?? extractChatGptRootThreadMetadata(parsed))
+      : undefined;
+    const continuationClaim = continuation ? extractChatGptContinuationEnvironmentClaim(parsed) : undefined;
+    const resolveContinuationRollout = (): ChatGptTurnEnvironment => {
+      if (!rolloutIdentity || !identity.turnId) {
+        throw new Error("Compaction continuation is missing canonical Codex rollout identity");
+      }
+      const rollout = resolveCurrentCodexRolloutEnvironment({
+        codexHome: this.codexHome,
+        ...(this.sqliteHome ? { sqliteHome: this.sqliteHome } : {}),
+        lineage: rolloutIdentity,
+        turnId: identity.turnId,
+        tools: parsed.context.tools,
+      });
+      if (!rollout) throw new Error("Compaction continuation has no current canonical Codex rollout");
+      return rollout;
+    };
     try {
       const environment = extractChatGptTurnEnvironment(parsed);
+      if (continuation) {
+        const rollout = resolveContinuationRollout();
+        if (!continuationClaim || !sameAuthority(continuationClaim, rollout)) {
+          throw new Error("Compaction continuation environment conflicts with its current Codex rollout");
+        }
+        if (identity.threadId) this.set(identity.threadId, rollout);
+        return rollout;
+      }
       if (identity.threadId) this.set(identity.threadId, environment);
       return environment;
     } catch (error) {
       if (!(error instanceof MissingTrustedCodexEnvironmentError) || !identity.threadId) throw error;
+      if (continuation) {
+        const rollout = resolveContinuationRollout();
+        if (!continuationClaim || !sameAuthority(continuationClaim, rollout)) {
+          throw new Error("Compaction continuation environment conflicts with its current Codex rollout");
+        }
+        this.set(identity.threadId, rollout);
+        return rollout;
+      }
+      const hasCurrentContext = hasCurrentChatGptEnvironmentContext(parsed);
+      const lineage = extractChatGptThreadSpawnLineage(parsed);
+      const historicalMessages = hasCurrentContext && lineage
+        ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
+      if (hasCurrentContext && !historicalMessages) throw error;
+      const nativeIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
+      const compactionSourceTurnId = parsed._compactionRequest
+        ? extractChatGptCompactionSourceRevision(parsed).turnId : undefined;
+      if (nativeIdentity && identity.turnId) {
+        const rollout = resolveCurrentCodexRolloutEnvironment({
+          codexHome: this.codexHome,
+          ...(this.sqliteHome ? { sqliteHome: this.sqliteHome } : {}),
+          lineage: nativeIdentity,
+          turnId: identity.turnId,
+          ...(compactionSourceTurnId ? { compactionSourceTurnId } : {}),
+          ...(historicalMessages ? { historicalEnvironmentMessages: historicalMessages } : {}),
+          tools: parsed.context.tools,
+        });
+        if (rollout) {
+          this.set(identity.threadId, rollout);
+          return rollout;
+        }
+      }
+      if (hasRawChatGptEnvironmentContext(parsed)) throw error;
       const sameThread = this.get(identity.threadId);
       if (sameThread) return {
         cwd: sameThread.cwd,
@@ -139,7 +222,6 @@ export class ChatGptThreadEnvironmentStore {
         tools: parsed.context.tools ?? [],
       };
 
-      const lineage = extractChatGptThreadSpawnLineage(parsed);
       if (!lineage) throw error;
       const parent = this.get(lineage.parentThreadId);
       if (!parent) throw error;
