@@ -91,6 +91,17 @@ partition and keep independent documents and lifecycles. Closing a running tab d
 and terminates that browser turn. A sixth concurrent turn fails explicitly; the cap avoids excessive
 parallel traffic that could trigger account abuse controls.
 
+Active-turn control is bidirectional. Public ChatGPT commentary and work/status rows are projected
+into Codex commentary/reasoning output; actual Codex Native requests still travel through the broker
+and remain native Codex tool calls. A newer user revision is steering only when native thread and
+turn identity both match the active browser owner and instruction lineage proves the predecessor.
+The launcher stops that superseded response on the exact Electron surface; if the stop is
+acknowledged and the surface is retained, the replacement sends only the new steering delta (plus
+matching just-returned tool results) into that same Temporary Chat. If reuse is unavailable, the
+replacement uses a fresh surface with canonical full context instead of replaying the old prompt
+into an uncertain conversation. Ordinary Codex Interrupt follows the same exact-surface stop path
+but never preserves the cancelled chat.
+
 Sign-in uses that same persistent Electron partition. ChatGPT login pages and allowed identity-
 provider popups are adopted into a temporary `WebContentsView` inside the launcher instead of being
 redirected to another browser. After the provider returns to ChatGPT, the launcher requires both a

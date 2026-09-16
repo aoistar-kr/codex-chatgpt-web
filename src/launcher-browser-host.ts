@@ -348,6 +348,12 @@ export type LauncherTurnActivity =
       refreshViewport?: boolean;
     }
   | {
+      /** Stop the exact active ChatGPT generation before helper teardown. */
+      phase: "stop";
+      traceId: string;
+      helperPid: number;
+    }
+  | {
       phase: "end";
       traceId: string;
       helperPid: number;
@@ -360,6 +366,7 @@ export type LauncherTurnActivity =
 export const LAUNCHER_TURN_START_TIMEOUT_MS = 5_000;
 export const LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS = 10_000;
 export const LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS = 5_000;
+export const LAUNCHER_TURN_STOP_TIMEOUT_MS = 3_000;
 export const LAUNCHER_TURN_END_TIMEOUT_MS = 15_000;
 
 export async function notifyLauncherTurn(
@@ -369,6 +376,8 @@ export async function notifyLauncherTurn(
     ? LAUNCHER_TURN_END_TIMEOUT_MS
     : activity.phase === "heartbeat"
       ? LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS
+      : activity.phase === "stop"
+        ? LAUNCHER_TURN_STOP_TIMEOUT_MS
       : LAUNCHER_TURN_START_TIMEOUT_MS,
   abortSignal?: AbortSignal,
 ): Promise<{
@@ -378,6 +387,7 @@ export async function notifyLauncherTurn(
   connectorPluginId?: string;
   effortPrepared?: boolean;
   cancelledByUser?: boolean;
+  stopped?: boolean;
 }> {
   if (abortSignal?.aborted) throw new DOMException("Launcher turn notification aborted", "AbortError");
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
@@ -440,6 +450,12 @@ export async function notifyLauncherTurn(
         throw new Error("Launcher browser control channel returned an invalid turn release result");
       }
       return { cancelledByUser: body.cancelledByUser };
+    }
+    if (activity.phase === "stop") {
+      if (typeof body.stopped !== "boolean") {
+        throw new Error("Launcher browser control channel returned an invalid stop acknowledgement");
+      }
+      return { stopped: body.stopped };
     }
     return {};
   } catch (error) {

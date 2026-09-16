@@ -968,6 +968,7 @@ describe("ChatGPT outer-native harness v4", () => {
     let finishBrowser!: () => void;
     let settlePhysical!: () => void;
     let cancellations = 0;
+    let steeringSource: ChatGptTurnSession | undefined;
     const browser = new Promise<string>(resolveBrowser => { finishBrowser = () => resolveBrowser("superseded"); });
     const physicalSettlement = new Promise<void>(resolvePhysical => { settlePhysical = resolvePhysical; });
     sessions.getOrCreate("old-turn", () => ({
@@ -976,12 +977,14 @@ describe("ChatGPT outer-native harness v4", () => {
       physicalSettlement,
       trace: new ChatGptTraceFeed(),
       text: new ChatGptTextFeed(),
+      conversationKey: "a".repeat(64),
+      submission: { phase: "accepted" },
       cancel: () => {
         cancellations += 1;
         finishBrowser();
         settlePhysical();
       },
-    }), "old-trace", "shared-thread", "old-native-turn", "thread", "old-instruction");
+    }), "old-trace", "shared-thread", "native-turn", "thread", "old-instruction");
 
     const replacement = await sessions.getOrCreateAfterOwnerRetirement(
       "new-turn",
@@ -996,13 +999,67 @@ describe("ChatGPT outer-native harness v4", () => {
       }),
       "new-trace",
       undefined,
-      "new-native-turn",
+      "native-turn",
       "thread",
       { current: "new-instruction", predecessors: new Set(["old-instruction"]) },
+      source => { steeringSource = source; },
     );
 
     expect(replacement.instruction).toBe("new-instruction");
     expect(cancellations).toBe(1);
+    expect(steeringSource?.traceId).toBe("old-trace");
+    sessions.clear();
+  });
+
+  test("a newer instruction from a different native turn waits instead of steering the active chat", async () => {
+    const sessions = new ChatGptTurnSessions();
+    let finishBrowser!: () => void;
+    let settlePhysical!: () => void;
+    let cancellations = 0;
+    let steeringSources = 0;
+    const browser = new Promise<string>(resolve => { finishBrowser = () => resolve("done"); });
+    const physicalSettlement = new Promise<void>(resolve => { settlePhysical = resolve; });
+    sessions.getOrCreate("old-turn", () => ({
+      mode: "read-only" as const,
+      browser,
+      physicalSettlement,
+      trace: new ChatGptTraceFeed(),
+      text: new ChatGptTextFeed(),
+      conversationKey: "b".repeat(64),
+      submission: { phase: "accepted" as const },
+      cancel: () => { cancellations += 1; },
+    }), "old-trace", "shared-thread", "old-native-turn", "thread", "old-instruction");
+
+    let replacements = 0;
+    const replacement = sessions.getOrCreateAfterOwnerRetirement(
+      "new-turn",
+      "shared-thread",
+      () => {
+        replacements += 1;
+        return {
+          mode: "read-only" as const,
+          browser: Promise.resolve("replacement"),
+          physicalSettlement: Promise.resolve(),
+          trace: new ChatGptTraceFeed(),
+          text: new ChatGptTextFeed(),
+          cancel: () => {},
+        };
+      },
+      "new-trace",
+      undefined,
+      "different-native-turn",
+      "thread",
+      { current: "new-instruction", predecessors: new Set(["old-instruction"]) },
+      () => { steeringSources += 1; },
+    );
+    await Bun.sleep(0);
+    expect(cancellations).toBe(0);
+    expect(steeringSources).toBe(0);
+    expect(replacements).toBe(0);
+    finishBrowser();
+    settlePhysical();
+    expect((await replacement).traceId).toBe("new-trace");
+    expect(replacements).toBe(1);
     sessions.clear();
   });
 
@@ -1493,6 +1550,33 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(files[0]?.name).toBe("codex-input-image-1.png");
     expect(files[0]?.mimeType).toBe("image/png");
     expect(files[0]?.buffer.length).toBeGreaterThan(0);
+  });
+
+  test("retained steering serializes only the continuation delta and refreshes the turn token", () => {
+    const request = parsed();
+    request.context.systemPrompt = ["must-not-replay-system"];
+    request.context.messages = [
+      { role: "user", content: "야", timestamp: 100 },
+    ];
+    const compiled = compileChatGptWebPrompt(
+      request,
+      toolCapabilities,
+      "turn_steering_12345678901234567890",
+      { retainedContinuation: "steering" },
+    );
+
+    expect(compiled.text).toContain("SAME Codex task already present in this Temporary Chat");
+    expect(compiled.text).toContain("newly arrived Codex continuation delta");
+    expect(compiled.text).toContain('"content":"야"');
+    expect(compiled.text).toContain("turn_steering_12345678901234567890");
+    expect(compiled.text).not.toContain("must-not-replay-system");
+    expect(compiled.text).not.toContain("Read the complete inline JSON task context before acting");
+
+    const adapterSource = readFileSync(new URL("../src/adapters/chatgpt-web/index.ts", import.meta.url), "utf8");
+    expect(adapterSource).toContain("function retainedSteeringResumeRequest(");
+    expect(adapterSource).toContain("systemPrompt: [],");
+    expect(adapterSource).toContain("messages: [...results, user],");
+    expect(adapterSource).toContain("steeringResumeInput ?? (conversationKey && mode.localTools");
   });
 
   test("keeps only the newest complete Codex model-switch contract", () => {

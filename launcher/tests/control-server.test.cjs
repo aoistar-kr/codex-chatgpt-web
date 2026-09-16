@@ -20,6 +20,10 @@ test("browser control server authenticates and owns turn visibility", async () =
       };
     },
     heartbeatTurn: (...args) => calls.push(["heartbeat", ...args]),
+    stopTurnGeneration: async (...args) => {
+      calls.push(["stop", ...args]);
+      return true;
+    },
     endTurn: (...args) => {
       calls.push(["end", ...args]);
       return { cancelledByUser: false };
@@ -75,6 +79,18 @@ test("browser control server authenticates and owns turn visibility", async () =
     });
     assert.equal(heartbeat.status, 200);
 
+    const stop = await fetch(`${descriptor.endpoint}/v1/turn/stop`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${descriptor.token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        phase: "stop",
+        traceId: "abcdef123456",
+        helperPid: process.pid,
+      }),
+    });
+    assert.equal(stop.status, 200);
+    assert.deepEqual(await stop.json(), { ok: true, stopped: true });
+
     const invalidRefresh = await fetch(`${descriptor.endpoint}/v1/turn/heartbeat`, {
       method: "POST",
       headers: { authorization: `Bearer ${descriptor.token}`, "content-type": "application/json" },
@@ -126,6 +142,7 @@ test("browser control server authenticates and owns turn visibility", async () =
         true,
       ],
       ["heartbeat", "abcdef123456", process.pid, true],
+      ["stop", "abcdef123456", process.pid],
       ["end", "abcdef123456", process.pid, "completed", true, undefined, true, true],
     ]);
     assert.equal(logs.some(([, event]) => event === "browser.turn_started"), true);

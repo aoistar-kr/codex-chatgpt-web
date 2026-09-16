@@ -21,6 +21,17 @@ export class ChatGptWebAdapterError extends Error {
   }
 }
 
+/** Internal preemption marker for native Codex steering. */
+export class ChatGptTurnSupersededError extends ChatGptWebAdapterError {
+  constructor() {
+    super(
+      "A newer Codex instruction superseded this ChatGPT response.",
+      { status: 499, errorType: "client_closed_request", code: "client_cancelled", retryable: false },
+    );
+    this.name = "ChatGptTurnSupersededError";
+  }
+}
+
 // Only the compaction owner emits this after its one-shot handoff is accepted.
 // It stops browser observation without reclassifying the accepted native summary as a failure.
 export class ChatGptCompactionHandoffAccepted extends DOMException {
@@ -66,8 +77,5 @@ export function chatGptRetainedConversationUnavailableError(): ChatGptWebAdapter
 }
 
 export function chatGptTurnSupersededError(): ChatGptWebAdapterError {
-  return new ChatGptWebAdapterError(
-    "A newer Codex instruction superseded this ChatGPT response.",
-    { status: 499, errorType: "client_closed_request", code: "client_cancelled", retryable: false },
-  );
+  return new ChatGptTurnSupersededError();
 }

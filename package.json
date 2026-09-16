@@ -29,7 +29,7 @@
     "dev:launcher": "bun run src/cli.ts dev launcher",
     "dev:chat": "bun run src/cli.ts dev chat",
     "test": "bun test tests/*.test.ts",
-    "test:custom-invariants": "bun test tests/browser-worker-contract.test.ts tests/model-contract.test.ts tests/web-stream-tap.test.ts tests/chatgpt-web-harness.test.ts tests/web-stream-rich-fixture.test.ts tests/request-prompt-shape.test.ts tests/turn-plan.test.ts tests/submission-disposition.test.ts tests/recovery-equivalent-proof.test.ts tests/recovery-request-observer.test.ts tests/compaction-continuation-backport.test.ts tests/native-passthrough.test.ts tests/launcher-helper-client.test.ts tests/prompt-contract.test.ts tests/environment.test.ts tests/codex-interrupt-hook.test.ts",
+    "test:custom-invariants": "bun test tests/browser-worker-contract.test.ts tests/model-contract.test.ts tests/web-stream-tap.test.ts tests/chatgpt-web-harness.test.ts tests/web-stream-rich-fixture.test.ts tests/request-prompt-shape.test.ts tests/turn-plan.test.ts tests/submission-disposition.test.ts tests/recovery-equivalent-proof.test.ts tests/recovery-request-observer.test.ts tests/compaction-continuation-backport.test.ts tests/native-passthrough.test.ts tests/launcher-helper-client.test.ts tests/launcher-browser-host.test.ts tests/prompt-contract.test.ts tests/environment.test.ts tests/codex-interrupt-hook.test.ts",
     "audit": "bun audit",
     "check-version": "bun run scripts/check-version.ts",
     "typecheck": "bun x tsc --noEmit",

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
@@ -253,6 +253,17 @@ test("an abort dispatched during run submission cannot overtake the run frame", 
 
   expect(messages).toEqual(["run", "abort"]);
   expect(released).toBe(false);
+});
+
+test("helper cancellation asks the launcher to stop the exact surface before preserving steering", () => {
+  const source = readFileSync(new URL("../src/adapters/chatgpt-web/launcher-helper-client.ts", import.meta.url), "utf8");
+  const abortStart = source.indexOf("const abortListener = () => {");
+  const abortEnd = source.indexOf("pending.abortListener = abortListener", abortStart);
+  const block = source.slice(abortStart, abortEnd);
+  expect(block).toContain('phase: "stop"');
+  expect(block).toContain("turn.abortSignal?.reason instanceof ChatGptTurnSupersededError");
+  expect(block).toContain("preserveConversation = preserveRequested && stop.stopped === true");
+  expect(block.indexOf('phase: "stop"')).toBeLessThan(block.indexOf('type: "abort"'));
 });
 
 test("structured helper errors preserve the ChatGPT adapter failure contract", async () => {

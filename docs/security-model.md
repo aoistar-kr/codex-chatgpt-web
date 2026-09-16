@@ -70,7 +70,7 @@ port. Run on a trusted single-user account and treat local code execution as ins
 boundary.
 
 The lifecycle endpoints are separate from the Responses surface. `/admin/drain`, `/admin/resume`,
-`/admin/cancel-turn`, `/admin/cancel-turns`, and `/admin/shutdown` require a random bearer token stored in the
+`/admin/cancel-turn`, `/admin/interrupt-turn`, `/admin/cancel-turns`, and `/admin/shutdown` require a random bearer token stored in the
 user-only application config. The launcher uses them to reject new work, prove that both the HTTP
 request and long-lived browser/tool loop are idle, flush response state, and stop a process. The
 token does not turn loopback into a hostile-local-process security boundary; it prevents accidental
@@ -103,6 +103,13 @@ bounded local continuation cache is private, expires, and exists only to impleme
 one-shot MCP control capability in the exact retained source chat. If that chat no longer exists, a
 fresh tool-free Temporary Chat receives the canonical Codex history; the bridge never parses ordinary
 assistant prose as a structured handoff.
+
+Mid-turn steering is narrower than generic conversation reuse. It is accepted only for a newer
+instruction revision with the same authenticated native thread and turn identity. Before reusing the
+browser document, the launcher must positively acknowledge that it clicked the active ChatGPT Stop
+control; only then may the helper retain the surface and submit a continuation delta. The original
+prompt is never resubmitted into that live conversation. A user Interrupt does not set the retention
+flag, so the exact browser turn is stopped and released rather than resurrected by later cleanup.
 
 ## Network exposure
 

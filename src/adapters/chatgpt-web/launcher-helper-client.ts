@@ -4,7 +4,7 @@ import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 import type { CodexOutputTextAnnotation } from "../../types";
-import { ChatGptWebAdapterError } from "./adapter-error";
+import { ChatGptTurnSupersededError, ChatGptWebAdapterError } from "./adapter-error";
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
 import {
@@ -268,7 +268,34 @@ export class LauncherBrowserHelperClient {
               );
               return;
             }
-            void this.send({ type: "abort", id: turn.traceId }).catch(error => {
+            const preserveRequested = turn.abortSignal?.reason instanceof ChatGptTurnSupersededError;
+            // Stop is a launcher-owned control action, not a side effect of observing AbortSignal in
+            // the Playwright loop. This reaches the exact Electron surface even while the helper is
+            // blocked in a DOM/network await. For steering we preserve the conversation only after
+            // that stop was positively acknowledged; otherwise the old fail-closed fresh-turn path
+            // remains authoritative and no prompt is replayed into an uncertain live conversation.
+            void (async () => {
+              let preserveConversation = false;
+              try {
+                const helperPid = this.child?.pid;
+                if (!helperPid) throw new Error("Launcher browser helper pid is unavailable during turn stop");
+                const stop = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
+                  phase: "stop",
+                  traceId: turn.traceId,
+                  helperPid,
+                });
+                preserveConversation = preserveRequested && stop.stopped === true;
+              } catch (error) {
+                console.warn(
+                  `[chatgpt-web] launcher stop command failed for ${turn.traceId}: ${error instanceof Error ? error.message : String(error)}`,
+                );
+              }
+              await this.send({
+                type: "abort",
+                id: turn.traceId,
+                ...(preserveConversation ? { preserveConversation: true } : {}),
+              });
+            })().catch(error => {
               this.finishWithError(
                 turn.traceId,
                 error instanceof Error ? error : new Error(String(error)),

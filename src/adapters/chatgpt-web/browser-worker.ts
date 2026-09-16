@@ -1203,6 +1203,8 @@ export interface BrowserTurn {
   /** Select the Codex Native connector without advertising the ordinary turn tool environment. */
   nativeConnector?: boolean;
   retainConversation?: boolean;
+  /** Dynamic steering preemption may preserve this exact Temporary Chat after an aborted run. */
+  retainConversationOnAbort?: () => boolean;
   requireRetainedConversation?: boolean;
   conversationKey?: string;
   onPreparedSelected?: (reused: boolean) => void | Promise<void>;
@@ -1714,13 +1716,18 @@ export class ChatGptVisibleTraceTracker {
       if (!candidate || candidate.text !== text) {
         candidate = { text, changedAt: now };
         this.traceCandidates.set(slot, candidate);
-        if (!completionActionVisible && this.traceStabilityMs > 0) continue;
+        // An anchored status row with a following rendered sibling is already structurally closed:
+        // ChatGPT has moved on to the next work/tool item. Emit it immediately so a short-lived row
+        // does not vanish during the generic 250ms live-status debounce.
+        const structurallyCompleteStatus = block.kind === "status" && block.complete === true;
+        if (!completionActionVisible && this.traceStabilityMs > 0 && !structurallyCompleteStatus) continue;
       }
       // A commentary Markdown root remains mutable until ChatGPT appends the next reasoning item.
       // Emitting it earlier lets a tool-status boundary split one semantic paragraph into multiple
       // Codex messages. The next anchored item (or final completion evidence) is the stable boundary.
       if (block.kind === "commentary" && block.complete === false && !completionActionVisible) continue;
-      if (!completionActionVisible && now - candidate.changedAt < this.traceStabilityMs) continue;
+      const structurallyCompleteStatus = block.kind === "status" && block.complete === true;
+      if (!completionActionVisible && !structurallyCompleteStatus && now - candidate.changedAt < this.traceStabilityMs) continue;
 
       const previous = this.emittedTrace.get(slot);
       if (previous === text) continue;
@@ -4242,6 +4249,10 @@ export class ChatGptBrowserWorker {
       const traceText = (candidate: HTMLElement): string => {
         const ariaLabel = candidate.getAttribute("aria-label")?.trim();
         if (ariaLabel) return ariaLabel;
+        const descendantAriaLabel = [...candidate.querySelectorAll<HTMLElement>("[aria-label]")]
+          .map(element => element.getAttribute("aria-label")?.replace(/\s+/g, " ").trim() ?? "")
+          .find(Boolean);
+        if (descendantAriaLabel) return descendantAriaLabel;
         // Animated ChatGPT action counters visually split a phrase around the changing number, so
         // `innerText` can become `Searching websites\n3`. The button's screen-reader label already
         // carries the stable semantic phrase (`Searching 3 websites`) without enclosing unrelated
@@ -4255,6 +4266,8 @@ export class ChatGptBrowserWorker {
         const statusContainer = candidate.closest<HTMLElement>("[data-streaming-response-status]");
         const itemAnchor = candidate.closest<HTMLElement>("[data-item-anchor]");
         if (!statusContainer || !itemAnchor) return undefined;
+        const anchorIdentity = itemAnchor.getAttribute("data-item-anchor")?.trim();
+        if (anchorIdentity) return `${kind}:anchor:${anchorIdentity}`;
         const anchorIndex = [...statusContainer.querySelectorAll<HTMLElement>("[data-item-anchor]")]
           .indexOf(itemAnchor);
         return anchorIndex >= 0 ? `${kind}:anchor:${anchorIndex}` : undefined;
@@ -4287,6 +4300,14 @@ export class ChatGptBrowserWorker {
           candidates.set(semantic, "status");
         }
       });
+      // Current ChatGPT work/tool rows can be bare item anchors with no button/role/testid on the
+      // owned element itself. Enumerate them explicitly so short-lived visible progress is not
+      // silently absent from the Codex Working timeline.
+      root.querySelectorAll<HTMLElement>("[data-streaming-response-status] [data-item-anchor]").forEach(candidate => {
+        if (completionActionSet.has(candidate)) return;
+        if (overlapsRenderedAnswer(candidate) || overlapsCommentary(candidate)) return;
+        if (!candidates.has(candidate)) candidates.set(candidate, "status");
+      });
       root.querySelectorAll<HTMLElement>("[data-streaming-response-status]").forEach(container => {
         if (!overlapsRenderedAnswer(container)
           && !overlapsCommentary(container)
@@ -4304,12 +4325,18 @@ export class ChatGptBrowserWorker {
           kind,
           text: traceText(candidate),
           key: traceKey(candidate, kind),
-          ...(kind === "commentary" ? { complete: hasFollowingRenderedSibling(candidate) } : {}),
+          ...((kind === "commentary" || candidate.closest("[data-item-anchor]"))
+            ? { complete: hasFollowingRenderedSibling(candidate) }
+            : {}),
           // Footer controls such as the model picker and overflow menu are siblings of the final
           // Markdown inside the assistant turn. They are UI, not model trace. Real action buttons
           // are scoped by ChatGPT's streaming-status container.
           uiControl: candidate.matches("button")
-            && candidate.closest("[data-streaming-response-status]") === null,
+            && candidate.closest("[data-streaming-response-status]") === null
+            && candidate.closest("[data-item-anchor]") === null
+            && candidate.closest('[data-testid^="cot"], [data-testid*="reason"], [data-testid*="thought"]') === null
+            && candidate.getAttribute("role") !== "status"
+            && candidate.getAttribute("aria-busy") !== "true",
         }))
         .filter(block => block.text.length > 0)
         .forEach((block, index) => {
@@ -4319,7 +4346,7 @@ export class ChatGptBrowserWorker {
         });
       const traceBlocks = [...traceByKey.values()].map((block, index, blocks) => ({
         ...block,
-        ...(block.kind === "commentary" ? {
+        ...((block.kind === "commentary" || (block.kind === "status" && block.complete !== undefined)) ? {
           complete: block.complete === true || index < blocks.length - 1,
         } : {}),
       }));
@@ -4588,14 +4615,15 @@ export class ChatGptBrowserWorker {
     } finally {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       try {
+        const retainAfterAbort = terminal === "aborted" && turn.retainConversationOnAbort?.() === true;
         const release = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
           phase: "end",
           traceId: turn.traceId,
           helperPid: process.pid,
           status: terminal,
           ...(terminalMessage ? { message: terminalMessage } : {}),
-          ...(terminal === "completed" && turn.retainConversation ? { retain: true } : {}),
-          ...(terminal === "completed" && (turn.nativeConnector || turn.capabilities.localToolsEnabled)
+          ...((terminal === "completed" && turn.retainConversation) || retainAfterAbort ? { retain: true } : {}),
+          ...((terminal === "completed" || retainAfterAbort) && (turn.nativeConnector || turn.capabilities.localToolsEnabled)
             ? { connectorBound: true }
             : {}),
         });

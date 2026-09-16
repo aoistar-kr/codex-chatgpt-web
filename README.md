@@ -54,6 +54,10 @@ connects ChatGPT back to the tools of that same Codex task until its next compac
   context lifecycle, streaming, tracing, and tool presentation stay intact.
 - **The full Codex harness over MCP.** Full mode gives every effort exposed by the signed-in account,
   including Pro, the active task's filesystem, shell, images, approvals, and configured tools/apps.
+- **Live turn control stays native.** Public ChatGPT work/status rows stream into Codex's Working
+  timeline, same-turn Codex steering stops the superseded response and continues in the same
+  Temporary Chat when that surface is proven retained, and Codex Interrupt explicitly stops the
+  launcher-owned ChatGPT generation before teardown.
 - **Continuous task sessions and native compaction.** Sequential messages reuse one task-bound
   Temporary Chat. At the context boundary, the retained agent writes the checkpoint before Codex
   starts a clean chat; if that chat was closed, canonical Codex history supplies the fallback.

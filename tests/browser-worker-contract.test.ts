@@ -2725,6 +2725,29 @@ test("completed-turn evidence flushes a short-lived reasoning label immediately"
   ]);
 });
 
+test("a structurally completed anchored work row bypasses the live-status debounce", () => {
+  const tracker = new ChatGptVisibleTraceTracker(10_000);
+  expect(tracker.observe([
+    { kind: "status", text: "Searched local files", key: "status:anchor:search-1", complete: true },
+    { kind: "status", text: "Waiting for tool session", key: "status:anchor:wait-2", complete: false },
+  ], false, 1_000)).toEqual([
+    { kind: "reasoning", text: "Searched local files" },
+  ]);
+});
+
+test("Codex cancellation has a launcher-owned direct stop path before helper teardown", () => {
+  const client = readFileSync(new URL("../src/adapters/chatgpt-web/launcher-helper-client.ts", import.meta.url), "utf8");
+  const control = readFileSync(new URL("../launcher/electron/control-server.cjs", import.meta.url), "utf8");
+  const host = readFileSync(new URL("../launcher/electron/browser-host.cjs", import.meta.url), "utf8");
+  expect(client).toContain('phase: "stop"');
+  expect(client).toContain("preserveConversation = preserveRequested && stop.stopped === true");
+  expect(control).toContain('request.url === "/v1/turn/stop"');
+  expect(control).toContain("host.stopTurnGeneration(body.traceId, body.helperPid)");
+  expect(host).toContain("async stopTurnGeneration(traceId, helperPid)");
+  expect(host).toContain(`querySelectorAll('[data-testid="stop-button"]')`);
+  expect(host).toContain("button.click()");
+});
+
 test("a structurally completed trailing Pro commentary does not wait for another parsed trace block", () => {
   const tracker = new ChatGptVisibleTraceTracker(100);
   const commentary = [{
@@ -2777,6 +2800,9 @@ test("response DOM separates streaming commentary from the final Markdown answer
   expect(workerSource).toContain("candidate.compareDocumentPosition(firstStatusContainer)");
   expect(workerSource).toContain("const renderedRoots = classified.answerRoots;");
   expect(workerSource).toContain("markdownRoots.filter(candidate => !commentary.includes(candidate))");
+  expect(workerSource).toContain('root.querySelectorAll<HTMLElement>("[data-streaming-response-status] [data-item-anchor]")');
+  expect(workerSource).toContain('itemAnchor.getAttribute("data-item-anchor")?.trim()');
+  expect(workerSource).toContain('candidate.querySelectorAll<HTMLElement>("[aria-label]")');
   expect(workerSource).toContain('fullHtml: renderedRoots.map(candidate => candidate.innerHTML).join("")');
   expect(workerSource).toContain("const flattenedMarkdownSegments:");
   expect(workerSource).toContain("Root boundaries and visible indices therefore are not identity");

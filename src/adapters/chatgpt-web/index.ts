@@ -2,12 +2,12 @@ import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { defaultBrokerEndpoint, expandUserPath, resolveBrokerEndpoint } from "../../config";
 import { releaseLauncherRetainedConversation } from "../../launcher-browser-host";
-import { namespacedToolName, type AdapterEvent, type CodexContentPart, type CodexOutputTextAnnotation, type CodexParsedRequest, type CodexProviderConfig, type CodexToolResultMessage, type CodexUsage } from "../../types";
+import { namespacedToolName, type AdapterEvent, type CodexContentPart, type CodexOutputTextAnnotation, type CodexParsedRequest, type CodexProviderConfig, type CodexToolResultMessage, type CodexUsage, type CodexUserMessage } from "../../types";
 import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import { ChatGptBrowserWorker } from "./browser-worker";
-import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "./environment";
+import { chatGptTurnUserRevisionHistory, extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "./environment";
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
 import { createChatGptStructuredOutputValidator } from "./output-validation";
@@ -260,6 +260,68 @@ function currentToolResults(parsed: CodexParsedRequest, session: ChatGptTurnSess
   return [...byId.values()];
 }
 
+function steeringRevisionContent(value: unknown): string | CodexContentPart[] {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) throw new Error("ChatGPT steering revision has unsupported user content");
+  const parts: CodexContentPart[] = [];
+  for (const candidate of value) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      throw new Error("ChatGPT steering revision contains an invalid content block");
+    }
+    const block = candidate as Record<string, unknown>;
+    if ((block.type === "input_text" || block.type === "text") && typeof block.text === "string") {
+      parts.push({ type: "text", text: block.text });
+      continue;
+    }
+    if (block.type === "input_image" && typeof block.image_url === "string" && block.image_url) {
+      parts.push({
+        type: "image",
+        imageUrl: block.image_url,
+        ...(typeof block.detail === "string" ? { detail: block.detail } : {}),
+      });
+      continue;
+    }
+    if (block.type === "input_file") {
+      const ref = typeof block.file_id === "string"
+        ? block.file_id
+        : typeof block.filename === "string" ? block.filename : "?";
+      parts.push({ type: "text", text: `[file: ${ref}]` });
+      continue;
+    }
+    throw new Error(`ChatGPT steering revision contains unsupported content type: ${String(block.type)}`);
+  }
+  if (parts.length === 1 && parts[0]?.type === "text") return parts[0].text;
+  return parts;
+}
+
+/**
+ * Build the suffix submitted only when the launcher proves it reused the superseded Temporary Chat.
+ * The original prompt/system history is already present in that conversation and must not be
+ * replayed. Matching outer tool results are retained as fresh evidence before the newest user
+ * revision so stop-and-steer keeps the canonical Codex ordering.
+ */
+function retainedSteeringResumeRequest(
+  parsed: CodexParsedRequest,
+  source: ChatGptTurnSession,
+): CodexParsedRequest {
+  const revision = chatGptTurnUserRevisionHistory(parsed).at(-1);
+  if (!revision) throw new Error("ChatGPT steering requires a latest canonical user revision");
+  const user: CodexUserMessage = {
+    role: "user",
+    content: steeringRevisionContent(revision.content),
+    timestamp: Date.now(),
+  };
+  const results = currentToolResults(parsed, source);
+  return {
+    ...parsed,
+    context: {
+      ...parsed.context,
+      systemPrompt: [],
+      messages: [...results, user],
+    },
+  };
+}
+
 function validateBatchTools(parsed: CodexParsedRequest, requests: BrokerToolRequest[]): void {
   const available = new Set((parsed.context.tools ?? []).map(tool => namespacedToolName(tool.namespace, tool.name)));
   for (const request of requests) {
@@ -315,6 +377,7 @@ export function createChatGptWebAdapter(
     environment: ReturnType<typeof extractChatGptTurnEnvironment> | undefined,
     traceId: string,
     turnCapabilities: ChatGptWebCapabilities,
+    steeringSource?: ChatGptTurnSession,
   ): ChatGptTurnRuntime => {
     const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities);
     const identity = extractChatGptTurnIdentity(parsed);
@@ -326,25 +389,28 @@ export function createChatGptWebAdapter(
       : { parsed, applied: false };
     const conversationKey = !parsed._compactionRequest
       && parsed.modelId !== CHATGPT_WEB_LUNA_MODEL_ID
-      && mode.localTools
       && retainedLauncherDescriptor
       ? chatGptConversationKey(checkpointInput.parsed, executionNamespace)
       : undefined;
-    const resumeInput = conversationKey
-      ? retainedConversationResumeRequest(checkpointInput.parsed)
+    const steeringResumeInput = steeringSource && conversationKey
+      ? retainedSteeringResumeRequest(checkpointInput.parsed, steeringSource)
       : undefined;
-    const retainConversation = conversationKey !== undefined;
-    const releaseRetainedConversation = conversationKey && retainedLauncherDescriptor
+    const resumeInput = steeringResumeInput ?? (conversationKey && mode.localTools
+      ? retainedConversationResumeRequest(checkpointInput.parsed)
+      : undefined);
+    const retainConversation = conversationKey !== undefined && mode.localTools;
+    const releaseRetainedConversation = conversationKey && mode.localTools && retainedLauncherDescriptor
       ? async () => {
         await releaseLauncherRetainedConversation(retainedLauncherDescriptor, conversationKey);
       }
       : undefined;
-    const compileOptionsFor = (input: CodexParsedRequest) => {
+    const compileOptionsFor = (input: CodexParsedRequest, retainedSteering = false) => {
       const experimentalMultipartParts = experimentalBiggerContext
         ? resolveBiggerContextMultipartParts(input, turnCapabilities)
         : undefined;
       return {
         captureLunaCheckpoint,
+        ...(retainedSteering ? { retainedContinuation: "steering" as const } : {}),
         ...(experimentalMultipartParts !== undefined
           ? { experimentalMultipartParts }
           : {}),
@@ -401,6 +467,18 @@ export function createChatGptWebAdapter(
           ),
           release: () => {},
         }),
+        ...(steeringResumeInput ? {
+          prepareResume: async () => ({
+            ...compileChatGptWebPrompt(
+              steeringResumeInput,
+              turnCapabilities,
+              undefined,
+              compileOptionsFor(steeringResumeInput, true),
+            ),
+            release: () => {},
+          }),
+        } : {}),
+        ...(conversationKey ? { conversationKey } : {}),
         abortSignal: browserAbort.signal,
         ...(parsed._compactionRequest ? { compaction: true } : {}),
         ...submissionLifecycle,
@@ -421,6 +499,7 @@ export function createChatGptWebAdapter(
         text,
         outputAnnotations: readOutputAnnotations,
         usageInput: checkpointInput.parsed,
+        ...(conversationKey ? { conversationKey } : {}),
         submission,
         cancel: browserTurn.cancel,
       };
@@ -430,7 +509,7 @@ export function createChatGptWebAdapter(
     const externalProgress = new ChatGptExternalTurnProgress();
     let tokenSettled = false;
     let activeToken: string | undefined;
-    const prepareWith = async (input: CodexParsedRequest) => {
+    const prepareWith = async (input: CodexParsedRequest, retainedSteering = false) => {
       const turnToken = activeToken ?? await broker.register(
         environment,
         timeoutMs === undefined ? undefined : timeoutMs + 60_000,
@@ -446,7 +525,7 @@ export function createChatGptWebAdapter(
           input,
           turnCapabilities,
           turnToken,
-          compileOptionsFor(input),
+          compileOptionsFor(input, retainedSteering),
         );
         return { ...compiled, release: () => {} };
       } catch (error) {
@@ -461,8 +540,9 @@ export function createChatGptWebAdapter(
       reasoning: parsed.options.reasoning,
       capabilities: turnCapabilities,
       prepare: () => prepareWith(checkpointInput.parsed),
-      ...(resumeInput ? { prepareResume: () => prepareWith(resumeInput) } : {}),
-      ...(retainConversation ? { retainConversation: true, conversationKey } : {}),
+      ...(resumeInput ? { prepareResume: () => prepareWith(resumeInput, steeringResumeInput !== undefined) } : {}),
+      ...(retainConversation ? { retainConversation: true } : {}),
+      ...(conversationKey ? { conversationKey } : {}),
       abortSignal: browserAbort.signal,
       ...(parsed._compactionRequest ? { compaction: true } : {}),
       ...submissionLifecycle,
@@ -760,15 +840,17 @@ export function createChatGptWebAdapter(
         const ownerKey = `${executionNamespace}:${chatGptThreadOwnershipKey(parsed)}`;
         const traceId = createHash("sha256").update(executionKey).digest("hex").slice(0, 12);
         const nativeIdentity = extractChatGptTurnIdentity(parsed);
+        let steeringSource: ChatGptTurnSession | undefined;
         const session = await chatGptTurnSessions.getOrCreateAfterOwnerRetirement(
           executionKey,
           ownerKey,
-          () => startRuntime(parsed, environment, traceId, turnCapabilities),
+          () => startRuntime(parsed, environment, traceId, turnCapabilities, steeringSource),
           traceId,
           incoming.abortSignal,
           nativeIdentity.turnId,
           nativeIdentity.threadId,
           chatGptInstructionLineage(parsed),
+          source => { steeringSource = source; },
         );
         const roundKey = chatGptTurnRoundKey(parsed);
         const emitRoundEvents = (events: readonly AdapterEvent[]): void => {

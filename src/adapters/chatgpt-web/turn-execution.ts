@@ -577,7 +577,12 @@ export class ChatGptTurnSessions {
     const session = new ChatGptTurnSession(start(), traceId, ownerKey, nativeTurnId, nativeThreadId, instruction);
     this.entries.set(key, session);
     const conversationKey = session.conversationKey();
-    if (conversationKey) this.conversationHeads.set(conversationKey, session);
+    // Only conversations deliberately retained after normal completion are durable heads. Read-only
+    // turns may still carry a conversation key while active so steering can preserve/reuse their
+    // exact Temporary Chat, but a normally completed read-only surface is released by the launcher.
+    if (conversationKey && session.runtime.releaseRetainedConversation) {
+      this.conversationHeads.set(conversationKey, session);
+    }
     return session;
   }
 
@@ -590,6 +595,7 @@ export class ChatGptTurnSessions {
     nativeTurnId?: string,
     nativeThreadId?: string,
     instruction?: ChatGptInstructionLineage,
+    onSteeringSource?: (session: ChatGptTurnSession) => void,
   ): Promise<ChatGptTurnSession> {
     for (;;) {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
@@ -609,15 +615,24 @@ export class ChatGptTurnSessions {
       ));
       if (activeOwner) {
         const [ownedKey, ownedSession] = activeOwner;
-        if (ownedSession.isActive() && instruction && ownedSession.instruction
+        const sameNativeTurn = nativeThreadId !== undefined
+          && nativeTurnId !== undefined
+          && ownedSession.nativeThreadId === nativeThreadId
+          && ownedSession.nativeTurnId === nativeTurnId;
+        if (ownedSession.isActive() && sameNativeTurn && instruction && ownedSession.instruction
           && instruction.current !== ownedSession.instruction) {
           if (!instruction.predecessors.has(ownedSession.instruction)) throw chatGptTurnSupersededError();
-          // Native steering can return the old tool result and a new instruction in one request.
-          // Waiting for the old browser here deadlocks before that result can be consumed. Retire
-          // its capability and rebuild from the complete canonical history, including that result.
-          // Keep the old entry terminal so a delayed replay cannot restart superseded work.
+          // Native steering appends a new user revision inside the SAME native Codex turn. Stop the
+          // superseded browser response and, only when it had already been accepted on a launcher
+          // conversation, offer that exact Temporary Chat to the successor. The successor decides
+          // from the launcher's reuse acknowledgement whether to send a steering-only delta or to
+          // fall back to a fresh full-context turn; the old prompt is never resubmitted into an
+          // uncertain live conversation.
           const reason = chatGptTurnSupersededError();
           ownedSession.supersededError = reason;
+          if (ownedSession.conversationKey() && ownedSession.runtime.submission?.phase === "accepted") {
+            onSteeringSource?.(ownedSession);
+          }
           this.forgetConversationHead(ownedSession);
           await awaitWithAbort(this.beginRetirement(ownedKey, ownedSession, reason), signal);
           continue;

@@ -2494,6 +2494,19 @@ test("a hot Temporary Chat surface is leased for a fresh turn without creating a
   );
 });
 
+test("active-turn stop is executed by the launcher surface and steering aborts can remain retained", () => {
+  const source = fs.readFileSync(
+    resolve(__dirname, "../electron/browser-host.cjs"),
+    "utf8",
+  );
+  assert.match(source, /async stopTurnGeneration\(traceId, helperPid\)/);
+  assert.match(source, /querySelectorAll\('\[data-testid="stop-button"\]'\)/);
+  assert.match(source, /button\.click\(\)/);
+  assert.match(source, /status === "completed" \|\| status === "aborted"/);
+  assert.match(source, /Steering update pending/);
+  assert.match(source, /!cancelledByUser/);
+});
+
 test("the UI A/B baseline switch disables only the active-turn hot replacement overlap", () => {
   const overlapRequests = [];
   const logEvents = [];

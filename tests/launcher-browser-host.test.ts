@@ -117,6 +117,8 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
     response.writeHead(200, { "content-type": "application/json" });
     response.end(request.url === "/v1/turn/start"
       ? '{"ok":true,"surfaceId":"launcher_surface_id_0123456789AB","reused":true,"connectorBound":true}\n'
+      : request.url === "/v1/turn/stop"
+        ? '{"ok":true,"stopped":true}\n'
       : request.url === "/v1/turn/end"
         ? '{"ok":true,"cancelledByUser":false}\n'
         : '{"ok":true}\n');
@@ -161,6 +163,16 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
       traceId: "abc123def456",
       helperPid: process.pid,
       refreshViewport: true,
+    });
+    await expect(notifyLauncherTurn(path, {
+      phase: "stop",
+      traceId: "abc123def456",
+      helperPid: process.pid,
+    })).resolves.toEqual({ stopped: true });
+    expect(received.body).toEqual({
+      phase: "stop",
+      traceId: "abc123def456",
+      helperPid: process.pid,
     });
     await expect(notifyLauncherTurn(path, {
       phase: "end",

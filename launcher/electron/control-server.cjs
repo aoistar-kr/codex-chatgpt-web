@@ -93,6 +93,7 @@ class BrowserControlServer {
     }
     const isTurn = request.url === "/v1/turn/start"
       || request.url === "/v1/turn/heartbeat"
+      || request.url === "/v1/turn/stop"
       || request.url === "/v1/turn/end";
     const isTurnRelease = request.url === "/v1/turn/release";
     const isSessionInspect = request.url === "/v1/session/inspect";
@@ -195,6 +196,11 @@ class BrowserControlServer {
         host.heartbeatTurn(body.traceId, body.helperPid, body.refreshViewport === true);
         this.logger.debug?.("browser.turn_heartbeat", { traceId: body.traceId });
         writeJson(response, 200, { ok: true });
+        return;
+      } else if (request.url === "/v1/turn/stop") {
+        const stopped = await host.stopTurnGeneration(body.traceId, body.helperPid);
+        this.logger.info("browser.turn_stop_requested", { traceId: body.traceId, stopped });
+        writeJson(response, 200, { ok: true, stopped });
         return;
       } else {
         if (!['completed', 'failed', 'aborted'].includes(body.status)) throw new Error("turn status is invalid");

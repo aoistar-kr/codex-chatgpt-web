@@ -76,7 +76,7 @@ type InputMessage = RunMessage
   | { type: "completion_fence_begin_ack"; id: string; requestId: number; revision: number | null }
   | { type: "completion_fence_commit_ack"; id: string; requestId: number; committed: boolean }
   | { type: "progress"; id: string; snapshot: ChatGptExternalTurnProgressSnapshot }
-  | { type: "abort"; id: string }
+  | { type: "abort"; id: string; preserveConversation?: boolean }
   | { type: "shutdown" };
 
 let outputFailure: Error | undefined;
@@ -98,6 +98,7 @@ console.warn = diagnostic;
 console.error = diagnostic;
 
 const abortControllers = new Map<string, AbortController>();
+const retainConversationAfterAbort = new Set<string>();
 const turnProgress = new Map<string, ChatGptMirroredTurnProgress>();
 const preparedSelections = new Map<string, ReturnType<typeof createBrowserHelperPromptSelection>>();
 const sendActivationWaiters = new Map<string, {
@@ -226,6 +227,7 @@ async function run(message: RunMessage): Promise<void> {
     prepare: prepareSelected,
     ...(message.turn.resumeAvailable ? { prepareResume: prepareSelected } : {}),
     ...(message.turn.retainConversation ? { retainConversation: true } : {}),
+    retainConversationOnAbort: () => retainConversationAfterAbort.has(message.id),
     ...(message.turn.requireRetainedConversation ? { requireRetainedConversation: true } : {}),
     ...(message.turn.conversationKey ? { conversationKey: message.turn.conversationKey } : {}),
     abortSignal: abortController.signal,
@@ -340,6 +342,7 @@ async function run(message: RunMessage): Promise<void> {
     completionFenceCommitWaiters.delete(message.id);
     commitWaiter?.reject(new DOMException("Browser helper turn ended before completion-fence commit", "AbortError"));
     abortControllers.delete(message.id);
+    retainConversationAfterAbort.delete(message.id);
     turnProgress.delete(message.id);
   }
 }
@@ -486,6 +489,12 @@ input.on("line", line => {
       );
     }
   } else if (message.type === "abort") {
+    if (message.preserveConversation !== undefined && typeof message.preserveConversation !== "boolean") {
+      writeProtocol({ type: "error", id: message.id, message: "Browser helper abort retention flag is invalid" });
+      return;
+    }
+    if (!abortControllers.has(message.id)) return;
+    if (message.preserveConversation === true) retainConversationAfterAbort.add(message.id);
     abortControllers.get(message.id)?.abort();
     preparedSelections.get(message.id)?.cancel();
     const waiter = sendActivationWaiters.get(message.id);

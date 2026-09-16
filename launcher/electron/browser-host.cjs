@@ -1252,6 +1252,41 @@ class BrowserHost {
     return this.snapshot();
   }
 
+  async stopTurnGeneration(traceId, helperPid) {
+    const tab = [...this.turnTabs.values()].find(candidate => candidate.traceId === traceId);
+    if (!tab) {
+      const closedOwner = this.closedTurnOwners.get(traceId);
+      if (closedOwner === helperPid) return false;
+      throw new Error(`Browser turn ownership mismatch: no browser tab owns ${traceId}`);
+    }
+    if (tab.helperPid !== helperPid) {
+      throw new Error(`Browser helper ownership mismatch: expected ${tab.helperPid}, received ${helperPid}`);
+    }
+    if (tab.status !== "running") return false;
+    const contents = tab.view.webContents;
+    if (contents.isDestroyed()) return false;
+    // This host-side command is independent of the Playwright helper's current await. Codex
+    // interrupt/steering must therefore be able to stop ChatGPT even when the helper is blocked in
+    // a DOM/network wait and would never reach its local AbortSignal polling branch.
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const stopped = await contents.executeJavaScript(`(() => {
+        const candidates = [...document.querySelectorAll('[data-testid="stop-button"]')];
+        const button = candidates.reverse().find(candidate => {
+          if (!(candidate instanceof HTMLElement) || !candidate.isConnected) return false;
+          const style = getComputedStyle(candidate);
+          return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+        });
+        if (!button) return false;
+        button.click();
+        return true;
+      })()`, true).catch(() => false);
+      if (stopped === true) return true;
+      if (tab.status !== "running" || contents.isDestroyed()) return false;
+      await sleep(50);
+    }
+    return false;
+  }
+
   refreshTurnLeases(reason, now = Date.now()) {
     const refreshed = refreshTurnLeasesAfterSuspension(
       [...this.turnTabs.values()],
@@ -1910,22 +1945,26 @@ class BrowserHost {
       );
     }
     const cancelledByUser = this.userCancelledTurnOwners.get(traceId) === helperPid;
-    tab.status = status === "completed" ? "ready" : status === "aborted" ? "aborted" : "error";
+    const retainTerminal = retain === true
+      && !cancelledByUser
+      && Boolean(tab.conversationKey)
+      && (!tab.connectorIdentity || connectorBound)
+      && (status === "completed" || status === "aborted");
+    tab.status = retainTerminal ? "ready" : status === "completed" ? "ready" : status === "aborted" ? "aborted" : "error";
     this.syncPowerSaveBlocker();
-    tab.message = status === "completed" ? "Task completed" : message || `ChatGPT turn ${status}`;
+    tab.message = retainTerminal && status === "aborted"
+      ? "Steering update pending"
+      : status === "completed" ? "Task completed" : message || `ChatGPT turn ${status}`;
     tab.loading = false;
     if (!tab.view.webContents.isDestroyed()) tab.view.webContents.setBackgroundThrottling(true);
     if (status === "completed") {
       this.logger.info("browser.tab_completed", { tabId: tab.id, traceId });
     }
-    if (status === "completed"
-      && retain
-      && tab.conversationKey
-      && (!tab.connectorIdentity || connectorBound)) {
+    if (retainTerminal) {
       tab.connectorBound = connectorBound === true;
       tab.lastHeartbeatAt = Date.now();
       if (hideAfterTurn && !this.activeTraceId) this.hide();
-      this.logger.info("browser.tab_retained", { tabId: tab.id, traceId });
+      this.logger.info("browser.tab_retained", { tabId: tab.id, traceId, status });
       this.publishState?.(this.snapshot());
       this.writeDescriptor();
       return { cancelledByUser };
