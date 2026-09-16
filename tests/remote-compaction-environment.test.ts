@@ -22,7 +22,9 @@ function compactRequest(options: {
 } = {}): CodexParsedRequest {
   const sourceTurnId = options.sourceTurnId ?? SOURCE_TURN_ID;
   const metadata = options.metadata ?? {
-    request_kind: "compaction",
+    // OpenCodex v2.56 preserves the original native turn metadata when it rewrites
+    // `/responses/compact` into an internal `/responses` + `compaction_trigger` request.
+    request_kind: "turn",
     thread_id: THREAD_ID,
     turn_id: COMPACT_TURN_ID,
     agent_name: "/root",
@@ -85,6 +87,20 @@ test("root remote compaction recovers cwd and authority from the exact canonical
   });
 });
 
+test("root remote compaction also accepts sparse metadata without request_kind", () => {
+  withRootRollout({}, (store, cwd) => {
+    expect(store.resolve(compactRequest({ metadata: {
+      thread_id: THREAD_ID,
+      turn_id: COMPACT_TURN_ID,
+      agent_name: "/root",
+    } }))).toMatchObject({
+      cwd,
+      roots: [cwd],
+      sandboxPolicy: { type: "dangerFullAccess" },
+    });
+  });
+});
+
 test("ordinary turns cannot use the sparse remote-compaction root identity", () => {
   withRootRollout({}, store => {
     expect(() => store.resolve(compactRequest({ compaction: false }))).toThrow("missing cwd");
@@ -94,7 +110,7 @@ test("ordinary turns cannot use the sparse remote-compaction root identity", () 
 test("remote compaction rejects child lineage instead of borrowing root rollout authority", () => {
   withRootRollout({}, store => {
     const request = compactRequest({ metadata: {
-      request_kind: "compaction",
+      request_kind: "turn",
       thread_id: THREAD_ID,
       turn_id: COMPACT_TURN_ID,
       parent_thread_id: "01a0a8e5-7777-7181-8447-6aca612627f5",

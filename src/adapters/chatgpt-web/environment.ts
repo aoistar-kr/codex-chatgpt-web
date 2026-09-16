@@ -939,7 +939,13 @@ export function extractChatGptRootCompactionRolloutIdentity(
 ): ChatGptRootCompactionRolloutIdentity | undefined {
   if (parsed._compactionRequest !== true) return undefined;
   const metadata = clientTurnMetadata(parsed);
-  if (!metadata || metadata.request_kind !== "compaction"
+  // `_compactionRequest` is derived from the actual `compaction_trigger` wire item and is the
+  // authoritative discriminator here. OpenCodex v2.56 intentionally preserves the caller's
+  // `x-codex-turn-metadata` while internally converting `/responses/compact` into a routed
+  // `/responses` compaction turn, so `request_kind` may still be `turn` (or be absent). Treating
+  // that descriptive field as authority would reject a real remote compaction before the exact
+  // rollout can re-authenticate cwd/sandbox/workspace state.
+  if (!metadata
     || metadata.parent_thread_id != null || metadata.subagent_kind != null
     || (metadata.agent_name != null && metadata.agent_name !== "/root")) return undefined;
 
