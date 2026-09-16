@@ -100,6 +100,9 @@ jobs:
             'changed=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
             Write-Host "$env:TAG requires validation/deployment (merge=$needsMerge)"
           }
+            # git merge-base --is-ancestor returns 1 when a merge is legitimately required.
+            # PowerShell preserves that handled native exit code, so finish this detection step explicitly.
+            exit 0
 
       - name: Merge upstream release without auto-resolution
         if: steps.detect.outputs.merge == 'true'
@@ -255,3 +258,4 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag "$marker" "$SHA"
           git push origin "refs/tags/${marker}"
+
