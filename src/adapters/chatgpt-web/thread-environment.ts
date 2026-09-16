@@ -7,6 +7,7 @@ import {
   extractChatGptTurnEnvironment,
   extractChatGptTurnIdentity,
   extractChatGptThreadSpawnLineage,
+  extractChatGptRootCompactionRolloutIdentity,
   extractChatGptRootThreadMetadata,
   extractChatGptContinuationEnvironmentClaim,
   extractChatGptCompactionSourceRevision,
@@ -194,7 +195,13 @@ export class ChatGptThreadEnvironmentStore {
       const historicalMessages = hasCurrentContext && lineage
         ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
       if (hasCurrentContext && !historicalMessages) throw error;
-      const nativeIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
+      // Remote /responses/compact can omit the ordinary turn's sandbox/workspace hints while
+      // retaining exact native thread/turn identity. For root compaction only, let the canonical
+      // Codex rollout supply those omitted authority fields. Ordinary turns and child turns keep
+      // the stricter metadata contract above.
+      const nativeIdentity = lineage
+        ?? extractChatGptRootThreadMetadata(parsed)
+        ?? extractChatGptRootCompactionRolloutIdentity(parsed);
       const compactionSourceTurnId = parsed._compactionRequest
         ? extractChatGptCompactionSourceRevision(parsed).turnId : undefined;
       if (nativeIdentity && identity.turnId) {

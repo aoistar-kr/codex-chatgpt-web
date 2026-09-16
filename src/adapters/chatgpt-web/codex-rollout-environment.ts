@@ -16,13 +16,14 @@ import { expandUserPath } from "../../config";
 import { findTopLevelAssignment } from "../../codex-integration-document";
 import type { CodexTool } from "../../types";
 import type {
+  ChatGptRootCompactionRolloutIdentity,
   ChatGptRootThreadMetadata,
   ChatGptThreadSpawnLineage,
   ChatGptTurnEnvironment,
   ChatGptUnattributedEnvironmentMessage,
 } from "./environment";
 
-type RolloutIdentity = ChatGptRootThreadMetadata | ChatGptThreadSpawnLineage;
+type RolloutIdentity = ChatGptRootThreadMetadata | ChatGptRootCompactionRolloutIdentity | ChatGptThreadSpawnLineage;
 
 const CODEX_ID_SOURCE = "[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
 const CODEX_ID = new RegExp(`^${CODEX_ID_SOURCE}$`, "i");
@@ -587,16 +588,18 @@ function validateMetadataConsistency(
   // Request sandbox/workspace fields are diagnostic only. They narrow a rollout-derived authority
   // here and never create or expand it.
   const owner = "parentThreadId" in lineage ? "subagent" : "thread";
-  if (lineage.sandboxType === "platform"
+  const claimedSandbox = lineage.sandboxType;
+  if (claimedSandbox !== undefined && (claimedSandbox === "platform"
     ? environment.sandboxPolicy.type === "dangerFullAccess"
-    : environment.sandboxPolicy.type !== lineage.sandboxType) {
+    : environment.sandboxPolicy.type !== claimedSandbox)) {
     throw new Error(`ChatGPT Web ${owner} sandbox metadata conflicts with its Codex rollout`);
   }
-  if (lineage.workspaceRoots.length > 0
-    && !lineage.workspaceRoots.some(root => contains(root, environment.cwd))) {
+  const claimedRoots = lineage.workspaceRoots ?? [];
+  if (claimedRoots.length > 0
+    && !claimedRoots.some(root => contains(root, environment.cwd))) {
     throw new Error(`ChatGPT Web ${owner} workspace metadata does not contain its Codex rollout cwd`);
   }
-  if (lineage.workspaceRoots.some(root => !environment.roots.some(rolloutRoot => (
+  if (claimedRoots.some(root => !environment.roots.some(rolloutRoot => (
     contains(rolloutRoot, root) || contains(root, rolloutRoot)
   )))) {
     throw new Error(`ChatGPT Web ${owner} workspace metadata conflicts with its Codex rollout roots`);

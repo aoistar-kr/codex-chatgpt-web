@@ -41,6 +41,20 @@ export interface ChatGptRootThreadMetadata {
   workspaceRoots: string[];
 }
 
+/**
+ * Root-thread identity carried by Codex remote compaction.
+ *
+ * Current Codex Desktop compact requests can keep the exact native thread/turn identity while
+ * omitting the ordinary turn's sandbox/workspace hints. Those omitted hints are not authority:
+ * the canonical local rollout remains authoritative for cwd, roots and permission policy. Any
+ * hints that are present stay narrowing claims and must still agree with that rollout.
+ */
+export interface ChatGptRootCompactionRolloutIdentity {
+  threadId: string;
+  sandboxType?: ChatGptSandboxPolicy["type"] | "platform";
+  workspaceRoots?: string[];
+}
+
 export interface ChatGptUnattributedEnvironmentMessage {
   id: string;
   content: unknown;
@@ -909,6 +923,45 @@ export function extractChatGptRootThreadMetadata(parsed: CodexParsedRequest): Ch
   const workspacePaths = workspaces ? Object.keys(workspaces) : [];
   if (!threadId || !sandboxType || workspacePaths.some(path => !isAbsolute(path))) return undefined;
   return { threadId, sandboxType, workspaceRoots: [...new Set(workspacePaths.map(path => resolve(path)))] };
+}
+
+/**
+ * Recover only the root identity needed to authenticate a remote-compaction rollout.
+ *
+ * Do not use this for ordinary turns: missing sandbox/workspace metadata there must continue to
+ * fail closed. A compaction request may omit those diagnostic claims, but it must still carry an
+ * exact native root thread + turn and must not claim child/subagent lineage. The rollout resolver
+ * then authenticates session_meta, the canonical file path and the exact turn_context before any
+ * filesystem authority is returned.
+ */
+export function extractChatGptRootCompactionRolloutIdentity(
+  parsed: CodexParsedRequest,
+): ChatGptRootCompactionRolloutIdentity | undefined {
+  if (parsed._compactionRequest !== true) return undefined;
+  const metadata = clientTurnMetadata(parsed);
+  if (!metadata || metadata.request_kind !== "compaction"
+    || metadata.parent_thread_id != null || metadata.subagent_kind != null
+    || (metadata.agent_name != null && metadata.agent_name !== "/root")) return undefined;
+
+  const threadId = typeof metadata.thread_id === "string" ? metadata.thread_id.trim() : "";
+  const turnId = typeof metadata.turn_id === "string" ? metadata.turn_id.trim() : "";
+  if (!threadId || !turnId) return undefined;
+
+  const rawSandbox = canonicalSandboxMetadata(metadata);
+  const sandboxType = rawSandbox === undefined ? undefined : sandboxTypeFromMetadata(rawSandbox);
+  if (rawSandbox !== undefined && !sandboxType) return undefined;
+
+  const rawWorkspaces = metadata.workspaces;
+  const workspaces = rawWorkspaces === undefined ? undefined : record(rawWorkspaces);
+  if (rawWorkspaces !== undefined && !workspaces) return undefined;
+  const workspacePaths = workspaces ? Object.keys(workspaces) : [];
+  if (workspacePaths.some(path => !isAbsolute(path))) return undefined;
+
+  return {
+    threadId,
+    ...(sandboxType ? { sandboxType } : {}),
+    ...(workspaces ? { workspaceRoots: [...new Set(workspacePaths.map(path => resolve(path)))] } : {}),
+  };
 }
 
 export function hasRawChatGptEnvironmentContext(parsed: CodexParsedRequest): boolean {
