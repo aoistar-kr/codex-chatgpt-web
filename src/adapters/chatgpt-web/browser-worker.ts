@@ -3763,7 +3763,10 @@ export class ChatGptBrowserWorker {
     await sendButton.press("Enter", {
       noWaitAfter: true,
       signal: abortSignal,
-      timeout: browserStageTimeouts.send,
+      // runStage owns the operation budget. A second Locator timeout would silently collapse the
+      // 180-second Bigger Context budget back to the ordinary 20 seconds after Enter has already
+      // submitted the message; semantic submission evidence below remains the authority.
+      timeout: 0,
     });
     recordTiming("press_enter");
     await requestRewriteProbe?.(abortSignal);
