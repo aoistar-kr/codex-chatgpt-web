@@ -653,7 +653,6 @@ function registerIpc({ logger, stateStore }) {
       mcpRuntimeInstalled: false,
       mcpGuideStep: 0,
       codexRestartRequired: true,
-      experimentalBiggerContext: false,
       experimentalSkillAttachments: false,
     });
     send("launcher:state-changed", state);
@@ -731,16 +730,6 @@ function registerIpc({ logger, stateStore }) {
       state: stateStore.update({ autoStart: desired }),
       ...autostart,
     };
-  });
-  handle("launcher:bigger-context", async (_event, enabled) => {
-    const result = await runtimeHost.setBiggerContext(enabled === true);
-    const state = stateStore.update({
-      experimentalBiggerContext: result.enabled,
-      codexCatalogVerified: true,
-      codexRestartRequired: false,
-    });
-    send("launcher:state-changed", state);
-    return state;
   });
   handle("launcher:skill-attachments", async (_event, enabled) => {
     if (browserHost.activeTraceId || browserHost.currentOperation()) {
@@ -1041,7 +1030,6 @@ async function start() {
       ...(config?.mode !== "full" ? { mcpSetupComplete: false, mcpGuideStep: 0 } : {}),
       codexRestartRequired: false,
       autoStart: false,
-      experimentalBiggerContext: config?.experimentalBiggerContext === true,
       experimentalSkillAttachments: config?.experimentalSkillAttachments === true,
     });
     send("launcher:state-changed", state);
@@ -1067,7 +1055,6 @@ async function start() {
         coreSetupComplete: true,
         codexCatalogVerified: true,
         codexRestartRequired: false,
-        experimentalBiggerContext: runtimeHost.runtimeConfigSnapshot().config?.experimentalBiggerContext === true,
         experimentalSkillAttachments: runtimeHost.runtimeConfigSnapshot().config?.experimentalSkillAttachments === true,
         ...(upgrade.mode === "full" ? {
           mcpRuntimeInstalled: true,
@@ -1100,12 +1087,10 @@ async function start() {
     }
     const configuredRuntime = runtimeHost.runtimeConfigSnapshot();
     if (configuredRuntime.configured) {
-      const enabled = configuredRuntime.config?.experimentalBiggerContext === true;
       const experimentalSkillAttachments = configuredRuntime.config?.experimentalSkillAttachments === true;
       const saved = stateStore.read();
-      if (saved.experimentalSkillAttachments !== experimentalSkillAttachments
-        || saved.experimentalBiggerContext !== enabled) {
-        const state = stateStore.update({ experimentalBiggerContext: enabled, experimentalSkillAttachments });
+      if (saved.experimentalSkillAttachments !== experimentalSkillAttachments) {
+        const state = stateStore.update({ experimentalSkillAttachments });
         send("launcher:state-changed", state);
       }
     }
@@ -1120,7 +1105,6 @@ async function start() {
         codexCatalogVerified: true,
         codexRestartRequired: false,
         mcpRuntimeInstalled: config.mode === "full",
-        experimentalBiggerContext: config.experimentalBiggerContext === true,
         experimentalSkillAttachments: config.experimentalSkillAttachments === true,
         ...(runtime.bridgeRouteChanged ? {
           codexCatalogVerified: false,

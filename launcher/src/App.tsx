@@ -320,14 +320,9 @@ function LauncherShell({
   const [browserSlot, setBrowserSlot] = useState<HTMLDivElement | null>(null);
   const [sessionReminderBusy, setSessionReminderBusy] = useState(false);
   const [sessionReminderDue, setSessionReminderDue] = useState(false);
-  const [biggerContextRecommendationOpen, setBiggerContextRecommendationOpen] = useState(
-    snapshot.state.coreSetupComplete === true && !snapshot.state.experimentalBiggerContext,
-  );
-  const [biggerContextRecommendationBusy, setBiggerContextRecommendationBusy] = useState(false);
   const browserSlotRef = useCallback((node: HTMLDivElement | null) => setBrowserSlot(node), []);
   const browserSurfaceActive = surface === "browser"
-    && !(compactSidebar && sidebarOpen)
-    && !biggerContextRecommendationOpen;
+    && !(compactSidebar && sidebarOpen);
   const needsBrowser = browser?.authenticated !== true;
   const needsSetup = !needsBrowser
     && (snapshot.state.coreSetupComplete !== true || snapshot.state.codexCatalogVerified !== true);
@@ -459,18 +454,6 @@ function LauncherShell({
     }
   };
 
-  const setRecommendedBiggerContext = async (enabled: boolean) => {
-    if (biggerContextRecommendationBusy) return;
-    setBiggerContextRecommendationBusy(true);
-    setError(null);
-    try {
-      updateState(await api!.setBiggerContext(enabled));
-    } catch (cause) {
-      setError(messageOf(cause));
-    } finally {
-      setBiggerContextRecommendationBusy(false);
-    }
-  };
 
   return (
     <motion.main
@@ -641,20 +624,9 @@ function LauncherShell({
         </AnimatePresence>
       </section>
 
-      <AnimatePresence>
-        {biggerContextRecommendationOpen ? (
-          <BiggerContextRecommendation
-            busy={biggerContextRecommendationBusy || operation?.status === "running"}
-            checked={snapshot.state.experimentalBiggerContext}
-            copy={copy}
-            onChange={(enabled) => void setRecommendedBiggerContext(enabled)}
-            onClose={() => setBiggerContextRecommendationOpen(false)}
-          />
-        ) : null}
-      </AnimatePresence>
 
       <AnimatePresence>
-        {sessionReminderDue && !biggerContextRecommendationOpen ? (
+        {sessionReminderDue ? (
           <SessionRefreshReminder
             busy={sessionReminderBusy}
             copy={copy}
@@ -1449,17 +1421,6 @@ function SettingsSurface({
       setBusy(false);
     }
   };
-  const setBiggerContext = async (enabled: boolean) => {
-    setBusy(true);
-    setError(null);
-    try {
-      updateState(await api!.setBiggerContext(enabled));
-    } catch (cause) {
-      setError(messageOf(cause));
-    } finally {
-      setBusy(false);
-    }
-  };
   const uninstallIntegration = async () => {
     setBusy(true);
     setError(null);
@@ -1502,13 +1463,6 @@ function SettingsSurface({
             onChange={(checked) => void api!.setPreference("showBrowserDuringTurns", checked)
               .then(updateState)
               .catch((cause) => setError(messageOf(cause)))}
-          />
-        </SettingRow>
-        <SettingRow body={copy.biggerContextBody} label={copy.biggerContext}>
-          <Switch
-            checked={snapshot.state.experimentalBiggerContext}
-            disabled={busy || snapshot.state.coreSetupComplete !== true}
-            onChange={(checked) => void setBiggerContext(checked)}
           />
         </SettingRow>
         <SettingRow body={copy.chooseLanguageHint} label={copy.language}>
@@ -1981,58 +1935,6 @@ function SessionRefreshReminder({
   );
 }
 
-function BiggerContextRecommendation({
-  busy,
-  checked,
-  copy,
-  onChange,
-  onClose,
-}: {
-  busy: boolean;
-  checked: boolean;
-  copy: Copy;
-  onChange: (checked: boolean) => void;
-  onClose: () => void;
-}) {
-  return (
-    <motion.div
-      animate={{ opacity: 1 }}
-      aria-describedby="bigger-context-recommendation-body"
-      aria-labelledby="bigger-context-recommendation-title"
-      aria-modal="true"
-      className="bigger-context-recommendation-backdrop"
-      exit={{ opacity: 0 }}
-      initial={{ opacity: 0 }}
-      role="dialog"
-      transition={{ duration: 0.18 }}
-    >
-      <motion.section
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        className="bigger-context-recommendation"
-        exit={{ opacity: 0, scale: 0.98, y: 6 }}
-        initial={{ opacity: 0, scale: 0.98, y: 8 }}
-        transition={PANEL_TRANSITION}
-      >
-        <header className="bigger-context-recommendation-header">
-          <small>{copy.biggerContext}</small>
-          <h2 id="bigger-context-recommendation-title">{copy.biggerContextRecommendationTitle}</h2>
-        </header>
-        <p className="bigger-context-recommendation-body" id="bigger-context-recommendation-body">{copy.biggerContextRecommendationBody}</p>
-        <div className="bigger-context-recommendation-toggle">
-          <div>
-            <strong>{copy.biggerContext}</strong>
-            <p>{copy.biggerContextRecommendationToggleBody}</p>
-          </div>
-          <Switch checked={checked} disabled={busy} onChange={onChange} />
-        </div>
-        {checked ? <p className="bigger-context-recommendation-restart">{copy.restartCodex}</p> : null}
-        <footer>
-          <SecondaryButton disabled={busy} onClick={onClose}>{copy.close}</SecondaryButton>
-        </footer>
-      </motion.section>
-    </motion.div>
-  );
-}
 
 function McpMark() {
   return <i aria-hidden="true" className="mcp-mark" />;

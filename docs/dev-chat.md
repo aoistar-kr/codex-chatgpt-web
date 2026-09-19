@@ -98,19 +98,18 @@ An unsupported browser helper or rejected upload produces an error instead of si
 instructions. This remains experimental: moving instructions into attachments does not guarantee
 that ChatGPT will follow them more reliably.
 
-## Bigger Context experiment
+## Bigger Context transport
 
-Both launcher profiles expose **Bigger Context (experimental)** in Settings. It is disabled by
-default. The switch updates the profile's canonical runtime configuration through the normal setup
-transaction; it is not a launcher-only preference. Production setup also rewrites the managed
-Codex model catalog with 3x context and auto-compaction thresholds and asks you to restart Codex.
-The DEV CLI reads the same setting from its isolated runtime configuration on each command.
+Bigger Context is the default transport. There is no launcher switch: the runtime configuration and
+the managed Codex model catalog always advertise the 3x context and auto-compaction thresholds, and
+the DEV CLI reads the same value from its isolated runtime configuration on each command. Changing
+the transport would require a source change, not a preference.
 
-When enabled, a normal turn stays on the original single-message path while its estimated input
-is below the selected mode's existing auto-compaction threshold. At the first threshold it uses two
-messages; at twice that threshold it uses six messages. The final context part also commits the
-transaction and starts the task, so there is no extra request. The existing DEV compaction threshold
-remains three times the selected mode's base limit.
+A normal turn stays on the original single-message path while its estimated input is below the
+selected mode's existing auto-compaction threshold. At the first threshold it uses two messages; at
+twice that threshold it uses six messages. The final context part also commits the transaction and
+starts the task, so there is no extra request. The DEV compaction threshold is three times the
+selected mode's base limit.
 
 Each stage contains complete semantic records, never a raw JSON string cut in the middle. The model
 must return an exact transaction-bound SHA-256 acknowledgement before the next part is sent.

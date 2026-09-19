@@ -51,7 +51,6 @@ export interface SetupOptions {
   appName?: string;
   forceLogin?: boolean;
   autoApproveToolCalls?: boolean;
-  experimentalBiggerContext?: boolean;
   experimentalSkillAttachments?: boolean;
   replaceCodexRoute?: boolean;
   restartService?: boolean;
@@ -230,9 +229,6 @@ function baseConfig(existing: AppConfig | undefined, options: SetupOptions): App
   }
   config.appName = resolveSetupConnectorName(existing?.appName, options.appName);
   if (options.autoApproveToolCalls !== undefined) config.autoApproveToolCalls = options.autoApproveToolCalls;
-  if (options.experimentalBiggerContext !== undefined) {
-    config.experimentalBiggerContext = options.experimentalBiggerContext;
-  }
   if (options.experimentalSkillAttachments !== undefined) {
     config.experimentalSkillAttachments = options.experimentalSkillAttachments;
   }

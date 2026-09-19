@@ -191,7 +191,7 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     solAvailable: true,
     extraHighAvailable: false,
     proAvailable: false,
-    experimentalBiggerContext: false,
+    experimentalBiggerContext: true,
     experimentalSkillAttachments: false,
     autoApproveToolCalls: false,
     controlToken: randomBytes(32).toString("base64url"),
@@ -427,7 +427,9 @@ function parseConfig(value: unknown, path: string): AppConfig {
   }
   const solAvailable = parsed.solAvailable !== false;
   const proAvailable = parsed.proAvailable === true;
-  const experimentalBiggerContext = parsed.experimentalBiggerContext === true;
+  // Bigger Context is the default transport: the six-part split and its three-times window are
+  // always active, so a stale saved value cannot silently disable them.
+  const experimentalBiggerContext = true;
   if (parsed.experimentalSkillAttachments !== undefined
     && typeof parsed.experimentalSkillAttachments !== "boolean") {
     throw new Error(`Invalid experimentalSkillAttachments in ${path}`);
