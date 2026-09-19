@@ -209,9 +209,8 @@ function buildTools(tools: unknown[] | undefined): CodexTool[] | undefined {
     }
     else if (typeof t.name === "string" && t.type !== "web_search" && t.type !== "image_generation") {
       // Any other named tool (for example a native computer-use tool type this parser does not
-      // model) is client-executed — pass it through as a function so the routed model can read and
-      // call it naturally; the bridge relays its call as a function_call. Previously such tools were
-      // silently dropped, so the model never saw them.
+      // model) is client-executed. Pass it through as a function so the routed model can call it
+      // naturally and the bridge can relay it as a function_call.
       pushFn(t);
     }
     // Only the OpenAI-hosted server-side tools (web_search, image_generation) are intentionally
@@ -382,7 +381,12 @@ export function parseRequest(body: unknown): CodexParsedRequest {
       }
 
       if (effectiveType === "message") {
-        const msg = item as { role?: string; content?: unknown; phase?: "commentary" | "final_answer" };
+        const msg = item as {
+          role?: string;
+          content?: unknown;
+          phase?: "commentary" | "final_answer";
+          internal_chat_message_metadata_passthrough?: { content_item_kinds?: string[] };
+        };
         switch (msg.role) {
           case "system": {
             pendingReasoning.length = 0;
@@ -395,7 +399,10 @@ export function parseRequest(body: unknown): CodexParsedRequest {
           case "developer": {
             pendingReasoning.length = 0;
             const content = inputContentParts(msg.content as unknown[] | string | undefined);
-            messages.push({ role: msg.role, content, timestamp: now });
+            const kinds = msg.internal_chat_message_metadata_passthrough?.content_item_kinds;
+            const selectedSkill = msg.role === "user" && kinds?.length === 1
+              && kinds[0] === "skills.selected_skill_instructions";
+            messages.push({ role: msg.role, content, timestamp: now, ...(selectedSkill ? { origin: "codex_skill" as const } : {}) });
             break;
           }
           case "assistant": {
