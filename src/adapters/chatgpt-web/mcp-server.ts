@@ -7,6 +7,7 @@ import { namespacedToolName, type CodexTool } from "../../types";
 import { VERSION } from "../../version";
 import type { ChatGptTurnEnvironment } from "./environment";
 import { CODEX_COMPACTION_CONTROL_WIRE_NAME } from "./native-compaction-control";
+import { observeMcpToolCalls } from "./mcp-observation";
 import {
   CODEX_PARALLEL_EXEC_BATCH_CONTROL_WIRE_NAME,
   CODEX_PARALLEL_EXEC_BATCH_MAX_CALLS,
@@ -34,6 +35,18 @@ const parallelExecBatchArgumentsSchema = z.object({
     .min(CODEX_PARALLEL_EXEC_BATCH_MIN_CALLS)
     .max(CODEX_PARALLEL_EXEC_BATCH_MAX_CALLS),
 }).strict();
+/** Bridge tools this MCP server exposes; used to label content-free transport observations. */
+const BRIDGE_TOOL_NAMES = new Set([
+  "codex_turn_start",
+  "codex_exec",
+  "codex_write_stdin",
+  "codex_apply_patch",
+  "codex_view_image",
+  "codex_tool_inventory",
+  "codex_tool_call",
+  "codex_turn_complete",
+]);
+
 export const CHATGPT_WEB_AGENT_WAIT_POLL_MS = 10_000;
 // The OpenAI tunnel currently owns a two-minute command-response deadline. The local MCP server
 // must settle first so an abandoned native tool call is returned as an MCP error instead of
@@ -903,5 +916,5 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     },
   );
 
-  await server.connect(new StdioServerTransport());
+  await server.connect(observeMcpToolCalls(new StdioServerTransport(), BRIDGE_TOOL_NAMES));
 }
