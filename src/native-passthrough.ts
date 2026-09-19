@@ -5,6 +5,7 @@ import {
   decodeCompactionSummary,
 } from "./responses/compaction";
 import { BRIDGE_REASONING_PREFIX } from "./responses/reasoning-envelope";
+import { fetchNativeCodex } from "./native-network";
 
 const CODEX_BACKEND = "https://chatgpt.com/backend-api/codex";
 const FIRST_PARTY_CODEX_ORIGINATORS = new Set([
@@ -207,7 +208,7 @@ function withUncleanCloseTolerance(
 export async function forwardNativeCodexRequest(
   request: Request,
   endpoint: NativeCodexEndpoint,
-  fetchUpstream: NativeFetch = fetch,
+  fetchUpstream: NativeFetch = fetchNativeCodex,
   decodedBody?: unknown,
 ): Promise<Response> {
   const authorization = request.headers.get("authorization") ?? "";
@@ -228,8 +229,7 @@ export async function forwardNativeCodexRequest(
   let model: string | undefined;
   let body: BodyInit | undefined;
   if (imageRequest) {
-    // Image endpoints use their own schema and may evolve independently from Responses. Preserve
-    // the exact bytes instead of parsing/scrubbing them as bridge history.
+    // Standalone image requests use their own schema; never interpret them as Responses history.
     body = await request.arrayBuffer();
   } else if (method === "POST") {
     const parseRequest = decodedBody === undefined ? request.clone() : undefined;
@@ -255,7 +255,8 @@ export async function forwardNativeCodexRequest(
     headers,
     ...(body ? { body } : {}),
     signal: request.signal,
-    // A redirected POST could replay image generation or leak account headers to another origin.
+    // Images create work: preserve redirects as responses instead of replaying a POST or
+    // forwarding account headers to a redirect destination.
     redirect: imageRequest ? "manual" : "follow",
   });
   const upstream = await fetchUpstream(upstreamRequest);
@@ -267,7 +268,7 @@ export async function forwardNativeCodexRequest(
     })}`);
   }
   const responseHeaders = endToEndHeaders(upstream.headers);
-  // Fetch exposes decoded response bytes; keeping a stale compression header makes Codex decode twice.
+  // fetch exposes decompressed image JSON; retaining gzip/br would make Codex decode it twice.
   if (imageRequest) responseHeaders.delete("content-encoding");
   const isEventStream = (upstream.headers.get("content-type") ?? "")
     .toLowerCase()
