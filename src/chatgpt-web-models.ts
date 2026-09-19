@@ -10,6 +10,47 @@ export type ChatGptWebCodexEffort = "low" | "medium" | "high" | "xhigh" | "ultra
 export type ChatGptWebAdapterEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
 /**
+ * Zero Risk backend identifiers. Our route tables stay ours; these exist so the upstream prompt
+ * planner can recognise a manual-control backend without importing route definitions.
+ */
+export const CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL = "chatgpt-web-zero-risk";
+export const CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL = "chatgpt-web-zero-risk-pro";
+
+export function isChatGptWebZeroRiskBackendModel(
+  model: string,
+): boolean {
+  return model === CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL
+    || model === CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL;
+}
+
+/** Image reserve used by the message-budget calculation. */
+export function chatGptWebImageTokenReserve(detail?: string): number {
+  return detail === "original" ? 8_192 : 4_096;
+}
+
+/**
+ * The largest single browser message this backend model may carry, after platform reserve and image
+ * budget are removed.
+ */
+export function resolveChatGptWebMessageTokenBudget(
+  backendModel: ChatGptWebBackendModel,
+  effort: ChatGptWebAdapterEffort,
+  capabilities: ChatGptWebAccountCapabilities,
+  imageTokens = 0,
+): number {
+  const { contextWindow } = resolveChatGptWebContextLimits(
+    backendModel,
+    effort,
+    { ...capabilities, experimentalBiggerContext: false },
+  );
+  const { browserMessageTokenLimit } = resolveChatGptWebTransportLimits(backendModel, effort, capabilities);
+  return Math.max(0, Math.min(
+    contextWindow - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS - imageTokens - 1,
+    browserMessageTokenLimit ?? Infinity,
+  ));
+}
+
+/**
  * Measured Plus browser transport windows, including the fixed hidden ChatGPT platform reserve.
  * Codex compacts the visible task at the lower explicit threshold before the next browser turn is
  * compiled. The remaining headroom is owned by ChatGPT's product prompt and Codex Native schemas.

@@ -37,6 +37,8 @@ export type CodexMessage =
 
 export interface CodexUserMessage {
   role: "user";
+  /** Native Responses metadata, never inferred from message text. */
+  origin?: "codex_skill";
   content: string | CodexContentPart[];
   timestamp: number;
 }
