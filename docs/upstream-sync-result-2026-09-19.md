@@ -80,3 +80,30 @@
 ## 업스트림 스티어링 방식 (참고)
 
 업스트림에는 인플라이트 composer 스티어링이 없다(server.ts/index.ts/browser-worker.ts 모두 steer 0회). 대신 Codex 네이티브 스티어링을 같은 스레드의 새 요청으로 받아 instruction supersession으로 처리한다: 새 instruction이 현재 활성 턴의 instruction을 대체하면 이전 턴의 capability를 retire하고 canonical history에서 세션을 재구축한다("Waiting for the old browser here deadlocks before that result can be consumed"). 환경 권한은 extractChatGptSteeringEnvironmentClaim으로 같은 턴 쌍에서만 추출해 현재 rollout과 대조한다. 우리 포크는 반대로 살아있는 컴포저에 직접 주입하는 방식이라 두 모델은 합칠 수 없다.
+
+
+## 최종 검수 결과 (배치 15 + 감사 수정)
+
+병합 결과를 custom 브랜치에 올리고 전체 스위트로 검수했다 (커밋 d897806).
+
+- typecheck: exit 0
+- 커스텀 불변조건 게이트(test:custom-invariants): 478 pass / 0 fail
+- 전체 스위트: 1214 pass / 17 fail
+
+실패 17건은 전부 기존 실패(launcher localization 4, renderer-wiring 4, completed-rebind-diagnostic 1 등 13건)와 플랫폼 제약 1건(Windows에서 fs.symlinkSync가 EPERM — symlink 권한 필요)이다. 병합 이전 기준선은 1080 pass / 3 fail 이었고, 병합 후 통과 수가 1106(워크트리) / 1214(라이브)로 늘었다.
+
+### 감사에서 찾아 고친 것
+
+1. browser-worker: 개인화 프리플라이트가 현지화 라벨(Personalized|个性化, includeHidden)을 인식하고, 구조적 컨트롤 셀렉터에 content-sheet 변형을 추가했다. 업스트림의 중국어 UI 수정에 해당한다.
+2. model.ts: ChatGptWebCapabilities에 extraHighAvailable 허용.
+3. dev-chat 드라이버와 dev/setup/cli 픽스처가 extraHighAvailable을 전달한다 — 업스트림 라우트 테이블이 그 증거 없이는 Extra High/Pro 행을 거부한다.
+4. dev-chat 브로커 기대값을 protocolVersion 5로 갱신(우리 turn-broker가 업스트림 것이 됨).
+5. browser-worker-contract 목이 RegExp 라벨 쿼리를 다시 받아들이게 수정.
+6. /admin/cancel-turns가 compaction owner 정산을 무한 대기하던 것을 2초로 상한 처리 — 정체된 브라우저가 launcher의 cancel-all을 영구히 붙잡지 못한다.
+7. codex-integration 테스트의 외부 라우트를 관리 테이블 밖에 배치 — 엄격해진 훅 파서가 파일 끝에 덧붙은 키를 관리 테이블 멤버로 보고 fail-closed 하는 게 정상이다.
+
+### 남은 사용자 판단 항목 (보류)
+
+- 6조각 Bigger Context 플래너: 업스트림 model.ts의 effort 라우팅을 함께 가져와야 해서 우리 라우팅과 충돌한다.
+- Zero Risk 어댑터 런타임(index.ts의 ChatGptZeroRiskManualControl)과 launcher i18n/languages.json.
+- 위 둘은 별도 배치로 진행해야 하며, 이번 병합은 그 전 단계까지 완료한 상태다.
