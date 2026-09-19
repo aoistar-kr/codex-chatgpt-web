@@ -5,6 +5,7 @@ import { createInterface } from "node:readline";
 import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 import type { CodexOutputTextAnnotation } from "../../types";
 import {
+  ChatGptCompactionHandoffAccepted,
   ChatGptSteeringUnavailableError,
   ChatGptTurnSupersededError,
   ChatGptWebAdapterError,
@@ -303,6 +304,7 @@ export class LauncherBrowserHelperClient {
               return;
             }
             const preserveRequested = turn.abortSignal?.reason instanceof ChatGptTurnSupersededError;
+            const compactionHandoffAccepted = turn.abortSignal?.reason instanceof ChatGptCompactionHandoffAccepted;
             // Stop is a launcher-owned control action, not a side effect of observing AbortSignal in
             // the Playwright loop. This reaches the exact Electron surface even while the helper is
             // blocked in a DOM/network await. For steering we preserve the conversation only after
@@ -328,6 +330,7 @@ export class LauncherBrowserHelperClient {
                 type: "abort",
                 id: turn.traceId,
                 ...(preserveConversation ? { preserveConversation: true } : {}),
+                ...(compactionHandoffAccepted ? { reason: "compaction_handoff_accepted" } : {}),
               });
             })().catch(error => {
               this.finishWithError(
