@@ -2540,15 +2540,20 @@ test("browser preflight separates model context from one-message transport limit
 });
 
 test("Bigger Context preflight expands only the total context ceiling and keeps each message boundary", () => {
-  const pro = { localToolsEnabled: false, solAvailable: true, proAvailable: true };
+  const pro = {
+    localToolsEnabled: false,
+    solAvailable: true,
+    proAvailable: true,
+    experimentalBiggerContext: true,
+  };
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    280_000,
+    333_578,
     95_000,
     "gpt-5.6-sol",
     "high",
     pro,
     900_000,
-    3,
+    6,
   )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     333_579,
@@ -2557,8 +2562,17 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     "high",
     pro,
     900_000,
-    3,
-  )).toThrow("three-part ceiling");
+    6,
+  )).toThrow("six-part ceiling");
+  expect(() => assertChatGptWebMultipartInputWithinLimits(
+    222_385,
+    95_000,
+    "gpt-5.6-sol",
+    "high",
+    pro,
+    900_000,
+    2,
+  )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     222_386,
     95_000,
@@ -2575,7 +2589,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     "high",
     pro,
     900_000,
-    3,
+    6,
   )).toThrow("ChatGPT message boundary");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     20_000,
@@ -2610,7 +2624,7 @@ test("Bigger Context stages use the lowest account mode that can carry the stage
     "low",
     plus,
     300_000,
-    3,
+    6,
     {
       stagingEffort: "medium",
       maxStageMessageTokens: 30_000,

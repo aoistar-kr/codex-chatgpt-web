@@ -75,6 +75,7 @@ import {
   notifyLauncherTurn,
 } from "../../launcher-browser-host";
 import {
+  CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER,
   resolveChatGptWebContextLimits,
   resolveChatGptWebTransportLimits,
 } from "../../chatgpt-web-models";
@@ -943,7 +944,7 @@ export function assertChatGptWebMultipartInputWithinLimits(
   },
 ): void {
   if (!isChatGptWebMultipartPartCount(partCount)) {
-    throw new Error("Bigger Context requires a supported context part count");
+    throw new Error("Bigger Context requires two or six context parts");
   }
   if (modelId === CHATGPT_WEB_LUNA_MODEL_ID) {
     throw new ChatGptWebAdapterError(
@@ -954,7 +955,11 @@ export function assertChatGptWebMultipartInputWithinLimits(
   if (modelId !== CHATGPT_WEB_MODEL_ID) {
     throw new Error(`ChatGPT Bigger Context limit is not defined for model: ${modelId}`);
   }
-  const { contextWindow } = resolveChatGptWebContextLimits(modelId, effort, capabilities);
+  const { contextWindow: baseContextWindow } = resolveChatGptWebContextLimits(
+    modelId,
+    effort,
+    { ...capabilities, experimentalBiggerContext: false },
+  );
   const assertMessageBoundary = (
     label: "stage" | "final part",
     messageTokens: number,
@@ -995,9 +1000,10 @@ export function assertChatGptWebMultipartInputWithinLimits(
   } else {
     assertMessageBoundary("stage", estimatedMessageTokens, maxMessageChars, effort);
   }
-  const experimentalContextWindow = contextWindow * partCount;
+  // More transport messages do not enlarge the model's advertised context window.
+  const experimentalContextWindow = baseContextWindow * Math.min(partCount, CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER);
   if (estimatedInputTokens < experimentalContextWindow) return;
-  const partLabel = partCount === 2 ? "two-part" : "three-part";
+  const partLabel = partCount === 2 ? "two-part" : "six-part";
   throw new ChatGptWebAdapterError(
     `This Bigger Context transaction is estimated at ${estimatedInputTokens.toLocaleString("en-US")} input tokens, which exceeds its experimental ${experimentalContextWindow.toLocaleString("en-US")}-token ${partLabel} ceiling. Run /compact, then retry.`,
     { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },

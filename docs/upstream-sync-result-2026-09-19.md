@@ -46,7 +46,7 @@
 - 예약 병렬 exec_command 배치 제어 + Windows 저오버헤드 cmd.exe fast path.
 - launcher 호스트의 stop phase, model/effort prewarm, connector plugin id, unsubmitted 플래그, 취소 경계 검사.
 - CHATGPT_WEB_AGENT_WAIT_POLL_MS = 10초 (업스트림 30초) - 터널 2분 데드라인 때문.
-- CHATGPT_BIGGER_CONTEXT_PARTS = 3 (업스트림 6) - 아래 보류 항목 참조.
+- CHATGPT_BIGGER_CONTEXT_PARTS = 3 (업스트림 6) - 아래 보류 항목 참조. → 배치 16에서 6으로 전환 완료.
 - model.ts effort 라우팅과 우리 계약 테스트.
 
 ## 보류 (이유 포함)
@@ -104,6 +104,38 @@
 
 ### 남은 사용자 판단 항목 (보류)
 
-- 6조각 Bigger Context 플래너: 업스트림 model.ts의 effort 라우팅을 함께 가져와야 해서 우리 라우팅과 충돌한다.
+- 6조각 Bigger Context 플래너: 업스트림 model.ts의 effort 라우팅을 함께 가져와야 해서 우리 라우팅과 충돌한다. → 배치 16에서 라우팅을 제외한 전송 계층만 채택해 해소.
 - Zero Risk 어댑터 런타임(index.ts의 ChatGptZeroRiskManualControl)과 launcher i18n/languages.json.
 - 위 둘은 별도 배치로 진행해야 하며, 이번 병합은 그 전 단계까지 완료한 상태다.
+
+
+## 배치 16 — 6조각 Bigger Context 전송 (사용자 지시: 전송방식만, effort 라우팅 제외)
+
+업스트림 eaf4f09 의 전송 계층만 가져왔다. 라우팅은 손대지 않았다.
+
+가져온 것:
+
+- `prompt.ts`: `CHATGPT_BIGGER_CONTEXT_PARTS = 3 -> 6`. 플래너·usage 회계·스테이징 루프·helper 검증·commit manifest 가 모두 이 상수에서 파생되므로 6조각 분할과 5개 inert stage + 1개 final commit 이 자동으로 성립한다.
+- `browser-worker.ts`: multipart 프리플라이트 상한을 `baseContextWindow * min(partCount, CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER)` 로 교체하고, 기준 창을 얻을 때 `experimentalBiggerContext: false` 를 강제한다. 업스트림 주석 그대로 "전송 메시지 수가 모델의 광고 창을 늘리지 않는다" 를 의미하며, 플래너(`usage.ts` 의 `fits()`)가 이미 쓰던 `min(messages.length, 3)` 와 같은 식이라 계획과 프리플라이트가 다시 일치한다. `partLabel` 은 `six-part`, 지원하지 않는 part 수는 업스트림 문구로 거부한다.
+- `browser-helper-main.ts`: 2/3 하드코딩 대신 `isChatGptWebMultipartPartCount` 검증.
+- launcher `biggerContextBody`(en/zh/ja) 와 CLI 도움말(`--bigger-context`, dev-chat 배너) 문구를 1/2/6 기준으로 갱신.
+- 테스트: 6조각 엔벨로프/스테이지/commit 기대값, 프리플라이트 경계(pro/high `333,578` 통과 / `333,579` 거부 = 111,193×3), helper 6조각 픽스처.
+
+가져오지 않은 것 (의도적):
+
+- `model.ts` effort 라우팅(고정 라우트 -> 가시 모드 매핑, `extraHighAvailable` 필수화, `resolveChatGptDirectRequestMode` 제거)과 그 계약 테스트. 우리 커스텀 라우팅(extra-high/pro network primary)을 그대로 둔다.
+
+검증: `tsc --noEmit` exit 0, `test:custom-invariants` 478 pass / 0 fail, 전체 스위트 1214 pass / 5 skip / 17 fail (실패 목록은 병합 직후와 동일).
+
+### 실패 17건 분류 정정
+
+기존 문서의 "실패 17건은 전부 기존 실패" 는 부정확하다. 병합 전 기준선 워크트리(`..\codex-chatgpt-web-baseline`, c1f9265)에서 같은 테스트를 다시 돌려 분류했다.
+
+- 기존 실패 1: root `completed-rebind-diagnostic` "generation turn-id observer ..." — 기준선에서도 같은 이름으로 실패.
+- 플랫폼 1: launcher `runtime-host` "failed launcher update ..." — Windows `EPERM: symlink`.
+- 병합으로 생긴 실패 15:
+  - renderer-wiring 5: 병합이 업스트림 `App.tsx` 를 채택했지만 `launcher/tests/renderer-wiring.test.cjs` 는 병합 대상에서 빠져 옛 소스 패턴을 검사한다. 기능은 살아 있고 이름/형태만 달라졌다(`doctor?.ok` -> `verified`, `SettingRow body=` 가 조건식으로 확장, `passkeySignIn` 배치 변경 등).
+  - localization 7: 위 "보류" 항목의 의도적 미이식. 실제로 `launcher/src/i18n.ts` 는 en/zh/ja 3개뿐이라 업스트림 테스트(ko/zh-TW/README.ko.md 포함)와 어긋난다.
+  - control-server 3: 우리 포크의 `unsubmitted` endTurn 인자(병합 전 코드에도 있던 커스텀)를 업스트림 테스트가 7-인자로 기대한다.
+
+다음 배치 후보(사용자 결정 필요): 위 15건은 ① renderer-wiring 패턴 갱신, ② 로케일 이식 또는 보류 유지, ③ `unsubmitted` 계약을 테스트에 반영, 세 갈래로 정리된다. 어느 쪽도 6조각 전송과는 독립적이다.

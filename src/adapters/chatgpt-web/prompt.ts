@@ -53,7 +53,10 @@ export interface CompileChatGptWebPromptOptions {
 
 // Our browser path stages three parts; upstream moved to six. The helper below derives from this
 // constant so the planner, usage accounting and the browser-side limit check stay in agreement.
-export const CHATGPT_BIGGER_CONTEXT_PARTS = 3 as const;
+// Six-part staging only: the planner, usage accounting, the browser-side limit check and the
+// launcher's staging loop all derive from this constant. The Codex-facing effort routing is
+// deliberately unchanged.
+export const CHATGPT_BIGGER_CONTEXT_PARTS = 6 as const;
 export type ChatGptWebMultipartPartCount = 2 | typeof CHATGPT_BIGGER_CONTEXT_PARTS;
 export type ChatGptWebMultipartParts = readonly string[];
 
