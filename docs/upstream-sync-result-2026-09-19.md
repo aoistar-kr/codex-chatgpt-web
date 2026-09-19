@@ -69,3 +69,14 @@
 
 각 배치마다 `node node_modules/typescript/bin/tsc --noEmit` exit 0 과 `bun run test:custom-invariants` 478 pass / 0 fail 를 확인했다. 기준선(병합 전)은 476 pass 였고, +2 는 업스트림 인터럽트 훅 테스트가 더 많아서다.
 
+
+
+## 추가 배치 (12~14)
+
+- **배치12** eff3869, 07d3b28: adapter-error / service / native-passthrough 수렴(주석·중복 함수 정리, 우리 terminal-cancelled 분류 유지), 그리고 compaction-handoff accepted abort reason을 helper 체인(browser-helper-main + launcher-helper-client)에 배선. 업스트림의 multipart_stage_acknowledged 소비측은 우리 browser-worker가 그 이벤트를 내보내지 않으므로 미채택.
+- **배치13** 52ab58a: server.ts를 업스트림 것으로 채택하고 우리 /admin/steer-turn 라우트만 재적용. 업스트림 interrupt-turn이 이미 compaction owner 취소를 포함해 수렴했고, lease-failure 오류 매핑과 native-network 경유가 새로 들어왔다.
+- **배치14**: environment.ts는 우리 것 유지. 양쪽이 같은 추출기들을 각자 구현해 수렴했고(union 시 중복 정의 20여 개 발생), 업스트림만 가진 export는 extractChatGptSteeringEnvironmentClaim 하나뿐이라 그들 스티어링(instruction supersession) 모델 전용이다. 반대로 우리만 가진 함수 4개(ChatGptRootCompactionRolloutIdentity, chatGptRawEnvironmentContextIdentity, chatGptSameTurnHumanUserRevision, extractChatGptRootCompactionRolloutIdentity)가 컴팩션 롤아웃 권한 인증에 쓰인다.
+
+## 업스트림 스티어링 방식 (참고)
+
+업스트림에는 인플라이트 composer 스티어링이 없다(server.ts/index.ts/browser-worker.ts 모두 steer 0회). 대신 Codex 네이티브 스티어링을 같은 스레드의 새 요청으로 받아 instruction supersession으로 처리한다: 새 instruction이 현재 활성 턴의 instruction을 대체하면 이전 턴의 capability를 retire하고 canonical history에서 세션을 재구축한다("Waiting for the old browser here deadlocks before that result can be consumed"). 환경 권한은 extractChatGptSteeringEnvironmentClaim으로 같은 턴 쌍에서만 추출해 현재 rollout과 대조한다. 우리 포크는 반대로 살아있는 컴포저에 직접 주입하는 방식이라 두 모델은 합칠 수 없다.
