@@ -169,15 +169,9 @@ async function assertLauncherReady(config: ReturnType<typeof loadConfig>): Promi
   if (config.browserHost !== "launcher" || !config.browserHostDescriptorPath) {
     throw new Error("DEV chat requires the isolated desktop launcher; run bun run dev:launcher first");
   }
-  if (config.browserInteractionMode === "manual") {
-    await inspectLauncherBrowserHostLiveness(config.browserHostDescriptorPath, {
-      expectedProfile: DEV_LAUNCHER_PROFILE,
-    });
-  } else {
-    await inspectLauncherBrowserHost(config.browserHostDescriptorPath, {
-      expectedProfile: DEV_LAUNCHER_PROFILE,
-    });
-  }
+  await inspectLauncherBrowserHost(config.browserHostDescriptorPath, {
+    expectedProfile: DEV_LAUNCHER_PROFILE,
+  });
 }
 
 async function executeMessage(driver: DevChatDriver, state: DevChatState, message: string): Promise<void> {
@@ -345,11 +339,6 @@ export async function runDevCommand(args: string[]): Promise<void> {
     const descriptorPath = takeOption(args, "--browser-host-descriptor") ?? paths.descriptorPath;
     const acknowledgedUnofficial = takeFlag(args, "--acknowledge-unofficial");
     const refreshAccountCapabilities = takeFlag(args, "--refresh-account-capabilities");
-    const automaticBrowserInteraction = takeFlag(args, "--automatic-browser-interaction");
-    const manualBrowserInteraction = takeFlag(args, "--zero-risk-browser-interaction");
-    if (automaticBrowserInteraction && manualBrowserInteraction) {
-      throw new Error("Choose at most one browser interaction mode");
-    }
     const skillAttachments = takeFlag(args, "--skill-attachments");
     const inlineSkills = takeFlag(args, "--inline-skills");
     if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");
@@ -364,9 +353,6 @@ export async function runDevCommand(args: string[]): Promise<void> {
       browserHostDescriptorPath: descriptorPath,
       refreshAccountCapabilities,
       acknowledgedUnofficial,
-      ...(automaticBrowserInteraction || manualBrowserInteraction
-        ? { browserInteractionMode: manualBrowserInteraction ? "manual" : "automatic" }
-        : {}),
       ...(biggerContext || standardContext ? { experimentalBiggerContext: biggerContext } : {}),
       ...(skillAttachments || inlineSkills ? { experimentalSkillAttachments: skillAttachments } : {}),
       ...(tunnelId ? { tunnelId } : {}),

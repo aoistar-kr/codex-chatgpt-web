@@ -87,7 +87,7 @@ the measured transport limit.
 **Settings → Skills as files (experimental)** is off by default in both launcher profiles.
 It uploads only skills explicitly selected in Codex and identified by native selected-skill
 metadata. Skill discovery and reading other skills through tools are unchanged. The CLI setup
-flags are `--skill-attachments` and `--inline-skills`; Zero Risk does not support automated uploads.
+flags are `--skill-attachments` and `--inline-skills`.
 
 Each UTF-8 `.txt` attachment contains the original skill envelope, including its path or resource
 authority. Its filename uses the skill name and a content digest to distinguish changed versions.

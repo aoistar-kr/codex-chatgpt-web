@@ -231,8 +231,7 @@ safe log**. A useful report contains:
 - Codex Desktop and/or CLI version;
 - OS and architecture;
 - ChatGPT account tier;
-- Browser-only, Full harness (automatic), or Zero Risk mode and the exact selected model;
-- For Zero Risk, the ChatGPT model/effort and the last completed step: copying, pasting, sending in ChatGPT, confirming Sent, or the first MCP call;
+- Browser-only or Full harness mode and the exact selected model and effort;
 - exact reproduction steps and complete final error;
 - whether it reproduces in a fresh Codex task; and
 - a safe log captured immediately after that reproduction.

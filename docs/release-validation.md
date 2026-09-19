@@ -32,12 +32,9 @@ Run this list on a maintained Windows 11 x64 machine with a real ChatGPT account
    tool turn. Repeat with Pro when the account exposes Pro.
 6. Drive a chat past the compaction threshold and prove that it continues after compaction without
    a duplicate or orphaned browser turn.
-7. On a clean install, prove that setup offers both interaction modes and defaults to With
-   Automation. Select Zero Risk and prove that Codex shows exactly one generic Web model after
-   restart, a retained chat receives only the next prompt, and
-   compaction completes through MCP before the compacted continuation opens a fresh manual chat.
-   Inspect the copied prompt and prove that it contains only the current `request_id`, never a
-   surface nonce, capability token, or prompt-level lifecycle commands.
+7. On a clean install, prove that setup installs the automatic interaction mode and that Codex
+   shows the expected Web model rows after restart, a retained chat receives only the next prompt,
+   and compaction completes through MCP before the compacted continuation opens a fresh chat.
    Switch back to Automatic and prove that the account-visible catalog is restored.
 8. Cancel a running turn by closing its launcher tab, then cancel another with the launcher action;
    prove that neither turn recreates a tab or keeps the runtime busy.

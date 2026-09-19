@@ -8,7 +8,6 @@ const {
   connectorNameForDevSetup,
   connectorNameForSetup,
   CURRENT_CONNECTOR_NAME,
-  DEV_CONNECTOR_NAME,
   isLegacyConnectorName,
   requireCurrentRuntimeConnectorName,
   validateConnectorName,
@@ -73,18 +72,13 @@ function usableExecutable(candidate, platform = process.platform) {
   }
 }
 
-function captureRegularFile(filePath, { followSymlink = false } = {}) {
+function captureRegularFile(filePath) {
   let stat;
   try {
     stat = fs.lstatSync(filePath);
   } catch (error) {
     if (error?.code === "ENOENT") return { path: filePath, exists: false };
     throw error;
-  }
-  let symlink;
-  if (followSymlink && stat.isSymbolicLink()) {
-    symlink = { link: fs.readlinkSync(filePath), target: fs.realpathSync(filePath) };
-    stat = fs.lstatSync(symlink.target);
   }
   if (!stat.isFile()) {
     throw new Error(`Setup checkpoint path is not a regular file: ${filePath}`);
@@ -95,20 +89,9 @@ function captureRegularFile(filePath, { followSymlink = false } = {}) {
   return {
     path: filePath,
     exists: true,
-    data: fs.readFileSync(symlink?.target ?? filePath),
+    data: fs.readFileSync(filePath),
     mode: stat.mode & 0o777,
-    ...(symlink ? { symlink } : {}),
   };
-}
-
-function checkpointWritePath(snapshot) {
-  if (!snapshot.symlink) return snapshot.path;
-  if (!fs.lstatSync(snapshot.path).isSymbolicLink()
-    || fs.readlinkSync(snapshot.path) !== snapshot.symlink.link
-    || fs.realpathSync(snapshot.path) !== snapshot.symlink.target) {
-    throw new Error(`Codex config symlink changed during setup: ${snapshot.path}`);
-  }
-  return snapshot.symlink.target;
 }
 
 function restoreRegularFile(snapshot, platform = process.platform) {
@@ -116,19 +99,14 @@ function restoreRegularFile(snapshot, platform = process.platform) {
     fs.rmSync(snapshot.path, { force: true });
     return;
   }
-  const writePath = checkpointWritePath(snapshot);
-  writePrivateFileAtomic(writePath, snapshot.data, snapshot.symlink
-    ? { mode: snapshot.mode, protectDirectory: false }
-    : undefined);
-  if (platform !== "win32") fs.chmodSync(writePath, snapshot.mode);
+  writePrivateFileAtomic(snapshot.path, snapshot.data);
+  if (platform !== "win32") fs.chmodSync(snapshot.path, snapshot.mode);
 }
 
 function regularFileChanged(snapshot, platform = process.platform) {
-  let filePath;
-  try { filePath = checkpointWritePath(snapshot); } catch { return true; }
   let stat;
   try {
-    stat = fs.lstatSync(filePath);
+    stat = fs.lstatSync(snapshot.path);
   } catch (error) {
     if (error?.code === "ENOENT") return snapshot.exists;
     throw error;
@@ -136,7 +114,7 @@ function regularFileChanged(snapshot, platform = process.platform) {
   if (!snapshot.exists || !stat.isFile()) return true;
   if (platform !== "win32" && (stat.mode & 0o777) !== snapshot.mode) return true;
   if (stat.size > MAX_CHECKPOINT_FILE_BYTES) return true;
-  return !fs.readFileSync(filePath).equals(snapshot.data);
+  return !fs.readFileSync(snapshot.path).equals(snapshot.data);
 }
 
 function parseBridgeRouteResult(stdout, { expectedActive, requireInstalled = false } = {}) {
@@ -176,7 +154,6 @@ class RuntimeHost {
     platform = process.platform,
     publishOperation,
     supervisor,
-    getBrowserInteractionMode = () => "automatic",
   }) {
     this.app = app;
     this.logger = logger;
@@ -203,7 +180,6 @@ class RuntimeHost {
       : path.join(os.homedir(), "Library", "LaunchAgents");
     this.publishOperation = publishOperation;
     this.supervisor = supervisor;
-    this.getBrowserInteractionMode = getBrowserInteractionMode;
     this.active = null;
     this.activeChild = null;
     this.lifecycleOperation = null;
@@ -223,24 +199,6 @@ class RuntimeHost {
       && this.activeChild.exitCode === null
       && this.activeChild.signalCode === null;
     return this.lifecycleOperation || this.active || (stuckChild ? "previous runtime process shutdown" : null);
-  }
-
-  browserInteractionMode() {
-    const mode = this.getBrowserInteractionMode();
-    if (mode !== "automatic" && mode !== "manual") {
-      throw new Error("Launcher browser interaction mode is invalid");
-    }
-    return mode;
-  }
-
-  browserInteractionArgs({ refreshCapabilities = false, mode = this.browserInteractionMode() } = {}) {
-    if (mode !== "automatic" && mode !== "manual") {
-      throw new Error("Launcher browser interaction mode is invalid");
-    }
-    return [
-      mode === "manual" ? "--zero-risk-browser-interaction" : "--automatic-browser-interaction",
-      ...(mode === "automatic" && refreshCapabilities ? ["--refresh-account-capabilities"] : []),
-    ];
   }
 
   assertProductionProfile(operation) {
@@ -442,19 +400,9 @@ class RuntimeHost {
     };
   }
 
-  mcpCredentialsConfigured(requestedMode) {
+  mcpCredentialsConfigured() {
     const config = this.runtimeConfigSnapshot().config;
-    const interactionMode = requestedMode ?? config?.browserInteractionMode ?? "automatic";
-    if (interactionMode !== "automatic" && interactionMode !== "manual") {
-      throw new Error("Browser interaction mode must be automatic or manual");
-    }
-    const explicitTunnel = interactionMode === "manual"
-      ? config?.manualTunnel
-      : config?.automaticTunnel;
-    const hasExplicitProfiles = Boolean(config?.automaticTunnel || config?.manualTunnel);
-    const tunnel = config?.mode === "full"
-      ? explicitTunnel || (!hasExplicitProfiles && interactionMode === "automatic" ? config.tunnel : null)
-      : null;
+    const tunnel = config?.mode === "full" ? config.tunnel : null;
     return Boolean(
       tunnel
       && /^tunnel_[a-f0-9]{32}$/.test(tunnel.tunnelId)
@@ -477,24 +425,14 @@ class RuntimeHost {
       path.join(this.codexHome, "config.toml"),
       path.join(this.codexHome, "models_cache.json"),
       path.join(coreHome, "secrets", "tunnel-runtime.key"),
-      path.join(coreHome, "secrets", "tunnel-runtime-automatic.key"),
-      path.join(coreHome, "secrets", "tunnel-runtime-zero-risk.key"),
       path.join(coreHome, "tunnel", "profiles", "codex-chatgpt-web.yaml"),
-      path.join(coreHome, "tunnel", "profiles", "codex-chatgpt-web-zero-risk.yaml"),
-      path.join(coreHome, "tunnel", "profiles", "codex-chatgpt-web-dev.yaml"),
-      path.join(coreHome, "tunnel", "profiles", "codex-chatgpt-web-dev-zero-risk.yaml"),
     ]);
     if (snapshot.owner === "external" && this.platform === "darwin") {
       paths.add(path.join(this.launchAgentsDir, "io.github.codex-chatgpt-web.daemon.plist"));
       paths.add(path.join(this.launchAgentsDir, "io.github.codex-chatgpt-web.tunnel.plist"));
     }
-    const tunnels = [
-      snapshot.config?.tunnel,
-      snapshot.config?.automaticTunnel,
-      snapshot.config?.manualTunnel,
-    ];
-    for (const tunnel of tunnels) {
-      if (!tunnel || typeof tunnel !== "object") continue;
+    const tunnel = snapshot.config?.tunnel;
+    if (tunnel && typeof tunnel === "object") {
       if (typeof tunnel.runtimeKeyFile === "string" && tunnel.runtimeKeyFile) {
         paths.add(tunnel.runtimeKeyFile);
       }
@@ -505,9 +443,7 @@ class RuntimeHost {
         paths.add(path.join(tunnel.profileDir, `${tunnel.profileName}.yaml`));
       }
     }
-    return [...paths].map(filePath => captureRegularFile(filePath, {
-      followSymlink: filePath === path.join(this.codexHome, "config.toml"),
-    }));
+    return [...paths].map(captureRegularFile);
   }
 
   setupCheckpointChanged(checkpoint) {
@@ -922,10 +858,6 @@ class RuntimeHost {
     return connectorNameForSetup(current.config?.appName);
   }
 
-  setupConnectorName() {
-    return this.launcherProfile === "development" ? DEV_CONNECTOR_NAME : CURRENT_CONNECTOR_NAME;
-  }
-
   cancelActiveTurns() {
     this.assertProductionProfile("Launcher-owned turn cancellation");
     return this.run("cancel-active-turns", ["service", "cancel-turns"], {
@@ -993,25 +925,16 @@ class RuntimeHost {
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const existing = this.runtimeConfigSnapshot();
     const mode = existing.mode;
-    const interactionMode = existing.configured
-      ? existing.config?.browserInteractionMode ?? this.browserInteractionMode()
-      : this.browserInteractionMode();
-    if (!existing.configured && interactionMode === "manual") {
-      throw new Error("Zero Risk must be installed through MCP setup because tunnel credentials are required");
-    }
     const args = [
       "setup",
       mode === "full" ? "--full" : "--browser-only",
       "--browser-host-descriptor",
       this.browserDescriptorPath,
-      ...this.browserInteractionArgs({
-        mode: interactionMode,
-        refreshCapabilities: interactionMode === "automatic",
-      }),
-      "--replace-codex-route",
+      "--refresh-account-capabilities",
       "--acknowledge-unofficial",
       "--restart-service",
     ];
+    if (mode === "full") args.push("--app-name", this.browserConnectorName());
     const result = await this.runSetup("core-setup", args, {
       message: "Configuring the ChatGPT Web provider runtime",
       successMessage: "ChatGPT Web provider runtime configured",
@@ -1027,21 +950,16 @@ class RuntimeHost {
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const existing = this.runtimeConfigSnapshot();
     const mode = existing.mode;
-    const interactionMode = existing.configured
-      ? existing.config?.browserInteractionMode ?? this.browserInteractionMode()
-      : "automatic";
     const args = [
       "dev",
       "setup",
       mode === "full" ? "--full" : "--browser-only",
       "--browser-host-descriptor",
       this.browserDescriptorPath,
-      ...this.browserInteractionArgs({
-        mode: interactionMode,
-        refreshCapabilities: interactionMode === "automatic",
-      }),
+      "--refresh-account-capabilities",
       "--acknowledge-unofficial",
     ];
+    if (mode === "full") args.push("--app-name", this.browserConnectorName());
     const result = await this.runDevSetup("dev-profile-setup", args, {
       message: "Configuring the isolated DEV harness",
       successMessage: "Isolated DEV harness configured",
@@ -1064,11 +982,11 @@ class RuntimeHost {
         mode === "full" ? "--full" : "--browser-only",
         "--browser-host-descriptor",
         this.browserDescriptorPath,
-        ...this.browserInteractionArgs(),
         "--acknowledge-unofficial",
         contextFlag,
       ];
       if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
+      if (mode === "full") args.push("--app-name", this.browserConnectorName());
       const result = await this.runDevSetup("bigger-context", args, {
         message: enabled ? "Enabling Bigger Context" : "Disabling Bigger Context",
         successMessage: enabled ? "Bigger Context enabled" : "Standard context restored",
@@ -1081,81 +999,18 @@ class RuntimeHost {
       mode === "full" ? "--full" : "--browser-only",
       "--browser-host-descriptor",
       this.browserDescriptorPath,
-      ...this.browserInteractionArgs(),
-      "--replace-codex-route",
       "--acknowledge-unofficial",
       "--restart-service",
       contextFlag,
     ];
     if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
+    if (mode === "full") args.push("--app-name", this.browserConnectorName());
     const result = await this.runSetup("bigger-context", args, {
       message: enabled ? "Enabling Bigger Context" : "Disabling Bigger Context",
       successMessage: enabled ? "Bigger Context enabled" : "Standard context restored",
       timeoutMs: CORE_SETUP_TIMEOUT_MS,
     });
     return { ...result, mode, enabled: enabled === true };
-  }
-
-  async setSkillAttachments(enabled) {
-    const current = this.runtimeConfigSnapshot();
-    if (!current.configured) throw new Error("Initialize the runtime before changing Skills as files");
-    if (current.config?.browserInteractionMode === "manual") {
-      throw new Error("Skills as files is unavailable in Zero Risk mode");
-    }
-    const development = this.launcherProfile === "development";
-    const args = [
-      ...(development ? ["dev", "setup"] : ["setup"]),
-      current.mode === "full" ? "--full" : "--browser-only",
-      "--browser-host-descriptor", this.browserDescriptorPath,
-      ...this.browserInteractionArgs(),
-      "--acknowledge-unofficial",
-      ...(development ? [] : ["--replace-codex-route", "--restart-service"]),
-      enabled === true ? "--skill-attachments" : "--inline-skills",
-    ];
-    if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
-    const options = {
-      message: enabled ? "Enabling Skills as files" : "Disabling Skills as files",
-      successMessage: enabled ? "Skills as files enabled" : "Inline skills restored",
-      timeoutMs: CORE_SETUP_TIMEOUT_MS,
-    };
-    const result = development
-      ? await this.runDevSetup("skill-attachments", args, options)
-      : await this.runSetup("skill-attachments", args, options);
-    return { ...result, enabled: enabled === true };
-  }
-
-  async setZeroRiskPro(enabled) {
-    const current = this.runtimeConfigSnapshot();
-    if (!current.configured) {
-      throw new Error("Install the Codex integration before changing Zero Risk model profiles");
-    }
-    if (current.config?.browserInteractionMode !== "manual" || current.mode !== "full") {
-      throw new Error("Zero Risk Pro is available only while the Full Zero Risk harness is active");
-    }
-    const profileFlag = enabled === true ? "--zero-risk-pro" : "--zero-risk-default";
-    const args = [
-      ...(this.launcherProfile === "development" ? ["dev", "setup"] : ["setup"]),
-      "--full",
-      "--browser-host-descriptor",
-      this.browserDescriptorPath,
-      ...this.browserInteractionArgs({ mode: "manual" }),
-      "--acknowledge-unofficial",
-      "--standard-context",
-      profileFlag,
-      ...(this.launcherProfile === "production" ? ["--replace-codex-route", "--restart-service"] : []),
-    ];
-    if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
-    const options = {
-      message: enabled ? "Installing the Zero Risk Pro model" : "Removing the Zero Risk Pro model",
-      successMessage: enabled
-        ? `Zero Risk Pro installed${this.launcherProfile === "production" ? "; restart Codex" : ""}`
-        : `Default Zero Risk model restored${this.launcherProfile === "production" ? "; restart Codex" : ""}`,
-      timeoutMs: CORE_SETUP_TIMEOUT_MS,
-    };
-    const result = this.launcherProfile === "development"
-      ? await this.runDevSetup("zero-risk-pro", args, options)
-      : await this.runSetup("zero-risk-pro", args, options);
-    return { ...result, mode: current.mode, enabled: enabled === true };
   }
 
   async upgradeManagedRuntime() {
@@ -1165,28 +1020,8 @@ class RuntimeHost {
     const currentVersion = this.app.getVersion();
     const connectorMigrationRequired = existing.mode === "full"
       && isLegacyConnectorName(validateConnectorName(existing.config?.appName));
-    const interactionMode = existing.config?.browserInteractionMode ?? "automatic";
-    const expectedTunnelProfile = interactionMode === "manual"
-      ? "codex-chatgpt-web-zero-risk"
-      : "codex-chatgpt-web";
-    const expectedKeyFile = interactionMode === "manual"
-      ? "tunnel-runtime-zero-risk.key"
-      : "tunnel-runtime-automatic.key";
-    const explicitTunnel = interactionMode === "manual"
-      ? existing.config?.manualTunnel
-      : existing.config?.automaticTunnel;
-    const activeTunnel = existing.config?.tunnel;
-    const tunnelProfileMigrationRequired = existing.mode === "full" && Boolean(activeTunnel) && Boolean(
-      !explicitTunnel
-      || explicitTunnel.tunnelId !== activeTunnel.tunnelId
-      || activeTunnel.profileName !== expectedTunnelProfile
-      || activeTunnel.alias !== expectedTunnelProfile
-      || path.basename(activeTunnel.runtimeKeyFile) !== expectedKeyFile
-    );
     if (existing.owner !== "launcher"
-      || (existing.config?.releaseVersion === currentVersion
-        && !connectorMigrationRequired
-        && !tunnelProfileMigrationRequired)) {
+      || (existing.config?.releaseVersion === currentVersion && !connectorMigrationRequired)) {
       return { updated: false };
     }
     const args = [
@@ -1194,19 +1029,15 @@ class RuntimeHost {
       existing.mode === "full" ? "--full" : "--browser-only",
       "--browser-host-descriptor",
       this.browserDescriptorPath,
-      // A release may repair capability detection. Reusing the previous result can
-      // keep eligible models disabled even after the corrected probe is installed.
-      ...this.browserInteractionArgs({ mode: interactionMode, refreshCapabilities: true }),
       "--acknowledge-unofficial",
       "--restart-service",
     ];
+    if (existing.mode === "full") {
+      args.push("--app-name", connectorNameForSetup(existing.config?.appName));
+    }
     const result = await this.runSetup("runtime-upgrade", args, {
-      message: tunnelProfileMigrationRequired
-        ? `Separating ${interactionMode === "manual" ? "Zero Risk" : "Automatic"} MCP credentials`
-        : `Upgrading launcher runtime from ${existing.config.releaseVersion} to ${currentVersion}`,
-      successMessage: tunnelProfileMigrationRequired
-        ? `${interactionMode === "manual" ? "Zero Risk" : "Automatic"} MCP profile migrated`
-        : `Launcher runtime upgraded to ${currentVersion}`,
+      message: `Upgrading launcher runtime from ${existing.config.releaseVersion} to ${currentVersion}`,
+      successMessage: `Launcher runtime upgraded to ${currentVersion}`,
       timeoutMs: existing.mode === "full" ? MCP_SETUP_TIMEOUT_MS : CORE_SETUP_TIMEOUT_MS,
     });
     return {
@@ -1219,11 +1050,10 @@ class RuntimeHost {
     };
   }
 
-  setupMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode } = {}, afterRuntimeReady) {
+  setupMcp({ tunnelId = "", runtimeKey = "", replace = false } = {}) {
     this.assertProductionProfile("Native Codex MCP setup");
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
-    const targetMode = interactionMode ?? this.browserInteractionMode();
-    const reuseSavedCredentials = replace !== true && this.mcpCredentialsConfigured(targetMode);
+    const reuseSavedCredentials = replace !== true && this.mcpCredentialsConfigured();
     if (!reuseSavedCredentials && !/^tunnel_[a-f0-9]{32}$/.test(tunnelId)) {
       throw new Error("Tunnel ID must be tunnel_ followed by 32 lowercase hexadecimal characters");
     }
@@ -1235,8 +1065,8 @@ class RuntimeHost {
       "--full",
       "--browser-host-descriptor",
       this.browserDescriptorPath,
-      ...this.browserInteractionArgs({ mode: targetMode }),
-      "--replace-codex-route",
+      "--app-name",
+      this.browserConnectorName(),
     ];
     if (reuseSavedCredentials) {
       args.push("--acknowledge-unofficial", "--restart-service");
@@ -1244,7 +1074,6 @@ class RuntimeHost {
         message: "Reconnecting the native Codex harness with saved tunnel credentials",
         successMessage: "Local MCP tools are ready",
         timeoutMs: MCP_SETUP_TIMEOUT_MS,
-        afterRuntimeReady,
       });
     }
     const secretsDir = path.join(this.app.getPath("userData"), "secrets");
@@ -1264,17 +1093,15 @@ class RuntimeHost {
       message: "Connecting the native Codex harness",
       successMessage: "Local MCP tools are ready",
       timeoutMs: MCP_SETUP_TIMEOUT_MS,
-      afterRuntimeReady,
     }).finally(() => fs.rmSync(keyPath, { force: true }));
   }
 
-  setupDevMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode } = {}, afterRuntimeReady) {
+  setupDevMcp({ tunnelId = "", runtimeKey = "", replace = false } = {}) {
     if (this.launcherProfile !== "development") {
       throw new Error("DEV MCP setup requires the isolated DEV launcher");
     }
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
-    const targetMode = interactionMode ?? this.browserInteractionMode();
-    const reuseSavedCredentials = replace !== true && this.mcpCredentialsConfigured(targetMode);
+    const reuseSavedCredentials = replace !== true && this.mcpCredentialsConfigured();
     if (!reuseSavedCredentials && !/^tunnel_[a-f0-9]{32}$/.test(tunnelId)) {
       throw new Error("Tunnel ID must be tunnel_ followed by 32 lowercase hexadecimal characters");
     }
@@ -1287,7 +1114,8 @@ class RuntimeHost {
       "--full",
       "--browser-host-descriptor",
       this.browserDescriptorPath,
-      ...this.browserInteractionArgs({ mode: targetMode }),
+      "--app-name",
+      this.browserConnectorName(),
       "--acknowledge-unofficial",
     ];
     if (reuseSavedCredentials) {
@@ -1295,7 +1123,6 @@ class RuntimeHost {
         message: "Validating saved DEV tunnel credentials",
         successMessage: "DEV Full harness is configured",
         timeoutMs: MCP_SETUP_TIMEOUT_MS,
-        afterRuntimeReady,
       });
     }
     const secretsDir = path.join(this.app.getPath("userData"), "secrets");
@@ -1308,48 +1135,7 @@ class RuntimeHost {
       message: "Configuring the isolated DEV Full harness",
       successMessage: "DEV Full harness is configured",
       timeoutMs: MCP_SETUP_TIMEOUT_MS,
-      afterRuntimeReady,
     }).finally(() => fs.rmSync(keyPath, { force: true }));
-  }
-
-  async setBrowserInteractionMode(mode, afterRuntimeReady) {
-    if (mode !== "automatic" && mode !== "manual") {
-      throw new Error("Browser interaction mode must be automatic or manual");
-    }
-    const current = this.runtimeConfigSnapshot();
-    if (!current.configured) {
-      throw new Error("Install the Codex integration before changing browser interaction mode");
-    }
-    if (mode === "manual" && current.mode !== "full") {
-      throw new Error("Connect the Full MCP harness before enabling Zero Risk");
-    }
-    const args = [
-      ...(this.launcherProfile === "development" ? ["dev", "setup"] : ["setup"]),
-      current.mode === "full" ? "--full" : "--browser-only",
-      "--browser-host-descriptor",
-      this.browserDescriptorPath,
-      ...this.browserInteractionArgs({ mode, refreshCapabilities: true }),
-      "--acknowledge-unofficial",
-      ...(this.launcherProfile === "production" ? ["--replace-codex-route", "--restart-service"] : []),
-      mode === "automatic" && current.config?.experimentalBiggerContext === true
-        ? "--bigger-context"
-        : "--standard-context",
-    ];
-    if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
-    const options = {
-      message: mode === "manual"
-        ? "Enabling Zero Risk"
-        : "Enabling automatic browser interaction",
-      successMessage: mode === "manual"
-        ? `Zero Risk enabled${this.launcherProfile === "production" ? "; restart Codex" : ""}`
-        : `Automatic browser interaction enabled${this.launcherProfile === "production" ? "; restart Codex" : ""}`,
-      timeoutMs: current.mode === "full" ? MCP_SETUP_TIMEOUT_MS : CORE_SETUP_TIMEOUT_MS,
-      afterRuntimeReady,
-    };
-    const result = this.launcherProfile === "development"
-      ? await this.runDevSetup("browser-interaction-mode", args, options)
-      : await this.runSetup("browser-interaction-mode", args, options);
-    return { configured: true, mode, stdout: result.stdout };
   }
 
   async runDevSetup(name, args, options) {
@@ -1369,17 +1155,7 @@ class RuntimeHost {
     const checkpoint = this.captureSetupCheckpoint(previousRuntime);
     this.lifecycleOperation = name;
     let setupCommandStarted = false;
-    let runtimeTransitionStarted = false;
     try {
-      if (this.launcherProfile === "production") {
-        await this.run(name, [...args, "--preflight-only"], {
-          ...options,
-          message: "Validating Codex configuration before changing the runtime",
-          successMessage: "Codex configuration is ready for setup",
-          timeoutMs: options.timeoutMs || CORE_SETUP_TIMEOUT_MS,
-        });
-      }
-      runtimeTransitionStarted = true;
       if (previousRuntime.owner === "external") this.supervisor.prepareExternalMigration();
       else await this.supervisor.stopForSetup();
       setupCommandStarted = true;
@@ -1388,7 +1164,6 @@ class RuntimeHost {
       if (runtime.status !== "ready") {
         throw new Error(`Setup completed, but the launcher-owned runtime is ${runtime.status}: ${runtime.detail || "not ready"}`);
       }
-      await options.afterRuntimeReady?.();
       return result;
     } catch (error) {
       const primary = error instanceof Error ? error.message : String(error);
@@ -1404,7 +1179,7 @@ class RuntimeHost {
           );
         }
       }
-      if (previousRuntime.configured && checkpoint && runtimeTransitionStarted) {
+      if (previousRuntime.configured && checkpoint) {
         try {
           checkpointChanged = this.setupCheckpointChanged(checkpoint);
         } catch (caught) {
@@ -1420,14 +1195,12 @@ class RuntimeHost {
         }
       }
       let recoveryError;
-      if (runtimeTransitionStarted) {
-        try {
-          await this.restorePreviousRuntime(previousRuntime, name, {
-            repairExternal: previousRuntime.owner === "external" && checkpointChanged,
-          });
-        } catch (caught) {
-          recoveryError = caught;
-        }
+      try {
+        await this.restorePreviousRuntime(previousRuntime, name, {
+          repairExternal: previousRuntime.owner === "external" && checkpointChanged,
+        });
+      } catch (caught) {
+        recoveryError = caught;
       }
       if (recoveryError) {
         failures.push(

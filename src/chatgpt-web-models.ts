@@ -1,20 +1,11 @@
 export const CHATGPT_WEB_MODEL_PREFIX = "chatgpt-web/";
 export const CHATGPT_WEB_BACKEND_MODEL = "gpt-5.6-sol";
 export const CHATGPT_WEB_LUNA_BACKEND_MODEL = "gpt-5.6-luna";
-/** Internal adapter identity for a turn whose ChatGPT model is selected by the user in the launcher. */
-export const CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL = "chatgpt-web-zero-risk";
-/** Internal adapter identity for the explicitly enabled, Pro-sized Zero Risk context profile. */
-export const CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL = "chatgpt-web-zero-risk-pro";
 
 export type ChatGptWebAutomaticBackendModel =
   | typeof CHATGPT_WEB_BACKEND_MODEL
   | typeof CHATGPT_WEB_LUNA_BACKEND_MODEL;
-export type ChatGptWebBackendModel =
-  | ChatGptWebAutomaticBackendModel
-  | ChatGptWebZeroRiskBackendModel;
-export type ChatGptWebZeroRiskBackendModel =
-  | typeof CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL
-  | typeof CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL;
+export type ChatGptWebBackendModel = ChatGptWebAutomaticBackendModel;
 
 export type ChatGptWebCodexEffort = "low" | "medium" | "high" | "xhigh" | "ultra";
 export type ChatGptWebAdapterEffort = "low" | "medium" | "high" | "xhigh" | "max";
@@ -26,13 +17,6 @@ export type ChatGptWebAdapterEffort = "low" | "medium" | "high" | "xhigh" | "max
  */
 export const CHATGPT_WEB_INSTANT_CONTEXT_WINDOW = 41_000;
 export const CHATGPT_WEB_INSTANT_AUTO_COMPACT_TOKEN_LIMIT = 32_000;
-/**
- * Zero Risk keeps one visible ChatGPT conversation across sequential Codex turns. Its fixed route
- * therefore uses the requested three-turn compaction interval without enabling Bigger Context's
- * automatic multipart transport; the user still pastes exactly one incremental prompt per turn.
- */
-export const CHATGPT_WEB_ZERO_RISK_CONTEXT_WINDOW = CHATGPT_WEB_INSTANT_CONTEXT_WINDOW * 3;
-export const CHATGPT_WEB_ZERO_RISK_AUTO_COMPACT_TOKEN_LIMIT = CHATGPT_WEB_INSTANT_AUTO_COMPACT_TOKEN_LIMIT * 3;
 export const CHATGPT_WEB_MEDIUM_HIGH_CONTEXT_WINDOW = 90_000;
 export const CHATGPT_WEB_MEDIUM_HIGH_AUTO_COMPACT_TOKEN_LIMIT = 80_000;
 export const CHATGPT_WEB_INSTANT_COMPOSER_CHAR_LIMIT = 211_256;
@@ -53,15 +37,6 @@ export const CHATGPT_WEB_PRO_STANDARD_CONTEXT_WINDOW =
   CHATGPT_WEB_PRO_STANDARD_MESSAGE_TOKEN_LIMIT + CHATGPT_WEB_PLATFORM_RESERVE_TOKENS + 1;
 export const CHATGPT_WEB_PRO_MODEL_CONTEXT_WINDOW =
   CHATGPT_WEB_PRO_MODEL_MESSAGE_TOKEN_LIMIT + CHATGPT_WEB_PLATFORM_RESERVE_TOKENS + 1;
-/**
- * Zero Risk Pro keeps the same three-turn manual conversation budget as the default profile, but
- * sizes each turn from the measured ChatGPT Pro boundary. The launcher cannot verify that the user
- * actually selected Pro, so this profile is exposed only through an explicit user setting.
- */
-export const CHATGPT_WEB_ZERO_RISK_PRO_CONTEXT_WINDOW =
-  CHATGPT_WEB_PRO_MODEL_CONTEXT_WINDOW * 3;
-export const CHATGPT_WEB_ZERO_RISK_PRO_AUTO_COMPACT_TOKEN_LIMIT =
-  CHATGPT_WEB_PRO_AUTO_COMPACT_TOKEN_LIMIT * 3;
 export const CHATGPT_WEB_PRO_INSTANT_COMPOSER_CHAR_LIMIT = 545_000;
 // Rechecked 2026-09-19: Pro-account Medium/High accept 500k characters but the server
 // rejects larger messages with HTTP 413 (message_length_exceeds_limit), even below
@@ -88,12 +63,6 @@ export interface ChatGptWebTransportLimits {
   browserComposerCharLimit?: number;
 }
 
-export function isChatGptWebZeroRiskBackendModel(
-  model: string,
-): model is ChatGptWebZeroRiskBackendModel {
-  return model === CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL
-    || model === CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL;
-}
 
 function contextLimits(
   contextWindow: number,
@@ -114,21 +83,6 @@ export function resolveChatGptWebContextLimits(
   effort: ChatGptWebAdapterEffort,
   capabilities: ChatGptWebAccountCapabilities,
 ): ChatGptWebContextLimits {
-  if (isChatGptWebZeroRiskBackendModel(backendModel)) {
-    if (capabilities.experimentalBiggerContext) {
-      throw new Error("Zero Risk does not support Bigger Context");
-    }
-    if (backendModel === CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL) {
-      return contextLimits(
-        CHATGPT_WEB_ZERO_RISK_PRO_CONTEXT_WINDOW,
-        CHATGPT_WEB_ZERO_RISK_PRO_AUTO_COMPACT_TOKEN_LIMIT,
-      );
-    }
-    return contextLimits(
-      CHATGPT_WEB_ZERO_RISK_CONTEXT_WINDOW,
-      CHATGPT_WEB_ZERO_RISK_AUTO_COMPACT_TOKEN_LIMIT,
-    );
-  }
   if (backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) {
     // Luna carries continuity through a private checkpoint on every completed browser turn. Codex
     // internally clamps this field to 90% of the model window, but the reported active usage is the
@@ -170,7 +124,7 @@ export function resolveChatGptWebTransportLimits(
   effort: ChatGptWebAdapterEffort,
   capabilities: ChatGptWebAccountCapabilities,
 ): ChatGptWebTransportLimits {
-  if (isChatGptWebZeroRiskBackendModel(backendModel)) return {};
+
   if (backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) return {};
   if (!capabilities.proAvailable) {
     if (effort === "low") {
@@ -230,19 +184,12 @@ interface ChatGptWebModelRouteBase {
 }
 
 export interface ChatGptWebAutomaticModelRoute extends ChatGptWebModelRouteBase {
-  interactionMode: "automatic";
   backendModel: ChatGptWebAutomaticBackendModel;
   adapterEffort: ChatGptWebAdapterEffort;
 }
 
-export interface ChatGptWebZeroRiskModelRoute extends ChatGptWebModelRouteBase {
-  interactionMode: "manual";
-  backendModel: ChatGptWebZeroRiskBackendModel;
-  /** Technical protocol value only; Zero Risk must not use it to choose the ChatGPT model. */
-  adapterEffort: "low";
-}
 
-export type ChatGptWebModelRoute = ChatGptWebAutomaticModelRoute | ChatGptWebZeroRiskModelRoute;
+export type ChatGptWebModelRoute = ChatGptWebAutomaticModelRoute;
 
 export interface ChatGptWebAccountCapabilities {
   solAvailable: boolean;
@@ -250,37 +197,15 @@ export interface ChatGptWebAccountCapabilities {
   extraHighAvailable?: boolean;
   proAvailable: boolean;
   experimentalBiggerContext?: boolean;
-  browserInteractionMode?: "automatic" | "manual";
-  zeroRiskProEnabled?: boolean;
+
 }
 
-export const CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE: ChatGptWebZeroRiskModelRoute = {
-  slug: "chatgpt-web/zero-risk",
-  displayName: "ChatGPT Web — Zero Risk",
-  description: "Zero Risk keeps model selection and prompt submission under your control while preserving the native Codex harness.",
-  interactionMode: "manual",
-  backendModel: CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL,
-  codexEffort: "low",
-  adapterEffort: "low",
-  requiresPro: false,
-};
 
-export const CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE: ChatGptWebZeroRiskModelRoute = {
-  slug: "chatgpt-web/zero-risk-pro",
-  displayName: "ChatGPT Web — Zero Risk Pro",
-  description: "Explicit Pro-sized Zero Risk context; select ChatGPT Pro manually for every turn.",
-  interactionMode: "manual",
-  backendModel: CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL,
-  codexEffort: "low",
-  adapterEffort: "low",
-  requiresPro: true,
-};
 
 export const CHATGPT_WEB_LUNA_MODEL_ROUTE: ChatGptWebAutomaticModelRoute = {
   slug: "chatgpt-web/luna",
   displayName: "ChatGPT Web — Luna",
   description: "ChatGPT Web Luna for accounts without the Sol model selector.",
-  interactionMode: "automatic",
   backendModel: CHATGPT_WEB_LUNA_BACKEND_MODEL,
   codexEffort: "low",
   adapterEffort: "low",
@@ -291,7 +216,6 @@ export const CHATGPT_WEB_LUNA_THINK_MODEL_ROUTE: ChatGptWebModelRoute = {
   slug: "chatgpt-web/think",
   displayName: "ChatGPT Web — Think",
   description: "ChatGPT Web Think for Luna-only accounts.",
-  interactionMode: "automatic",
   backendModel: CHATGPT_WEB_LUNA_BACKEND_MODEL,
   codexEffort: "low",
   // The backend model remains Luna. This internal adapter effort distinguishes the explicit
@@ -316,7 +240,6 @@ export const CHATGPT_WEB_MODEL_ROUTES: readonly ChatGptWebAutomaticModelRoute[] 
     slug: "chatgpt-web/light",
     displayName: "ChatGPT Web — Instant",
     description: "ChatGPT Web Instant through the native Codex harness.",
-    interactionMode: "automatic",
     backendModel: CHATGPT_WEB_BACKEND_MODEL,
     codexEffort: "low",
     adapterEffort: "low",
@@ -326,7 +249,6 @@ export const CHATGPT_WEB_MODEL_ROUTES: readonly ChatGptWebAutomaticModelRoute[] 
     slug: "chatgpt-web/medium",
     displayName: "ChatGPT Web — Medium",
     description: "ChatGPT Web Medium through the native Codex harness.",
-    interactionMode: "automatic",
     backendModel: CHATGPT_WEB_BACKEND_MODEL,
     codexEffort: "medium",
     adapterEffort: "medium",
@@ -336,7 +258,6 @@ export const CHATGPT_WEB_MODEL_ROUTES: readonly ChatGptWebAutomaticModelRoute[] 
     slug: "chatgpt-web/high",
     displayName: "ChatGPT Web — High",
     description: "ChatGPT Web High through the native Codex harness.",
-    interactionMode: "automatic",
     backendModel: CHATGPT_WEB_BACKEND_MODEL,
     codexEffort: "high",
     adapterEffort: "high",
@@ -346,7 +267,6 @@ export const CHATGPT_WEB_MODEL_ROUTES: readonly ChatGptWebAutomaticModelRoute[] 
     slug: "chatgpt-web/extra-high",
     displayName: "ChatGPT Web — Extra High",
     description: "Account-gated ChatGPT Web Extra High through the native Codex harness.",
-    interactionMode: "automatic",
     backendModel: CHATGPT_WEB_BACKEND_MODEL,
     codexEffort: "xhigh",
     adapterEffort: "xhigh",
@@ -357,7 +277,6 @@ export const CHATGPT_WEB_MODEL_ROUTES: readonly ChatGptWebAutomaticModelRoute[] 
     slug: "chatgpt-web/pro",
     displayName: "ChatGPT Web — Pro",
     description: "Account-gated ChatGPT Pro through the native Codex harness.",
-    interactionMode: "automatic",
     backendModel: CHATGPT_WEB_BACKEND_MODEL,
     codexEffort: "ultra",
     adapterEffort: "max",
@@ -367,8 +286,7 @@ export const CHATGPT_WEB_MODEL_ROUTES: readonly ChatGptWebAutomaticModelRoute[] 
 
 const routesBySlug = new Map(
   [
-    CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE,
-    CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE,
+
     ...CHATGPT_WEB_LUNA_MODEL_ROUTES,
     ...CHATGPT_WEB_MODEL_ROUTES,
   ]
@@ -382,14 +300,6 @@ export function isChatGptWebModelSlug(modelId: string): boolean {
 export function availableChatGptWebModelRoutes(
   capabilities: ChatGptWebAccountCapabilities,
 ): readonly ChatGptWebModelRoute[] {
-  if (capabilities.browserInteractionMode === "manual") {
-    if (capabilities.experimentalBiggerContext) {
-      throw new Error("Zero Risk does not support Bigger Context");
-    }
-    return capabilities.zeroRiskProEnabled
-      ? [CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE, CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE]
-      : [CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE];
-  }
   if (!capabilities.solAvailable) return CHATGPT_WEB_LUNA_MODEL_ROUTES;
   return CHATGPT_WEB_MODEL_ROUTES.filter(route =>
     (!route.requiresPro || capabilities.proAvailable)
@@ -400,23 +310,8 @@ export function requireChatGptWebModelRoute(
   modelId: string,
   capabilities: ChatGptWebAccountCapabilities,
 ): ChatGptWebModelRoute {
-  if (capabilities.browserInteractionMode === "manual" && capabilities.experimentalBiggerContext) {
-    throw new Error("Zero Risk does not support Bigger Context");
-  }
   const route = routesBySlug.get(modelId);
   if (!route) throw new Error(`ChatGPT web model is not enabled: ${modelId}`);
-  if (capabilities.browserInteractionMode === "manual") {
-    if (route.interactionMode !== "manual") {
-      throw new Error(`${route.displayName} is not available while Zero Risk is enabled`);
-    }
-    if (route === CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE && !capabilities.zeroRiskProEnabled) {
-      throw new Error(`${route.displayName} is not enabled in Zero Risk model settings`);
-    }
-    return route;
-  }
-  if (route.interactionMode === "manual") {
-    throw new Error(`${route.displayName} is only available while Zero Risk is enabled`);
-  }
   if (route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) {
     if (capabilities.solAvailable) {
       throw new Error(`${route.displayName} is only available for Luna-only accounts`);

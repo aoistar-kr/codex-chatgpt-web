@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { unzipSync } from "fflate";
-import type { AppConfig, BrowserInteractionMode, TunnelConfig } from "./config";
+import type { AppConfig, TunnelConfig } from "./config";
 import { atomicWriteFile, getConfigDir } from "./config";
 import { runCommand, runChecked } from "./process";
 
@@ -156,30 +156,21 @@ export async function installTunnelClient(): Promise<string> {
   return executable;
 }
 
-export function installRuntimeKey(
-  sourcePath: string,
-  interactionMode: BrowserInteractionMode = "automatic",
-): string {
+export function installRuntimeKey(sourcePath: string): string {
   if (!existsSync(sourcePath)) throw new Error(`Tunnel runtime key file does not exist: ${sourcePath}`);
   const key = readFileSync(sourcePath);
   if (key.byteLength === 0 || key.byteLength > 64 * 1024) throw new Error("Tunnel runtime key file is empty or unexpectedly large");
-  return installRuntimeKeyBytes(key, interactionMode);
+  return installRuntimeKeyBytes(key);
 }
 
-export function managedRuntimeKeyPath(interactionMode: BrowserInteractionMode = "automatic"): string {
-  const fileName = interactionMode === "manual"
-    ? "tunnel-runtime-zero-risk.key"
-    : "tunnel-runtime-automatic.key";
-  return join(getConfigDir(), "secrets", fileName);
+export function managedRuntimeKeyPath(): string {
+  return join(getConfigDir(), "secrets", "tunnel-runtime.key");
 }
 
-export function installRuntimeKeyBytes(
-  key: Uint8Array | string,
-  interactionMode: BrowserInteractionMode = "automatic",
-): string {
+export function installRuntimeKeyBytes(key: Uint8Array | string): string {
   const bytes = typeof key === "string" ? new TextEncoder().encode(key.trim()) : key;
   if (bytes.byteLength === 0 || bytes.byteLength > 64 * 1024) throw new Error("Tunnel runtime key is empty or unexpectedly large");
-  const destination = managedRuntimeKeyPath(interactionMode);
+  const destination = managedRuntimeKeyPath();
   atomicWriteFile(destination, bytes);
   return destination;
 }
@@ -219,19 +210,12 @@ function tunnelCommandQuoted(value: string): string {
 }
 
 export function mcpCommand(config: AppConfig, platform = process.platform): string {
-  const contract = config.browserInteractionMode === "manual" ? "safe" : "native";
-  const command = [
-    ...config.runtimeCommand,
-    "mcp",
-    "--contract",
-    contract,
-    "--broker-socket",
-    config.brokerSocketPath,
-  ];
   if (platform === "win32") {
-    return command.map(tunnelCommandQuoted).join(" ");
+    return [...config.runtimeCommand, "mcp", "--broker-socket", config.brokerSocketPath]
+      .map(tunnelCommandQuoted)
+      .join(" ");
   }
-  return command.map(shellQuote).join(" ");
+  return [...config.runtimeCommand, "mcp", "--broker-socket", config.brokerSocketPath].map(shellQuote).join(" ");
 }
 
 function tunnel(config: AppConfig): TunnelConfig {
@@ -355,24 +339,23 @@ export function tunnelConnectLaunchError(output: string): string | undefined {
   ].join("; "));
 }
 
-export function parseTunnelStatus(output: string, alias: string, exitStatus = 0): TunnelRuntimeStatus {
+export function parseTunnelStatus(output: string, exitStatus = 0): TunnelRuntimeStatus {
   if (exitStatus !== 0) {
     return { ok: false, processRunning: false, healthy: false, ready: false, detail: safeTunnelDetail(output) };
   }
   try {
     const parsed = JSON.parse(output) as Record<string, unknown>;
-    if (!Array.isArray(parsed.entries)) throw new Error("local inventory has no entries array");
-    const matches = parsed.entries.filter(entry => entry?.alias === alias);
-    if (matches.length > 1) throw new Error("local inventory contains duplicate aliases");
-    const state = matches.length === 0 ? "stopped" : matches[0].runtime_state;
-    if (!["stopped", "starting", "healthy", "ready"].includes(state)) {
-      throw new Error("local inventory has an unsupported runtime state");
-    }
-    // tunnel-client 0.0.12 derives these states from the live process and local healthz/readyz
-    // probes. It does not need the optional remote control-plane lookup made by `status`.
-    const processRunning = state !== "stopped";
-    const healthy = state === "healthy" || state === "ready";
-    const ready = state === "ready";
+    const processRunning = parsed.process_running === true;
+    const healthy = parsed.healthy === true;
+    const ready = parsed.ready === true;
+    const state = typeof parsed.runtime_state === "string" ? parsed.runtime_state
+      : typeof parsed.status === "string" ? parsed.status
+        : undefined;
+    const issues = parsed.local && typeof parsed.local === "object" && Array.isArray((parsed.local as { issues?: unknown }).issues)
+      ? ((parsed.local as { issues: unknown[] }).issues).filter(issue => typeof issue === "string").slice(0, 3)
+      : [];
+    const explicitError = typeof parsed.error === "string" && parsed.error ? parsed.error : undefined;
+    const logTail = runtimeLogTail(parsed);
     const ok = processRunning && healthy && ready;
     const detail = ok
       ? "process_running=true healthy=true ready=true"
@@ -380,12 +363,14 @@ export function parseTunnelStatus(output: string, alias: string, exitStatus = 0)
         `process_running=${processRunning}`,
         `healthy=${healthy}`,
         `ready=${ready}`,
-        `state=${state}`,
-        ...(matches.length === 0 ? ["local_inventory=absent"] : []),
+        ...(state ? [`state=${state}`] : []),
+        ...(explicitError ? [explicitError] : []),
+        ...issues,
+        ...(logTail ? [`runtime_log=${logTail}`] : []),
       ].join("; "));
-    return { ok, processRunning, healthy, ready, state, detail };
-  } catch (error) {
-    return { ok: false, processRunning: false, healthy: false, ready: false, detail: `tunnel-client returned invalid local inventory: ${safeTunnelDetail(error instanceof Error ? error.message : String(error))}` };
+    return { ok, processRunning, healthy, ready, ...(state ? { state } : {}), detail };
+  } catch {
+    return { ok: false, processRunning: false, healthy: false, ready: false, detail: `tunnel-client returned non-JSON status: ${safeTunnelDetail(output)}` };
   }
 }
 
@@ -396,10 +381,10 @@ export function tunnelStatus(config: AppConfig): TunnelRuntimeStatus {
   }
   const result = runCommand(
     settings.binaryPath,
-    ["runtimes", "cleanup", "--json"],
+    ["runtimes", "status", settings.alias, "--json"],
     { timeout: 10_000 },
   );
-  return parseTunnelStatus(tunnelCommandOutput(result), settings.alias, result.status);
+  return parseTunnelStatus(tunnelCommandOutput(result), result.status);
 }
 
 export async function waitForTunnelReady(

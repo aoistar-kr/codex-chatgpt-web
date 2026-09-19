@@ -3,8 +3,6 @@ const { randomBytes, timingSafeEqual } = require("node:crypto");
 const { releaseRetainedConversation } = require("./retained-turn-release.cjs");
 
 const MAX_BODY_BYTES = 16 * 1024;
-const MAX_MANUAL_START_BODY_BYTES = 3 * 1024 * 1024;
-const MANUAL_SENT_OBSERVER_TIMEOUT_MS = 35_000;
 
 function secureTokenMatches(expected, authorization) {
   const prefix = "Bearer ";
@@ -14,12 +12,12 @@ function secureTokenMatches(expected, authorization) {
   return supplied.length === wanted.length && timingSafeEqual(supplied, wanted);
 }
 
-async function readJson(request, maxBytes = MAX_BODY_BYTES) {
+async function readJson(request) {
   const chunks = [];
   let bytes = 0;
   for await (const chunk of request) {
     bytes += chunk.length;
-    if (bytes > maxBytes) throw new Error("request body is too large");
+    if (bytes > MAX_BODY_BYTES) throw new Error("request body is too large");
     chunks.push(chunk);
   }
   const text = Buffer.concat(chunks).toString("utf8");
@@ -101,23 +99,12 @@ class BrowserControlServer {
     const isTurnRelease = request.url === "/v1/turn/release";
     const isSessionInspect = request.url === "/v1/session/inspect";
     const isProxyResolution = request.url === "/v1/network/resolve-proxy";
-    const manualAction = new Map([
-      ["/v1/manual/start", "start"],
-      ["/v1/manual/wait-sent", "wait-sent"],
-      ["/v1/manual/wait-terminal", "wait-terminal"],
-      ["/v1/manual/started", "started"],
-      ["/v1/manual/end", "end"],
-      ["/v1/manual/cancel", "cancel"],
-    ]).get(request.url);
-    if (request.method !== "POST" || (!isTurn && !isTurnRelease && !isSessionInspect && !isProxyResolution && !manualAction)) {
+    if (request.method !== "POST" || (!isTurn && !isTurnRelease && !isSessionInspect && !isProxyResolution)) {
       writeJson(response, 404, { error: "not_found" });
       return;
     }
     try {
-      const body = await readJson(
-        request,
-        manualAction === "start" ? MAX_MANUAL_START_BODY_BYTES : MAX_BODY_BYTES,
-      );
+      const body = await readJson(request);
       if (isProxyResolution) {
         const url = new URL(body?.url);
         if (url.origin !== "https://chatgpt.com" || url.username || url.password
@@ -135,13 +122,6 @@ class BrowserControlServer {
       const host = this.getBrowserHost();
       if (!host) throw new Error("browser host is not ready");
       if (isSessionInspect) {
-        if (host.browserInteractionMode() === "manual") {
-          const error = new Error(
-            "ChatGPT session and capability inspection is disabled in Zero Risk mode",
-          );
-          error.code = "manual_browser_inspection_disabled";
-          throw error;
-        }
         const result = await host.inspectSession(body?.detectCapabilities === true);
         writeJson(response, 200, result);
         return;
@@ -205,106 +185,6 @@ class BrowserControlServer {
       if (body.refreshViewport !== undefined && request.url !== "/v1/turn/heartbeat") {
         throw new Error("refreshViewport is only valid for a turn heartbeat");
       }
-      if (manualAction) {
-        if (manualAction === "start") {
-          if (host.browserInteractionMode() !== "manual") {
-            throw new Error("Zero Risk is not enabled");
-          }
-          if (typeof body.prompt !== "string" || body.prompt.length < 1) {
-            throw new Error("manual prompt is invalid");
-          }
-          if (body.resumePrompt !== undefined
-            && (typeof body.resumePrompt !== "string" || body.resumePrompt.length < 1)) {
-            throw new Error("manual resume prompt is invalid");
-          }
-          if (body.compaction !== undefined && body.compaction !== true) {
-            throw new Error("manual compaction flag is invalid");
-          }
-          const lease = host.beginManualTurn(
-            body.traceId,
-            body.helperPid,
-            body.prompt,
-            body.conversationKey,
-            body.resumePrompt,
-            body.compaction === true,
-          );
-          this.logger.info("browser.manual_control_started", {
-            traceId: body.traceId,
-            reused: lease.reused,
-          });
-          writeJson(response, 200, { ok: true, ...lease });
-          return;
-        }
-        if (manualAction === "wait-sent") {
-          const observed = await host.waitManualSent(
-            body.traceId,
-            body.helperPid,
-            MANUAL_SENT_OBSERVER_TIMEOUT_MS,
-          );
-          if (observed.status === "pending") {
-            writeJson(response, 202, { ok: true, status: "pending" });
-            return;
-          }
-          if (observed.status === "timeout") {
-            writeJson(response, 408, { error: "Manual prompt was not confirmed within its allowed time", code: "manual_turn_timed_out" });
-            return;
-          }
-          if (observed.status === "cancelled") {
-            writeJson(response, 409, { error: "Zero Risk turn was cancelled", code: "turn_cancelled" });
-            return;
-          }
-          if (observed.status !== "sent") {
-            writeJson(response, 409, { error: "Zero Risk turn failed before Sent confirmation", code: "manual_turn_failed" });
-            return;
-          }
-          writeJson(response, 200, { ok: true, status: "sent", sentAt: observed.sentAt });
-          return;
-        }
-        if (manualAction === "wait-terminal") {
-          const observed = await host.waitManualTerminal(
-            body.traceId,
-            body.helperPid,
-            MANUAL_SENT_OBSERVER_TIMEOUT_MS,
-          );
-          if (observed.status === "pending") {
-            writeJson(response, 202, { ok: true, status: "pending" });
-            return;
-          }
-          if (observed.status === "timeout") {
-            writeJson(response, 408, {
-              error: "Codex Zero Risk did not start within its allowed time after Sent confirmation",
-              code: "manual_turn_timed_out",
-            });
-            return;
-          }
-          if (!['cancelled', 'failed'].includes(observed.status)) {
-            throw new Error("manual terminal state is invalid");
-          }
-          writeJson(response, 200, { ok: true, status: observed.status });
-          return;
-        }
-        if (manualAction === "started") {
-          host.markManualTurnStarted(body.traceId, body.helperPid);
-          writeJson(response, 200, { ok: true });
-          return;
-        }
-        if (manualAction === "cancel") {
-          const result = host.cancelManualTurn(body.traceId, body.helperPid);
-          writeJson(response, 200, { ok: true, ...result });
-          return;
-        }
-        if (!['completed', 'failed', 'aborted'].includes(body.status)) {
-          throw new Error("manual turn status is invalid");
-        }
-        const release = host.endManualTurn(
-          body.traceId,
-          body.helperPid,
-          body.status,
-          body.retain === true,
-        );
-        writeJson(response, 200, { ok: true, ...release });
-        return;
-      }
       if (request.url === "/v1/turn/start") {
         if (typeof host.waitForWarmingHotTemporarySurfaceForTurn === "function") {
           await host.waitForWarmingHotTemporarySurfaceForTurn({
@@ -315,9 +195,6 @@ class BrowserControlServer {
             modelId: body.modelId,
             reasoning: body.reasoning,
           });
-        }
-        if (typeof host.browserInteractionMode === "function" && host.browserInteractionMode() === "manual") {
-          throw new Error("Automatic browser interaction is disabled");
         }
         const beginArgs = [
           body.traceId,
@@ -365,23 +242,11 @@ class BrowserControlServer {
       this.logger.warn("browser.control_rejected", { message });
       const cancelled = error?.code === "turn_cancelled";
       const retainedUnavailable = error?.code === "retained_conversation_unavailable";
-      const manualInspectionDisabled = error?.code === "manual_browser_inspection_disabled";
-      const manualOwnerLost = error?.code === "manual_turn_owner_lost";
-      const manualTimedOut = error?.code === "manual_turn_timed_out";
-      writeJson(
-        response,
-        cancelled || retainedUnavailable || manualInspectionDisabled || manualOwnerLost
-          ? 409
-          : manualTimedOut ? 408 : 400,
-        {
+      writeJson(response, cancelled || retainedUnavailable ? 409 : 400, {
         error: message,
         ...(cancelled ? { code: "turn_cancelled" } : {}),
         ...(retainedUnavailable ? { code: "retained_conversation_unavailable" } : {}),
-        ...(manualInspectionDisabled ? { code: "manual_browser_inspection_disabled" } : {}),
-        ...(manualOwnerLost ? { code: "manual_turn_owner_lost" } : {}),
-        ...(manualTimedOut ? { code: "manual_turn_timed_out" } : {}),
-        },
-      );
+      });
     }
   }
 
@@ -393,4 +258,4 @@ class BrowserControlServer {
   }
 }
 
-module.exports = { BrowserControlServer, MAX_MANUAL_START_BODY_BYTES, MANUAL_SENT_OBSERVER_TIMEOUT_MS };
+module.exports = { BrowserControlServer };

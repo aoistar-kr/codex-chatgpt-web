@@ -5,7 +5,6 @@ import { atomicWriteFile } from "../config";
 import { estimateTokens } from "../lib/token-estimate";
 
 export const DEV_CHAT_MODELS = [
-  "chatgpt-web/zero-risk",
   "chatgpt-web/luna",
   "chatgpt-web/think",
   "chatgpt-web/light",

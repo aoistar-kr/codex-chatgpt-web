@@ -139,3 +139,16 @@
   - control-server 3: 우리 포크의 `unsubmitted` endTurn 인자(병합 전 코드에도 있던 커스텀)를 업스트림 테스트가 7-인자로 기대한다.
 
 다음 배치 후보(사용자 결정 필요): 위 15건은 ① renderer-wiring 패턴 갱신, ② 로케일 이식 또는 보류 유지, ③ `unsubmitted` 계약을 테스트에 반영, 세 갈래로 정리된다. 어느 쪽도 6조각 전송과는 독립적이다.
+
+
+## 배치 17 — Zero Risk 전면 제거 (사용자 지시: UI·툴표면·런타임 전부)
+
+업스트림에서 들여온 Zero Risk(수동 브라우저 상호작용) 기능을 전 계층에서 걷어냈다. 6조각 전송·자동 모드·스킬 첨부는 그대로 유지한다.
+
+- launcher: 상호작용 모드/manual 프롬프트 UI, Zero Risk 상태·프로필·터널, `/v1/manual/*` 엔드포인트, `withInteractionModeChange`, `--contract safe` 선택, ko/zh-TW 로케일 확장을 제거하고 렌더러(i18n·App·styles·types)와 preload/state/runtime/runtime-supervisor를 우리 포크 기준으로 되돌렸다. `launcher: tsc --noEmit` exit 0, launcher 테스트 279개 중 277 pass / 2 skip / 0 fail.
+- daemon: Zero Risk 모델/라우트/컨텍스트 창(`chatgpt-web-models.ts`), `manualControl` 프롬프트 경로, MCP `safe` 계약(`codex_turn_start`/`codex_turn_complete`, `safeVisibleTools`), config/setup/tunnel의 상호작용 모드·이중 터널·connector identity 분기, `--zero-risk-*` CLI 플래그, launcher 수동 턴 클라이언트를 제거했다. `extraHighAvailable`·`experimentalSkillAttachments`·6조각 전송은 유지.
+- 문서: README.ko.md와 로케일 README의 업스트림판을 되돌리고 TROUBLESHOOTING/dev-chat/release-validation의 Zero Risk 절차를 정리했다.
+
+검증: root `tsc --noEmit` exit 0, `test:custom-invariants` 478 pass / 0 fail, 전체 스위트 1195 pass / 4 skip / 1 fail(남은 1건은 병합 전 기준선에서도 실패하는 `completed-rebind-diagnostic` 기존 실패).
+
+남은 것: `turn-broker.ts`의 `registerSafe`/`safe_*` 계열과 `launcher-browser-host.ts`의 수동 턴 클라이언트는 호출자가 없어 inert 상태다. 브로커 코어(claim/complete/retire)에 얽혀 있어 별도 배치로 제거한다.
