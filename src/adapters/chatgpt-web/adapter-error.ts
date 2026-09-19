@@ -32,6 +32,28 @@ export class ChatGptTurnSupersededError extends ChatGptWebAdapterError {
   }
 }
 
+/** Rejection of one revision; it must not cancel the browser that owns the ongoing response. */
+export class ChatGptSteeringUnavailableError extends ChatGptWebAdapterError {
+  constructor() {
+    super(
+      "ChatGPT does not expose an enabled in-flight Send control. The new instruction was not submitted; the existing browser response and Temporary Chat remain active.",
+      { status: 409, errorType: "invalid_request_error", code: "inflight_steering_unavailable", retryable: false },
+    );
+    this.name = "ChatGptSteeringUnavailableError";
+  }
+}
+
+/** Exact native Stop marker. The browser generation ends, but its proven Temporary Chat survives. */
+export class ChatGptTurnInterruptedError extends ChatGptWebAdapterError {
+  constructor() {
+    super(
+      "The active Codex turn was interrupted.",
+      { status: 499, errorType: "client_closed_request", code: "client_cancelled", retryable: false },
+    );
+    this.name = "ChatGptTurnInterruptedError";
+  }
+}
+
 // Only the compaction owner emits this after its one-shot handoff is accepted.
 // It stops browser observation without reclassifying the accepted native summary as a failure.
 export class ChatGptCompactionHandoffAccepted extends DOMException {

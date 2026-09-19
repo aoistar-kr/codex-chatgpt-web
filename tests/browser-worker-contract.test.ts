@@ -26,6 +26,7 @@ test("completed diagnostic can pass only through the persisted-detail or strict 
 });
 import type { Page } from "playwright-core";
 import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCaptureEnabled, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptConnectorAttachmentMode, chatGptEffortSelectionRequired, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptRecoverableIncompleteCaptureFailure, chatGptSameDocumentTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptBrowserSteeringQueue } from "../src/adapters/chatgpt-web/browser-worker";
 import { ensureChatGptPersonalizedConnectorAccess } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -168,7 +169,9 @@ test("browser worker delegates network stream eligibility to the pure turn plan"
   expect(workerSource).toContain("const turnPlan = resolveChatGptTurnPlan({");
   expect(workerSource).toContain("networkStreamPrimary: chatGptNetworkStreamPrimaryEnabled(),");
   expect(workerSource).toContain("networkStreamShadow: chatGptNetworkStreamShadowEnabled(),");
-  expect(workerSource).toContain('const networkStreamPrimary = turnPlan.networkStream === "primary";');
+  // In-flight steering can open a new conversation request on the same browser answer. Until the
+  // wire tap binds that sequence, steerable turns keep the DOM as final-text authority.
+  expect(workerSource).toContain('const networkStreamPrimary = turnPlan.networkStream === "primary" && !turn.steering;');
   expect(workerSource).toContain('if (turnPlan.networkStream === "off") return;');
 });
 
@@ -3215,7 +3218,8 @@ test("the daemon prefers the browser helper that shipped beside its own entrypoi
   expect(client).toContain('this.helperFeatures.has("progress")');
   expect(client).toContain('this.helperFeatures.has("tool-boundary-ack")');
   expect(client).toContain('this.helperFeatures.has("completion-fence")');
-  expect(helper).toContain('features: ["progress", "tool-boundary-ack", "completion-fence"]');
+  expect(helper).toContain('features: ["progress", "tool-boundary-ack", "completion-fence", "inflight-steering"]');
+  expect(client).toContain('this.helperFeatures.has("inflight-steering")');
   expect(helper).toMatch(/message\.type === "run"/);
   expect(helper).toContain("Browser helper received an unsupported message type");
 
@@ -3258,15 +3262,20 @@ test("the shipped commentary classifier separates answer Markdown from reasoning
     .replace(/\):\s*\{[^}]*\}\s*=>/, ") =>");
   const selectChatGptAnswerRoots = new Function(
     `${javascript}; return selectChatGptAnswerRoots;`,
-  )() as (roots: unknown[], statuses: unknown[]) => { answerRoots: Array<{ textContent: string }> };
+  )() as (
+    roots: unknown[],
+    statuses: unknown[],
+    turnComplete?: boolean,
+    previouslyAnswered?: unknown[],
+  ) => { answerRoots: Array<{ textContent: string }> };
 
-  const answerFor = (html: string): string => {
+  const answerFor = (html: string, turnComplete = false): string => {
     const document = createDocument(`<body>${html}</body>`);
     // domino's NodeList is array-like rather than iterable.
     const roots = Array.from(document.body.querySelectorAll(".markdown"))
       .filter(candidate => !candidate.parentElement?.closest(".markdown"));
     const statuses = Array.from(document.body.querySelectorAll("[data-streaming-response-status]"));
-    return selectChatGptAnswerRoots(roots, statuses).answerRoots
+    return selectChatGptAnswerRoots(roots, statuses, turnComplete).answerRoots
       .map(root => (root.textContent ?? "").trim())
       .filter(Boolean)
       .join(" | ");
@@ -3306,6 +3315,43 @@ test("the shipped commentary classifier separates answer Markdown from reasoning
 
   // A turn with no status container at all is entirely answer.
   expect(answerFor('<div class="markdown">ONLY ANSWER</div>')).toBe("ONLY ANSWER");
+
+  // A status row that renders BELOW answer text strands the whole answer in the commentary channel
+  // while the turn is live. That is the conservative choice: the Pro shape renders completed
+  // commentary immediately above the live status, so position alone cannot separate them yet.
+  const strandedAnswer = '<div class="markdown">ANSWER</div>'
+    + '<div data-streaming-response-status>s1</div>';
+  expect(answerFor(strandedAnswer)).toBe("");
+  // Once ChatGPT stops generating the ambiguity is gone, and leaving the answer in the commentary
+  // channel is what surfaced it in Codex's Working area while truncating the delivered answer.
+  expect(answerFor(strandedAnswer, true)).toBe("ANSWER");
+  expect(answerFor(
+    '<div class="markdown">COMMENTARY</div>'
+    + '<div data-streaming-response-status>s1</div>'
+    + '<div class="markdown">ANSWER</div>',
+    true,
+  )).toBe("ANSWER");
+  // The recovery must never promote genuine reasoning, completed turn or not.
+  expect(answerFor(
+    '<div data-streaming-response-status><div class="markdown">NESTED</div></div>',
+    true,
+  )).toBe("");
+  expect(answerFor(
+    '<div data-testid="cot-v5-block"><div class="markdown">THINKING</div></div>',
+    true,
+  )).toBe("");
+
+  // A status row arriving after already-streamed answer Markdown must not move that prefix into
+  // Codex's Work tab, even when a later answer root means the zero-answer fallback cannot apply.
+  const moving = createDocument('<body><div class="markdown">PREFIX</div></body>');
+  const prefix = Array.from(moving.body.querySelectorAll(".markdown"));
+  const first = selectChatGptAnswerRoots(prefix, []);
+  (moving.body as unknown as HTMLElement).insertAdjacentHTML("beforeend",
+    '<div data-streaming-response-status>work</div><div class="markdown">SUFFIX</div>');
+  const all = Array.from(moving.body.querySelectorAll(".markdown"));
+  const statuses = Array.from(moving.body.querySelectorAll("[data-streaming-response-status]"));
+  const classified = selectChatGptAnswerRoots(all, statuses, true, first.answerRoots);
+  expect(classified.answerRoots.map(root => root.textContent)).toEqual(["PREFIX", "SUFFIX"]);
 });
 
 test("proven MCP progress vetoes completion, not only the health verdicts", () => {
@@ -3638,3 +3684,151 @@ test("a stage that spans a system sleep is not charged for the slept time", asyn
   await stage;
   expect(outcome).toEqual(["ChatGPT browser stage timed out: probe"]);
 }, 10_000);
+
+test("in-flight steering queue keeps FIFO order and settles only after browser proof", async () => {
+  const queue = new ChatGptBrowserSteeringQueue();
+  const settled: string[] = [];
+  const first = queue.submit({ id: "steer_aaaaaa", prompt: { text: "first", images: [] } })
+    .then(() => settled.push("first"));
+  const second = queue.submit({ id: "steer_bbbbbb", prompt: { text: "second", images: [] } })
+    .then(() => settled.push("second"));
+  expect(queue.hasPending()).toBe(true);
+
+  const head = queue.take();
+  expect(head?.id).toBe("steer_aaaaaa");
+  expect(head?.prompt.text).toBe("first");
+  // Enqueueing and taking are not submission evidence: nothing settles until the browser proves it.
+  await Bun.sleep(5);
+  expect(settled).toEqual([]);
+  head!.complete();
+  await first;
+  expect(settled).toEqual(["first"]);
+
+  const next = queue.take();
+  expect(next?.id).toBe("steer_bbbbbb");
+  next!.complete(new Error("steering proof failed"));
+  await expect(second).rejects.toThrow("steering proof failed");
+  expect(queue.take()).toBeUndefined();
+});
+
+test("in-flight steering queue rejects queued and in-flight items when the turn ends", async () => {
+  const queue = new ChatGptBrowserSteeringQueue();
+  const taken = queue.take();
+  expect(taken).toBeUndefined();
+  const inFlight = queue.submit({ id: "steer_cccccc", prompt: { text: "active", images: [] } });
+  const consumed = queue.take();
+  expect(consumed?.id).toBe("steer_cccccc");
+  const queued = queue.submit({ id: "steer_dddddd", prompt: { text: "queued", images: [] } });
+  queue.close(new Error("turn ended"));
+  await expect(inFlight).rejects.toThrow("turn ended");
+  await expect(queued).rejects.toThrow("turn ended");
+  await expect(queue.submit({ id: "steer_eeeeee", prompt: { text: "late", images: [] } }))
+    .rejects.toThrow("turn ended");
+});
+
+test("in-flight steering accepts one text revision and rejects images, multipart, and short ids", async () => {
+  const queue = new ChatGptBrowserSteeringQueue();
+  await expect(queue.submit({ id: "short", prompt: { text: "x", images: [] } })).rejects.toThrow(/identity/);
+  await expect(queue.submit({ id: "steer_ffffff", prompt: { text: "   ", images: [] } })).rejects.toThrow(/text message only/);
+  await expect(queue.submit({
+    id: "steer_gggggg",
+    prompt: { text: "x", images: [{ ref: "r", imageUrl: "data:image/png;base64,AA" }] },
+  })).rejects.toThrow(/text message only/);
+});
+
+test("direct steering replaces the browser epoch and uses the retained continuation compiler", () => {
+  const adapter = readFileSync("src/adapters/chatgpt-web/index.ts", "utf8");
+  const marker = "const sourceRuntime = session.beginRuntimeTransition();";
+  const at = adapter.indexOf(marker);
+  expect(at).toBeGreaterThan(-1);
+  const block = adapter.slice(Math.max(0, at - 900), at + 1_800);
+  expect(block).toContain("const superseded = chatGptTurnSupersededError();");
+  expect(block).toContain("sourceRuntime.cancel(superseded);");
+  expect(block).toContain("await sourceRuntime.physicalSettlement;");
+  expect(block).toContain("const replacement = startRuntime(");
+  expect(block).toContain("session.installRuntime(replacement, nextInstruction);");
+  expect(block).toContain("session.completeInstruction(nextInstruction);");
+  expect(block).toContain("session.failInstruction(nextInstruction);");
+  expect(adapter).toContain('retainedContinuation: "steering" as const');
+  expect(adapter).not.toContain("inFlightSteeringText(event.content)");
+  expect(adapter).not.toContain("const steering = new ChatGptBrowserSteeringQueue();");
+});
+
+test("Codex Stop interrupts the browser generation without retaining the cancelled Temporary Chat", () => {
+  const adapter = readFileSync("src/adapters/chatgpt-web/index.ts", "utf8");
+  const at = adapter.indexOf('if (event.type === "interrupt") {');
+  expect(at).toBeGreaterThan(-1);
+  const block = adapter.slice(at, at + 400);
+  expect(block).toContain("const reason = new ChatGptTurnInterruptedError();");
+  expect(block).not.toContain("chatGptBrowserTabClosedError()");
+
+  const client = readFileSync("src/adapters/chatgpt-web/launcher-helper-client.ts", "utf8");
+  expect(client).not.toContain("turn.abortSignal?.reason instanceof ChatGptTurnInterruptedError");
+  expect(client).toContain("preserveConversation = preserveRequested && stop.stopped === true");
+});
+
+test("in-flight steering submits into the live composer without stopping the active generation", () => {
+  const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
+  const at = worker.indexOf("private async submitInFlightSteering(");
+  expect(at).toBeGreaterThan(-1);
+  const next = worker.indexOf("\n  private async ", at + 10);
+  const block = worker.slice(at, next > at ? next : at + 5_000);
+  // Positive liveness proof: the exact ChatGPT Stop control must be visible before submitting.
+  expect(block).toContain("before.visibleStopButtonCount < 1");
+  // Submission re-reads the shared control's identity and activates it inside one evaluation, so the
+  // Stop control can never be the control this submit presses.
+  expect(block).toContain('button.getAttribute("data-testid") !== "send-button"');
+  expect(block).toContain('document.querySelectorAll("[data-streaming-response-status]").length < 1');
+  expect(block).toContain("(button as HTMLElement).click();");
+  expect(block).not.toContain("CHATGPT_STOP_BUTTON_SELECTOR).last().press");
+  // The Send identity is probed in the page rather than through an out-of-page locator, and the
+  // revision is written with the editor's own commands.
+  expect(block).toContain("await this.steeringSubmitControlState(page, signal)");
+  expect(block).toContain("await this.insertSteeringRevision(page, item.prompt.text, signal)");
+  expect(worker).toContain("writeComposerTextWithEditorCommands");
+  expect(worker).toContain('if (current.length > 0) {');
+  expect(worker).toContain('reason: "already-inserted"');
+  // Steering must never turn into an implicit Stop. If ChatGPT refuses to expose Send, fail the
+  // revision and leave the original generation running.
+  expect(block).not.toContain("fell back to the exact stop control");
+  expect(block).not.toContain("stopControl.click(");
+  expect(block).not.toContain("this.attachPrompt(page, item.prompt.text");
+  // Expected UI races reject only the steering revision. They must not escape as generic browser
+  // failures and tear down the original response/runtime.
+  expect(block).toContain("before.visibleStopButtonCount < 1");
+  expect(block).toContain("throw new ChatGptSteeringUnavailableError();");
+  expect(block).not.toContain('throw new Error("ChatGPT generation ended before the steering message could be submitted")');
+  expect(block).not.toContain('throw new Error("ChatGPT did not expose semantic evidence for the steering submission")');
+  // Stop and Send are two identities of the same shared button. Once Send is armed, requiring a
+  // separately visible Stop button would reject every valid steering submission before the click.
+  const armedAt = block.indexOf("if (!armed) {");
+  const clickAt = block.indexOf("const clickArmedSteeringSend");
+  expect(armedAt).toBeGreaterThan(-1);
+  expect(clickAt).toBeGreaterThan(armedAt);
+  expect(block.slice(armedAt, clickAt)).not.toContain("CHATGPT_STOP_BUTTON_SELECTOR");
+  // ChatGPT swaps one submit control between Stop and Send, so Send is only observable after the
+  // revision is inserted. The arm loop must wait for that swap and re-insert when it is withheld.
+  expect(block).toContain("CHATGPT_STEERING_SEND_ARM_MS");
+  expect(block).toContain("while (!armed && Date.now() < armDeadline)");
+  // The steered revision opens its own assistant turn; the answer authority moves to it.
+  expect(block).toContain("replyIdentity");
+  expect(block).toContain("more than one new assistant turn");
+  // Acceptance is exactly one new user turn whose content matches the submitted revision.
+  expect(block).toContain("added.length > 1");
+  expect(block).toContain("promptTextEquivalent");
+  // The steady DOM loop drains the queue; the steerable path deliberately keeps DOM authority.
+  expect(worker).toContain("await submitPendingSteering();");
+});
+
+test("a rejected steering round replays idempotently without appending after completion", () => {
+  const adapter = readFileSync("src/adapters/chatgpt-web/index.ts", "utf8");
+  const runExclusive = adapter.indexOf("await session.runExclusive(async () => {");
+  expect(runExclusive).toBeGreaterThan(-1);
+  const block = adapter.slice(runExclusive, runExclusive + 1_400);
+  const replay = block.indexOf("const replay = session.roundEvents(roundKey);");
+  const completed = block.indexOf("if (session.roundCompleted(roundKey)) {");
+  const steeringFailure = block.indexOf("const steeringFailure = incomingInstruction");
+  expect(replay).toBeGreaterThan(-1);
+  expect(completed).toBeGreaterThan(replay);
+  expect(steeringFailure).toBeGreaterThan(completed);
+});

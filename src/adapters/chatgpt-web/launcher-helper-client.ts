@@ -4,7 +4,11 @@ import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 import type { CodexOutputTextAnnotation } from "../../types";
-import { ChatGptTurnSupersededError, ChatGptWebAdapterError } from "./adapter-error";
+import {
+  ChatGptSteeringUnavailableError,
+  ChatGptTurnSupersededError,
+  ChatGptWebAdapterError,
+} from "./adapter-error";
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
 import {
@@ -18,9 +22,16 @@ interface PendingTurn {
   reject: (error: Error) => void;
   abortListener?: () => void;
   sent?: boolean;
+  sendActivated?: boolean;
   prepared?: CompiledChatGptWebPrompt & { release: () => void };
   localFailure?: Error;
   progressForwarding?: AbortController;
+  steeringForwarding?: AbortController;
+  steeringAck?: {
+    id: string;
+    resolve: () => void;
+    reject: (error: Error) => void;
+  };
 }
 
 type HelperMessage =
@@ -31,6 +42,8 @@ type HelperMessage =
   | { type: "event"; id: string; event: "completion_fence_commit"; requestId: number; revision: number }
   | { type: "event"; id: string; event: "prepared_selected"; reused: boolean }
   | { type: "event"; id: string; event: "luna_checkpoint"; checkpoint: ChatGptLunaCheckpoint; answerHash: string }
+  | { type: "event"; id: string; event: "steer_submitted"; steeringId: string }
+  | { type: "event"; id: string; event: "steer_rejected"; steeringId: string; message: string; code?: string }
   | { type: "result"; id: string; text: string; annotations?: CodexOutputTextAnnotation[] }
   | {
       type: "error";
@@ -93,6 +106,22 @@ function parseHelperMessage(line: string): HelperMessage {
   }
   if (message.type === "event") {
     const event = message.event;
+    if (event === "steer_submitted" || event === "steer_rejected") {
+      if (typeof message.steeringId !== "string" || !/^[A-Za-z0-9_-]{6,128}$/.test(message.steeringId)
+        || (event === "steer_rejected" && typeof message.message !== "string")) {
+        throw new Error("Launcher browser helper steering acknowledgement is invalid");
+      }
+      return {
+        type: "event",
+        id: message.id,
+        event,
+        steeringId: message.steeringId,
+        ...(event === "steer_rejected" ? {
+          message: message.message as string,
+          ...(message.code === "inflight_steering_unavailable" ? { code: message.code } : {}),
+        } : {}),
+      } as HelperMessage;
+    }
     if (event === "tool_batch_observed") {
       if (!Number.isSafeInteger(message.revision) || (message.revision as number) <= 0) {
         throw new Error("Launcher browser helper tool-boundary revision is invalid");
@@ -252,6 +281,11 @@ export class LauncherBrowserHelperClient {
         "Launcher browser helper does not support the MCP completion fence; update or restart the launcher",
       );
     }
+    if (turn.steering && !this.helperFeatures.has("inflight-steering")) {
+      throw new Error(
+        "Launcher browser helper does not support in-flight ChatGPT steering; update or restart the launcher",
+      );
+    }
     return await new Promise<string>((resolveResult, rejectResult) => {
         if (this.pending.has(turn.traceId)) {
           rejectResult(new Error(`Duplicate launcher browser turn: ${turn.traceId}`));
@@ -314,6 +348,8 @@ export class LauncherBrowserHelperClient {
         pending.sent = true;
         const progressForwarding = new AbortController();
         pending.progressForwarding = progressForwarding;
+        const steeringForwarding = new AbortController();
+        pending.steeringForwarding = steeringForwarding;
         void this.send({
           type: "run",
           id: turn.traceId,
@@ -343,6 +379,7 @@ export class LauncherBrowserHelperClient {
           // turn it has not been told about and cannot accumulate state for unknown ids.
           .then(() => {
             if (!progressForwarding.signal.aborted) this.forwardProgress(turn, progressForwarding.signal);
+            if (!steeringForwarding.signal.aborted) this.forwardSteering(pending, steeringForwarding.signal);
           })
           .catch(error => this.finishWithError(turn.traceId, error instanceof Error ? error : new Error(String(error))));
       });
@@ -526,8 +563,12 @@ export class LauncherBrowserHelperClient {
         ));
       }
       else if (message.event === "send_activated") {
+        // A pre-send Interrupt must not race the stop-button probe and commit a prompt while
+        // the helper is still waiting for its abort frame. Withhold its causal Send permission.
+        if (pending.turn.abortSignal?.aborted) return;
+        pending.sendActivated = true;
         void Promise.resolve().then(() => pending.turn.onSendActivated?.()).then(() => {
-          if (this.pending.get(message.id) !== pending) return;
+          if (this.pending.get(message.id) !== pending || pending.turn.abortSignal?.aborted) return;
           return this.send({ type: "send_activation_ack", id: message.id });
         }).catch(error => this.abortWithLocalFailure(
           message.id,
@@ -536,6 +577,14 @@ export class LauncherBrowserHelperClient {
         ));
       }
       else if (message.event === "submitted") pending.turn.onSubmitted?.();
+      else if (message.event === "steer_submitted" || message.event === "steer_rejected") {
+        const acknowledgement = pending.steeringAck;
+        if (!acknowledgement || acknowledgement.id !== message.steeringId) return;
+        pending.steeringAck = undefined;
+        if (message.event === "steer_submitted") acknowledgement.resolve();
+        else acknowledgement.reject(message.code === "inflight_steering_unavailable"
+          ? new ChatGptSteeringUnavailableError() : new Error(message.message));
+      }
       else if (message.event === "prepared_selected") {
         const prepare = message.reused ? pending.turn.prepareResume : pending.turn.prepare;
         void Promise.resolve().then(() => prepare?.()).then(prepared => {
@@ -654,6 +703,51 @@ export class LauncherBrowserHelperClient {
     });
   }
 
+  /**
+   * Serially forwards revisions to the one helper that already owns the live page. The queue item
+   * is completed only after the helper proves the corresponding user turn in the browser DOM.
+   */
+  private forwardSteering(pending: PendingTurn, stop: AbortSignal): void {
+    const steering = pending.turn.steering;
+    if (!steering) return;
+    void (async () => {
+      while (!stop.aborted) {
+        const item = steering.take();
+        if (!item) {
+          await steering.waitForPending(stop);
+          continue;
+        }
+        try {
+          const acknowledged = new Promise<void>((resolve, reject) => {
+            pending.steeringAck = { id: item.id, resolve, reject };
+          });
+          await this.send({
+            type: "steer",
+            id: pending.turn.traceId,
+            steeringId: item.id,
+            prompt: item.prompt,
+          });
+          await acknowledged;
+          item.complete();
+        } catch (error) {
+          const normalized = error instanceof Error ? error : new Error(String(error));
+          item.complete(normalized);
+          if (normalized instanceof ChatGptSteeringUnavailableError) continue;
+          throw normalized;
+        } finally {
+          if (pending.steeringAck?.id === item.id) pending.steeringAck = undefined;
+        }
+      }
+    })().catch(error => {
+      if (stop.aborted || (error instanceof DOMException && error.name === "AbortError")) return;
+      this.abortWithLocalFailure(
+        pending.turn.traceId,
+        error instanceof Error ? error : new Error(String(error)),
+        pending,
+      );
+    });
+  }
+
   private finish(id: string): void {
     const pending = this.pending.get(id);
     if (!pending) return;
@@ -662,6 +756,11 @@ export class LauncherBrowserHelperClient {
     }
     pending.progressForwarding?.abort();
     pending.progressForwarding = undefined;
+    pending.steeringForwarding?.abort();
+    pending.steeringForwarding = undefined;
+    pending.steeringAck?.reject(new DOMException("Launcher browser turn ended", "AbortError"));
+    pending.steeringAck = undefined;
+    pending.turn.steering?.close();
     pending.prepared?.release();
     pending.prepared = undefined;
     this.pending.delete(id);

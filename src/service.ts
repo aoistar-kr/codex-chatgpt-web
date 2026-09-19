@@ -184,6 +184,31 @@ export async function interruptActiveTurn(
   }
 }
 
+export async function steerActiveTurn(
+  config: AppConfig,
+  input: { threadId: string; turnId: string; itemId: string; content: Array<{ type: "input_text"; text: string }> },
+): Promise<{ acceptedBrowserTurns: number }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  try {
+    const response = await fetch(`http://${config.host}:${config.port}/admin/steer-turn`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${config.controlToken}`, "content-type": "application/json" },
+      body: JSON.stringify(input),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const result = await response.json() as Record<string, unknown>;
+    const accepted = result.accepted_browser_turns;
+    if (!Number.isInteger(accepted) || (accepted as number) < 0) {
+      throw new Error("daemon returned an invalid exact-turn steering acknowledgement");
+    }
+    return { acceptedBrowserTurns: accepted as number };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function cancelActiveTurns(config: AppConfig): Promise<{
   cancelledHttpTurns: number;
   cancelledBrowserTurns: number;

@@ -1051,6 +1051,7 @@ test("structured compact rebuilds canonical context when its retained browser di
     text: new ChatGptTextFeed(),
     usageInput: sourceRequest,
     conversationKey: chatGptConversationKey(sourceRequest, namespace)!,
+    releaseRetainedConversation: async () => {},
     cancel() {},
   }));
   await chatGptTurnSessions.find(sourceKey)!.browserOutcome;
@@ -1111,6 +1112,7 @@ test("a disappeared retained source cannot leave its fresh compaction rebuild pa
     text: new ChatGptTextFeed(),
     usageInput: sourceRequest,
     conversationKey: chatGptConversationKey(sourceRequest, namespace)!,
+    releaseRetainedConversation: async () => {},
     cancel() {},
   }));
   await chatGptTurnSessions.find(sourceKey)!.browserOutcome;

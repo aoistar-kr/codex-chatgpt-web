@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -160,6 +161,25 @@ function isUserOrParentInstruction(
 
 function isTurnAbortedNotice(value: Record<string, unknown>): boolean {
   return /^<turn_aborted>[\s\S]*<\/turn_aborted>$/.test(rawMessageText(value).trim());
+}
+
+/**
+ * Classify one native Codex response-item payload as an authenticated same-turn human revision.
+ * Rollout control uses this narrower seam so environment/context messages and synthetic abort
+ * notices can never become steering input.
+ */
+export function chatGptSameTurnHumanUserRevision(
+  value: unknown,
+  expectedTurnId: string,
+): ChatGptTurnUserRevision | undefined {
+  const item = record(value);
+  if (item?.type !== "message" || item.role !== "user" || contextualUserMessage(item) || isTurnAbortedNotice(item)) {
+    return undefined;
+  }
+  const turnId = itemTurnId(item);
+  const itemId = typeof item.id === "string" && item.id.length > 0 ? item.id : undefined;
+  if (turnId !== expectedTurnId || !itemId) return undefined;
+  return { content: item.content, turnId, itemId };
 }
 
 /**
@@ -977,6 +997,24 @@ export function hasRawChatGptEnvironmentContext(parsed: CodexParsedRequest): boo
     const item = record(value);
     return item?.type === "message" && /<\/?environment_context\b/i.test(rawMessageText(item));
   });
+}
+
+/** Content-bound identity for native environment messages already authenticated on this turn. */
+export function chatGptRawEnvironmentContextIdentity(parsed: CodexParsedRequest): string | undefined {
+  const body = record(parsed._rawBody);
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const contexts = input.flatMap(value => {
+    const item = record(value);
+    if (item?.type !== "message" || !/<\/?environment_context\b/i.test(rawMessageText(item))) return [];
+    return [{
+      id: typeof item.id === "string" ? item.id : null,
+      role: item.role,
+      content: item.content,
+      turnId: itemTurnId(item) ?? null,
+    }];
+  });
+  if (contexts.length === 0) return undefined;
+  return createHash("sha256").update(JSON.stringify(contexts)).digest("hex");
 }
 
 export function hasCurrentChatGptEnvironmentContext(parsed: CodexParsedRequest): boolean {

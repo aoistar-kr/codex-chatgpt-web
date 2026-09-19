@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launcher-helper-client";
+import { ChatGptBrowserSteeringQueue } from "../src/adapters/chatgpt-web/browser-worker";
 import type { BrowserTurn, ResolvedBrowserConfig } from "../src/adapters/chatgpt-web/browser-worker";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 
@@ -262,8 +263,84 @@ test("helper cancellation asks the launcher to stop the exact surface before pre
   const block = source.slice(abortStart, abortEnd);
   expect(block).toContain('phase: "stop"');
   expect(block).toContain("turn.abortSignal?.reason instanceof ChatGptTurnSupersededError");
+  // Steering may retain the proven chat for its successor; a user Stop terminates the task and
+  // therefore must not preserve the cancelled conversation.
+  expect(block).not.toContain("turn.abortSignal?.reason instanceof ChatGptTurnInterruptedError");
   expect(block).toContain("preserveConversation = preserveRequested && stop.stopped === true");
   expect(block.indexOf('phase: "stop"')).toBeLessThan(block.indexOf('type: "abort"'));
+});
+
+test("a rejected in-flight send keeps the original helper response alive", async () => {
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native", browserHost: "launcher", browserHostDescriptorPath: "/unused",
+    storageStatePath: "/unused", chromeExecutablePath: "/unused", headed: true,
+    turnTimeoutMs: 60_000, autoApproveToolCalls: false,
+  });
+  const internal = client as any;
+  const child = {};
+  internal.child = child;
+  internal.ensureChild = async () => {};
+  internal.helperFeatures = new Set(["inflight-steering"]);
+  const frames: string[] = [];
+  internal.send = async (frame: any) => {
+    frames.push(frame.type);
+    if (frame.type === "steer") internal.handleLine(child, JSON.stringify({
+      type: "event", id: frame.id, event: "steer_rejected", steeringId: frame.steeringId,
+      message: "unavailable", code: "inflight_steering_unavailable",
+    }));
+  };
+  const steering = new ChatGptBrowserSteeringQueue();
+  const result = client.run({
+    traceId: "live-original", modelId: "gpt-5.6-sol", reasoning: "high",
+    capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+    steering, prepare: async () => ({ text: "initial", images: [], release() {} }),
+    onTextDelta() {},
+  });
+  await Bun.sleep(0);
+  await expect(steering.submit({ id: "steer-123", prompt: { text: "new", images: [] } }))
+    .rejects.toMatchObject({ code: "inflight_steering_unavailable" });
+  expect(frames).toEqual(["run", "steer"]);
+  internal.handleLine(child, JSON.stringify({ type: "result", id: "live-original", text: "original answer" }));
+  await expect(result).resolves.toBe("original answer");
+});
+
+test("late Send activation cannot commit after a pre-send Stop", async () => {
+  const client = new LauncherBrowserHelperClient({} as ResolvedBrowserConfig);
+  const internal = client as any;
+  const child = {};
+  internal.child = child;
+  const controller = new AbortController();
+  controller.abort();
+  let activations = 0;
+  let sends = 0;
+  internal.send = async () => { sends += 1; };
+  internal.pending.set("stopped", { turn: {
+    abortSignal: controller.signal, onSendActivated: () => { activations += 1; },
+  } });
+  internal.handleLine(child, JSON.stringify({ type: "event", id: "stopped", event: "send_activated" }));
+  await Bun.sleep(0);
+  expect(activations).toBe(0);
+  expect(sends).toBe(0);
+});
+
+test("steering frames are forwarded to the live helper and settle only on helper acknowledgement", () => {
+  const source = readFileSync(new URL("../src/adapters/chatgpt-web/launcher-helper-client.ts", import.meta.url), "utf8");
+  const helper = readFileSync(new URL("../src/adapters/chatgpt-web/browser-helper-main.ts", import.meta.url), "utf8");
+
+  // The daemon refuses to steer through a helper that cannot prove an in-flight submission.
+  expect(source).toContain('turn.steering && !this.helperFeatures.has("inflight-steering")');
+  expect(source).toContain('type: "steer"');
+  expect(source).toContain("steeringId: item.id");
+  expect(source).toContain("await acknowledged;");
+  expect(source).toContain("item.complete();");
+  expect(source).toContain("pending.steeringAck?.reject(");
+  expect(source).toContain("pending.turn.steering?.close();");
+
+  // The helper validates the payload shape, then acknowledges only after the queue proves it.
+  expect(helper).toContain('message.type === "steer"');
+  expect(helper).toContain('event: "steer_submitted"');
+  expect(helper).toContain('event: "steer_rejected"');
+  expect(helper).toContain("steering.close();");
 });
 
 test("structured helper errors preserve the ChatGPT adapter failure contract", async () => {

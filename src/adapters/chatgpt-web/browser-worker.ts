@@ -79,6 +79,7 @@ import {
 import { LauncherBrowserHelperClient } from "./launcher-helper-client";
 import { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 import {
+  ChatGptSteeringUnavailableError,
   ChatGptWebAdapterError,
   chatGptBrowserTabClosedError,
   chatGptRetainedConversationUnavailableError,
@@ -194,6 +195,12 @@ export const CHATGPT_UI_SETTLE_MS = 250;
 export const CHATGPT_SEND_ENABLE_GRACE_MS = 5_000;
 const CHATGPT_RESPONSE_DOM_MIN_OBSERVATION_INTERVAL_MS = 250;
 const CHATGPT_RESPONSE_DOM_IDLE_WAIT_MS = 1_000;
+/** How long an in-flight steering revision may take to prove it left the composer. */
+const CHATGPT_STEERING_ACCEPTANCE_MS = 10_000;
+/** How long ChatGPT may take to swap its single submit control back to Send for the inserted text. */
+const CHATGPT_STEERING_SEND_ARM_MS = 30_000;
+/** How long the steered revision may take to open its own assistant turn. */
+const CHATGPT_STEERING_REPLY_MS = 30_000;
 
 const CHATGPT_DOM_REVISION_ATTRIBUTES = [
   "align",
@@ -1205,6 +1212,11 @@ export interface BrowserTurn {
   retainConversation?: boolean;
   /** Dynamic steering preemption may preserve this exact Temporary Chat after an aborted run. */
   retainConversationOnAbort?: () => boolean;
+  /**
+   * ChatGPT opened a separate assistant turn for the steered revision. The answer authority moved to
+   * that turn, so the superseded answer prefix must no longer be treated as part of the answer.
+   */
+  onSteeringReply?: (replyIdentity: string) => void;
   requireRetainedConversation?: boolean;
   conversationKey?: string;
   onPreparedSelected?: (reused: boolean) => void | Promise<void>;
@@ -1234,6 +1246,99 @@ export interface BrowserTurn {
   /** Require and remove the private Luna checkpoint tail from the visible Markdown stream. */
   captureLunaCheckpoint?: boolean;
   onLunaCheckpoint?: (captured: CapturedChatGptLunaCheckpoint) => void;
+  /** Ordered same-generation user revisions submitted through the active ChatGPT composer. */
+  steering?: ChatGptBrowserSteeringQueue;
+}
+
+export interface ChatGptBrowserSteeringItem {
+  id: string;
+  prompt: CompiledChatGptWebPrompt;
+}
+
+/**
+ * One logical Codex turn owns this queue.  A revision settles only after the browser proves that
+ * ChatGPT accepted the extra user turn; enqueueing it is not submission evidence.
+ */
+export class ChatGptBrowserSteeringQueue {
+  private readonly pending: Array<ChatGptBrowserSteeringItem & {
+    resolve: () => void;
+    reject: (error: Error) => void;
+  }> = [];
+  private readonly inFlight = new Set<{
+    resolve: () => void;
+    reject: (error: Error) => void;
+    settled: boolean;
+  }>();
+  private readonly waiters = new Set<() => void>();
+  private closed?: Error;
+
+  submit(item: ChatGptBrowserSteeringItem): Promise<void> {
+    if (this.closed) return Promise.reject(this.closed);
+    if (!/^[A-Za-z0-9_-]{6,128}$/.test(item.id)) {
+      return Promise.reject(new Error("ChatGPT steering item identity is invalid"));
+    }
+    if (!item.prompt.text.trim() || item.prompt.images.length > 0 || item.prompt.multipart) {
+      return Promise.reject(new Error("In-flight ChatGPT steering supports one non-empty text message only"));
+    }
+    return new Promise<void>((resolve, reject) => {
+      this.pending.push({ ...item, resolve, reject });
+      for (const wake of [...this.waiters]) wake();
+    });
+  }
+
+  take(): (ChatGptBrowserSteeringItem & { complete(error?: Error): void }) | undefined {
+    const item = this.pending.shift();
+    if (!item) return undefined;
+    const settlement = { resolve: item.resolve, reject: item.reject, settled: false };
+    this.inFlight.add(settlement);
+    return {
+      id: item.id,
+      prompt: item.prompt,
+      complete: error => {
+        if (settlement.settled) return;
+        settlement.settled = true;
+        this.inFlight.delete(settlement);
+        if (error) settlement.reject(error);
+        else settlement.resolve();
+      },
+    };
+  }
+
+  hasPending(): boolean {
+    return this.pending.length > 0;
+  }
+
+  waitForPending(signal?: AbortSignal): Promise<void> {
+    if (this.pending.length > 0 || this.closed) return Promise.resolve();
+    if (signal?.aborted) return Promise.reject(new DOMException("ChatGPT steering wait aborted", "AbortError"));
+    return new Promise<void>((resolve, reject) => {
+      const wake = () => {
+        signal?.removeEventListener("abort", onAbort);
+        this.waiters.delete(wake);
+        resolve();
+      };
+      const onAbort = () => {
+        this.waiters.delete(wake);
+        reject(new DOMException("ChatGPT steering wait aborted", "AbortError"));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.waiters.add(wake);
+    });
+  }
+
+  close(error = new Error("ChatGPT browser turn ended before steering was submitted")): void {
+    if (this.closed) return;
+    this.closed = error;
+    for (const item of this.pending.splice(0)) item.reject(error);
+    for (const item of [...this.inFlight]) {
+      if (item.settled) continue;
+      item.settled = true;
+      item.reject(error);
+    }
+    this.inFlight.clear();
+    for (const wake of [...this.waiters]) wake();
+    this.waiters.clear();
+  }
 }
 
 interface ChatGptSubmissionBaseline {
@@ -2119,6 +2224,41 @@ export async function insertPlainTextIntoComposer(
   };
 }
 
+/**
+ * Replace the composer content through the editor's own editing commands.
+ *
+ * The ordinary prompt attachment clears the editor with a DOM-level fill. On the launcher surface
+ * that can leave ChatGPT's editor state and its rendered DOM out of step, and the one shared submit
+ * control then never swaps back from Stop to Send even though the inserted text is visible, which is
+ * exactly the state that made an in-flight steering submit unprovable. An empty value clears only.
+ */
+export async function writeComposerTextWithEditorCommands(
+  element: HTMLElement,
+  value: string,
+): Promise<{ inserted: boolean; reason: string }> {
+  if (document.activeElement !== element) element.focus();
+  if (document.activeElement !== element) return { inserted: false, reason: "focus-refused" };
+  const selection = window.getSelection();
+  if (!selection) return { inserted: false, reason: "no-selection" };
+  const current = element.textContent ?? "";
+  if (value.length > 0 && current === value) return { inserted: true, reason: "already-inserted" };
+  if (current.length > 0) {
+    const all = document.createRange();
+    all.selectNodeContents(element);
+    selection.removeAllRanges();
+    selection.addRange(all);
+    document.execCommand("delete", false);
+  }
+  if (value.length === 0) return { inserted: true, reason: "cleared" };
+  const collapsed = document.createRange();
+  collapsed.selectNodeContents(element);
+  collapsed.collapse(false);
+  selection.removeAllRanges();
+  selection.addRange(collapsed);
+  const inserted = document.execCommand("insertText", false, value);
+  return { inserted, reason: inserted ? "inserted" : "exec-refused" };
+}
+
 export class ChatGptBrowserWorker {
   static forProvider(provider: CodexProviderConfig): ChatGptBrowserWorker {
     const config = resolveBrowserConfig(provider);
@@ -2811,11 +2951,10 @@ export class ChatGptBrowserWorker {
         if (values.some(value => typeof value !== "string" || value.trim().length === 0)) {
           throw new Error(`ChatGPT conversation turn has no stable ${attribute} identity`);
         }
-        const typed = values as string[];
-        if (new Set(typed).size !== typed.length) {
-          throw new Error("ChatGPT exposed duplicate conversation turn identities");
-        }
-        return typed;
+        // React may briefly keep two renderer nodes for one logical conversation turn while it
+        // remounts/virtualizes the transcript. Ownership is the stable turn id, not DOM-node
+        // cardinality, so collapse renderer clones before comparing the semantic transcript.
+        return [...new Set(values as string[])];
       };
       const visible = (element: Element): boolean => {
         const candidate = element as HTMLElement;
@@ -3642,6 +3781,201 @@ export class ChatGptBrowserWorker {
     return evidence;
   }
 
+  /**
+   * Submit a revision through ChatGPT's composer without activating its Stop control. Acceptance
+   * requires one exact new user turn in the same document while the original generation is live.
+   */
+  private async insertSteeringRevision(page: Page, text: string, signal?: AbortSignal): Promise<string> {
+    const composer = await this.activeComposer(page, 30_000, signal);
+    const result = await composer.evaluate(writeComposerTextWithEditorCommands, text, {
+      timeout: 20_000,
+      signal,
+    });
+    if (!result.inserted) return result.reason;
+    const observed = await this.attachedPromptText(page, signal, composer);
+    if (!this.promptTextEquivalent(text, observed)) {
+      return `readback-mismatch:${observed.length}`;
+    }
+    return "inserted";
+  }
+
+  private async clearSteeringRevision(page: Page, signal?: AbortSignal): Promise<void> {
+    const composer = await this.activeComposer(page, 10_000, signal);
+    await composer.evaluate(writeComposerTextWithEditorCommands, "", { timeout: 10_000, signal });
+  }
+
+  /** The one shared submit control carries the Send identity only once ChatGPT holds a revision. */
+  private async steeringSubmitControlState(page: Page, signal?: AbortSignal): Promise<{
+    testid: string | null;
+    disabled: boolean;
+    editorChars: number;
+    activeId: string | null;
+    editors: number;
+  }> {
+    return withChatGptBrowserObservationTimeout(withBrowserTurnAbort(page.evaluate(() => {
+      const editors = document.querySelectorAll(
+        '[data-testid="prompt-textarea"], #prompt-textarea, [contenteditable="true"][data-lexical-editor="true"], .ProseMirror',
+      );
+      const editor = document.querySelector("#prompt-textarea");
+      const form = editor ? editor.closest("form") : null;
+      const button = document.querySelector("#composer-submit-button")
+        ?? form?.querySelector('button[type="submit"]')
+        ?? form?.querySelector('[data-testid="send-button"]');
+      const active = document.activeElement;
+      return {
+        testid: button?.getAttribute("data-testid") ?? null,
+        disabled: button?.getAttribute("aria-disabled") === "true"
+          || (button as HTMLButtonElement | null)?.disabled === true,
+        editorChars: (editor?.textContent ?? "").trim().length,
+        activeId: active instanceof HTMLElement ? active.id || active.className.slice(0, 32) : null,
+        editors: editors.length,
+      };
+    }), signal));
+  }
+
+  private async submitInFlightSteering(
+    page: Page,
+    item: ChatGptBrowserSteeringItem,
+    binding: ChatGptAssistantTurnBinding,
+    signal?: AbortSignal,
+  ): Promise<{ state: ChatGptSubmissionDomState; replyIdentity?: string }> {
+    const beforeCache: ChatGptSubmissionDomCache = {};
+    const before = await this.submissionDomState(page, beforeCache, signal);
+    if (before.documentId !== binding.documentId) {
+      throw new Error("ChatGPT steering target no longer exposes the committed response document");
+    }
+    if (before.visibleStopButtonCount < 1) {
+      // The browser can finish the response between the control bridge observing the revision and
+      // this queue drain. That rejects only the late revision; it must not fail the already-owned
+      // browser runtime or make Codex tear down the provider connection.
+      throw new ChatGptSteeringUnavailableError();
+    }
+    if (before.userIdentities.length !== binding.acceptedUserTurnIdentities.length
+      || binding.acceptedUserTurnIdentities.some(identity => !before.userIdentities.includes(identity))) {
+      throw new Error("ChatGPT steering found an unowned user turn before submission");
+    }
+    const composer = await this.activeComposer(page, 30_000, signal);
+    // ChatGPT owns one submit control and swaps it between Stop and Send as the composer content
+    // changes, so the Send identity is only observable after the revision is inserted. Wait for that
+    // exact swap instead of demanding Send before the insertion, which can only ever see Stop.
+    let insertOutcome = "not-attempted";
+    let lastControl: Awaited<ReturnType<ChatGptBrowserWorker["steeringSubmitControlState"]>> | undefined;
+    const armSendControl = async (budgetMs: number): Promise<boolean> => {
+      const armDeadline = Date.now() + budgetMs;
+      let armed = false;
+      while (!armed && Date.now() < armDeadline) {
+        lastControl = await this.steeringSubmitControlState(page, signal).catch(() => undefined);
+        armed = lastControl?.testid === "send-button"
+          && lastControl.disabled !== true
+          && lastControl.editorChars > 0;
+        if (!armed) await this.waitForTurnDomMutation(page, 250);
+      }
+      return armed;
+    };
+    // One editor command is enough to make ChatGPT expose its queued-message Send control. Rewriting
+    // the same visible text while React is applying that state can pin the shared control on Stop.
+    insertOutcome = await this.insertSteeringRevision(page, item.prompt.text, signal)
+      .catch(error => `error:${error instanceof Error ? error.message.slice(0, 60) : String(error).slice(0, 60)}`);
+    const armed = await armSendControl(CHATGPT_STEERING_SEND_ARM_MS);
+    console.info(`[chatgpt-web] in-flight steering armed=${armed} insert=${insertOutcome}`
+      + ` control=${JSON.stringify(lastControl ?? null)}`);
+    if (!armed) {
+      await this.clearSteeringRevision(page).catch(() => {});
+      throw new ChatGptSteeringUnavailableError();
+    }
+    // The launcher surface can be an unmeasured hidden view, ChatGPT's composer ignores a
+    // synthesised Enter even with the Send control focused, and the one shared control flips back to
+    // Stop between an outside check and an outside click. Re-read the identity and activate it inside
+    // one evaluation so Stop can never be the control this submit presses.
+    const clickArmedSteeringSend = () => withChatGptBrowserObservationTimeout(withBrowserTurnAbort(page.evaluate(() => {
+      const editor = document.querySelector("#prompt-textarea");
+      const form = editor ? editor.closest("form") : null;
+      const button = document.querySelector("#composer-submit-button")
+        ?? form?.querySelector('button[type="submit"]')
+        ?? form?.querySelector('[data-testid="send-button"], [data-testid="stop-button"]');
+      if (!button
+        || document.querySelectorAll("[data-streaming-response-status]").length < 1
+        || button.getAttribute("data-testid") !== "send-button"
+        || button.getAttribute("aria-disabled") === "true"
+        || (button as HTMLButtonElement).disabled === true) return false;
+      (button as HTMLElement).click();
+      return true;
+    }), signal));
+    await page.waitForTimeout(CHATGPT_UI_SETTLE_MS);
+    const submitted = await clickArmedSteeringSend();
+    if (!submitted) throw new ChatGptSteeringUnavailableError();
+
+    const acceptedDeadline = Date.now() + CHATGPT_STEERING_ACCEPTANCE_MS;
+    // The strongest proof is one new user turn whose content matches the revision. Some ChatGPT
+    // builds do not expose user turns through the conversation-turn testid at all, so the turn can
+    // also be proven by the composer draining while the exact generation is still running and no
+    // new assistant turn replaced the steered answer.
+    let drainedSince: number | undefined;
+    let acceptedAt: number | undefined;
+    let nextSubmitAttemptAt = Date.now() + CHATGPT_UI_SETTLE_MS;
+    for (;;) {
+      if (signal?.aborted) throw new DOMException("ChatGPT steering aborted", "AbortError");
+      if (page.isClosed()) throw chatGptBrowserTabClosedError();
+      const state = await this.submissionDomState(page, {}, signal);
+      if (state.documentId !== binding.documentId) {
+        throw new Error("ChatGPT steering navigated away from the committed response document");
+      }
+      const accepted = new Set(before.userIdentities);
+      const added = state.userIdentities.filter(identity => !accepted.has(identity));
+      if (added.length > 1) {
+        throw new Error("ChatGPT steering exposed more than one new user turn");
+      }
+      if (added.length === 1) {
+        if (before.userIdentities.some(identity => !state.userIdentities.includes(identity))) {
+          throw new Error("ChatGPT steering replaced an accepted user turn");
+        }
+        const userTurn = page.locator(`[data-turn-id=${JSON.stringify(added[0])}]`);
+        const visibleText = await withChatGptBrowserObservationTimeout(
+          withBrowserTurnAbort(userTurn.innerText(), signal),
+        );
+        if (!this.promptTextEquivalent(item.prompt.text, visibleText)) {
+          throw new Error("ChatGPT steering user-turn content did not match the submitted revision");
+        }
+        acceptedAt ??= Date.now();
+      }
+      if (before.userIdentities.length === 0) {
+        const composerText = await this.attachedPromptText(page, signal, composer);
+        const stillGenerating = await page.locator(CHATGPT_STOP_BUTTON_SELECTOR).last()
+          .isVisible().catch(() => false);
+        if (!composerText.trim() && stillGenerating) {
+          // ChatGPT clears the composer only after it consumes the send, so a drained editor that
+          // stays empty across one observation window is acceptance evidence, not a race.
+          drainedSince ??= Date.now();
+          if (Date.now() - drainedSince >= 250) acceptedAt ??= Date.now();
+        } else {
+          drainedSince = undefined;
+        }
+      }
+      if (acceptedAt !== undefined) {
+        // The steered revision opens its own assistant turn inside the same Temporary Chat. Bind to
+        // that turn so the delivered answer is the new direction rather than the superseded prefix.
+        const replies = state.responseIdentities
+          .filter(identity => !binding.acceptedTurnIdentities.includes(identity));
+        if (replies.length > 1) {
+          throw new Error("ChatGPT steering exposed more than one new assistant turn");
+        }
+        if (replies.length === 1) return { state, replyIdentity: replies[0] };
+        if (Date.now() - acceptedAt >= CHATGPT_STEERING_REPLY_MS) return { state };
+      }
+      if (added.length === 0 && Date.now() >= nextSubmitAttemptAt) {
+        nextSubmitAttemptAt = Date.now() + CHATGPT_UI_SETTLE_MS;
+        await clickArmedSteeringSend().catch(() => false);
+      }
+      if (Date.now() >= acceptedDeadline) {
+        // Do not poison the live runtime when ChatGPT consumed neither (or cannot prove consuming)
+        // this revision. The single-use instruction binding prevents a later canonical replay from
+        // resubmitting an uncertain revision.
+        throw new ChatGptSteeringUnavailableError();
+      }
+      await this.waitForTurnDomMutation(page, 50);
+    }
+  }
+
   private async waitForMultipartAcknowledgement(
     page: Page,
     initialResponseTurn: ChatGptAssistantTurnBinding,
@@ -4006,6 +4340,7 @@ export class ChatGptBrowserWorker {
         revision: number;
         observer: MutationObserver;
         waiters: Set<() => void>;
+        answerRoots: WeakSet<HTMLElement>;
       };
       type ObserverRegistry = { documentId: string; nextId: number; states: WeakMap<Element, ObserverState> };
       const scope = globalThis as typeof globalThis & {
@@ -4023,6 +4358,7 @@ export class ChatGptBrowserWorker {
           revision: 0,
           observer: undefined as unknown as MutationObserver,
           waiters: new Set<() => void>(),
+          answerRoots: new WeakSet<HTMLElement>(),
         };
         const state = observerState;
         state.observer = new MutationObserver(() => {
@@ -4069,6 +4405,8 @@ export class ChatGptBrowserWorker {
       const selectChatGptAnswerRoots = (
         markdownRoots: HTMLElement[],
         statusContainers: HTMLElement[],
+        turnComplete = false,
+        previouslyAnswered: HTMLElement[] = [],
       ): { commentaryRoots: HTMLElement[]; answerRoots: HTMLElement[] } => {
         const firstStatusContainer = statusContainers[0];
         const commentary = markdownRoots.filter(candidate => (
@@ -4081,18 +4419,43 @@ export class ChatGptBrowserWorker {
           // this on "some status follows me" silently reclassified answer text as commentary as
           // soon as a second tool call opened another status container below it, which both zeroed
           // the visible text and dropped every answer chunk emitted between tool calls.
-          || (firstStatusContainer !== undefined && Boolean(
+          || (!previouslyAnswered.includes(candidate) && firstStatusContainer !== undefined && Boolean(
             // 4 is Node.DOCUMENT_POSITION_FOLLOWING, inlined to keep this function standalone.
             candidate.compareDocumentPosition(firstStatusContainer) & 4,
           ))
         ));
+        const answerRoots = markdownRoots.filter(candidate => !commentary.includes(candidate));
+        // The position arm is a live-streaming heuristic: it assumes the answer has not started
+        // rendering yet. Once ChatGPT has stopped generating, a status row that rendered *below*
+        // answer text strands the whole answer in the commentary channel, which surfaces it in
+        // Codex's Working/commentary area and truncates the delivered answer. A completed turn with
+        // no answer root at all therefore falls back to the context-derived boundary; markdown that
+        // is genuinely reasoning (inside the status container or a chain-of-thought block) is still
+        // refused, so this recovers stranded answers without promoting real reasoning.
+        if (answerRoots.length > 0 || !turnComplete) {
+          return { commentaryRoots: commentary, answerRoots };
+        }
+        const contextDerived = markdownRoots.filter(candidate => (
+          candidate.closest("[data-streaming-response-status]") === null
+          && candidate.closest('[data-testid^="cot-v5"]') === null
+        ));
+        if (contextDerived.length === 0) return { commentaryRoots: commentary, answerRoots };
         return {
-          commentaryRoots: commentary,
-          answerRoots: markdownRoots.filter(candidate => !commentary.includes(candidate)),
+          commentaryRoots: commentary.filter(candidate => !contextDerived.includes(candidate)),
+          answerRoots: contextDerived,
         };
       };
       // CHATGPT_COMMENTARY_CLASSIFIER_END
-      const classified = selectChatGptAnswerRoots(allMarkdownRoots, streamingStatusContainers);
+      // A rendered copy action is ChatGPT's completed-turn marker, and it is independent of how the
+      // Markdown roots are classified. Read it before classification so the completed-turn recovery
+      // above can use it.
+      const turnCompleted = [...root.querySelectorAll<HTMLElement>(options.completionActionSelector)]
+        .some(candidate => renderedInDom(candidate));
+      const classified = selectChatGptAnswerRoots(
+        allMarkdownRoots, streamingStatusContainers, turnCompleted,
+        allMarkdownRoots.filter(candidate => observerState.answerRoots.has(candidate)),
+      );
+      for (const candidate of classified.answerRoots) observerState.answerRoots.add(candidate);
       const commentaryRoots = classified.commentaryRoots;
       const renderedRoots = classified.answerRoots;
       // ChatGPT may merge adjacent `.markdown` roots or virtualize an old prefix while a streamed
@@ -4560,6 +4923,7 @@ export class ChatGptBrowserWorker {
     });
     const surfaceId = lease.surfaceId;
     const reused = lease.reused === true;
+    let sendPermitted = false;
     let terminal: "completed" | "failed" | "aborted" = "completed";
     let terminalMessage: string | undefined;
     let originalError: unknown;
@@ -4596,7 +4960,10 @@ export class ChatGptBrowserWorker {
       heartbeatTimer = setInterval(sendHeartbeat, LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS);
       heartbeatTimer.unref?.();
       return await this.runBrowserTurn(
-        turn,
+        { ...turn, onSendActivated: async () => {
+          await turn.onSendActivated?.();
+          sendPermitted = true;
+        } },
         surfaceId,
         undefined,
         reused,
@@ -4616,6 +4983,7 @@ export class ChatGptBrowserWorker {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       try {
         const retainAfterAbort = terminal === "aborted" && turn.retainConversationOnAbort?.() === true;
+        const unsubmitted = retainAfterAbort && !reused && !sendPermitted;
         const release = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
           phase: "end",
           traceId: turn.traceId,
@@ -4623,7 +4991,8 @@ export class ChatGptBrowserWorker {
           status: terminal,
           ...(terminalMessage ? { message: terminalMessage } : {}),
           ...((terminal === "completed" && turn.retainConversation) || retainAfterAbort ? { retain: true } : {}),
-          ...((terminal === "completed" || retainAfterAbort) && (turn.nativeConnector || turn.capabilities.localToolsEnabled)
+          ...(unsubmitted ? { unsubmitted: true } : {}),
+          ...(!unsubmitted && (terminal === "completed" || retainAfterAbort) && (turn.nativeConnector || turn.capabilities.localToolsEnabled)
             ? { connectorBound: true }
             : {}),
         });
@@ -5152,7 +5521,10 @@ export class ChatGptBrowserWorker {
           );
         }
       }
-      const networkStreamPrimary = turnPlan.networkStream === "primary";
+      // In-flight steering can create additional network requests while preserving one browser
+      // answer. Until the stream tap can bind that sequence atomically, keep the DOM as the sole
+      // final-text authority for steerable turns instead of silently dropping a later stream.
+      const networkStreamPrimary = turnPlan.networkStream === "primary" && !turn.steering;
       const enableNetworkStreamTap = async (): Promise<void> => {
         if (turnPlan.networkStream === "off") return;
         try {
@@ -5321,6 +5693,8 @@ export class ChatGptBrowserWorker {
         CHATGPT_RESPONSE_DOM_GRACE_MS,
         completionTracker,
       );
+      const visibleTrace = new ChatGptVisibleTraceTracker();
+      const responseDomCache: ChatGptResponseDomCache = {};
       // A new assistant DOM shell can appear as soon as ChatGPT accepts the submission, before
       // fetch() resolves the conversation response headers. That shell is liveness evidence, not
       // evidence that the network tap is unavailable. Give the owned conversation fetch one short
@@ -5383,13 +5757,50 @@ export class ChatGptBrowserWorker {
             completionTracker.observeToolBatch(snapshot.lastToolBatchRevision, boundaryText);
             await turn.externalProgress!.acknowledgeToolBatch(snapshot.lastToolBatchRevision);
           };
+          // Network-primary stays authoritative for final text, but Codex still needs the public
+          // ChatGPT work/status rows while the turn is running. Keep this observation deliberately
+          // low-frequency: the previous 250ms loop performed expensive renderer snapshots on the
+          // hot path and materially increased contention. Cached snapshots are cheap when the DOM
+          // did not change; changed DOM is sampled at most once per second.
+          let lastVisibleTracePoll = 0;
+          let visibleTracePoll: Promise<void> | undefined;
+          let networkPrimaryClosed = false;
+          const scheduleVisibleTracePoll = (): void => {
+            const now = Date.now();
+            if (networkPrimaryClosed || visibleTracePoll || now - lastVisibleTracePoll < 1_000) return;
+            lastVisibleTracePoll = now;
+            visibleTracePoll = (async () => {
+              try {
+                const responseTurn = await Promise.race([
+                  responseTurnPromise,
+                  new Promise<undefined>(resolveWait => setTimeout(() => resolveWait(undefined), 75)),
+                ]);
+                if (!responseTurn || networkPrimaryClosed) return;
+                const snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
+                if (!snapshot.responsePresent || networkPrimaryClosed) return;
+                for (const trace of visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionVisible)) {
+                  if (networkPrimaryClosed) return;
+                  if (trace.kind === "commentary") turn.onCommentary?.(trace.text, trace.continuation === true);
+                  else turn.onReasoningSummary?.(trace.text, trace.continuation === true);
+                }
+              } catch {
+                // Non-fatal: the network stream remains the final-answer authority.
+              }
+            })().finally(() => {
+              visibleTracePoll = undefined;
+            });
+            void visibleTracePoll;
+          };
           for (;;) {
             const remainingMs = Math.max(0, waitDeadline - Date.now());
             if (!turn.externalProgress || remainingMs === 0) {
+              const observationWindowMs = Math.min(1_000, remainingMs);
               terminal = remainingMs === 0
                 ? undefined
-                : await wireCapture.waitForEnd(remainingMs, turn.abortSignal);
-              break;
+                : await wireCapture.waitForEnd(observationWindowMs, turn.abortSignal);
+              if (terminal !== undefined || remainingMs <= observationWindowMs) break;
+              scheduleVisibleTracePoll();
+              continue;
             }
             // Process the current snapshot before arming a waiter. waitForChange then closes the
             // opposite race: an update that lands after this read is returned immediately because
@@ -5400,6 +5811,10 @@ export class ChatGptBrowserWorker {
               ? AbortSignal.any([waitAbort.signal, turn.abortSignal])
               : waitAbort.signal;
             try {
+              const observationWindowMs = Math.min(1_000, remainingMs);
+              const observationTick = new Promise<{ source: "trace" }>(resolveTick => {
+                setTimeout(() => resolveTick({ source: "trace" }), observationWindowMs);
+              });
               const observed = await withBrowserTurnAbort(Promise.race([
                 wireCapture.waitForEnd(remainingMs, waitSignal).then(snapshot => ({
                   source: "wire" as const,
@@ -5409,16 +5824,19 @@ export class ChatGptBrowserWorker {
                   source: "external" as const,
                   snapshot,
                 })),
+                observationTick,
               ]), turn.abortSignal);
               if (observed.source === "wire") {
                 terminal = observed.snapshot;
                 break;
               }
-              await observeExternalProgress(observed.snapshot);
+              if (observed.source === "external") await observeExternalProgress(observed.snapshot);
+              scheduleVisibleTracePoll();
             } finally {
               waitAbort.abort();
             }
           }
+          networkPrimaryClosed = true;
           unsubscribe();
           if (wireInconsistent) {
             throw new Error("ChatGPT network stream rewrote already-emitted assistant text");
@@ -5561,8 +5979,7 @@ export class ChatGptBrowserWorker {
       let loggedCompletionWait = false;
       let capturedResponse = false;
       const sentAt = Date.now();
-      const visibleTrace = new ChatGptVisibleTraceTracker();
-      const markdownBuffer = new ChatGptMarkdownBuffer();
+      let markdownBuffer = new ChatGptMarkdownBuffer();
       const checkpointStream = turn.captureLunaCheckpoint
         ? new ChatGptLunaCheckpointStream()
         : undefined;
@@ -5581,11 +5998,59 @@ export class ChatGptBrowserWorker {
       };
       let domHealthTracker = new ChatGptTurnDomHealthTracker();
       let stoppedThinkingTracker = new ChatGptStoppedThinkingTracker();
-      const responseDomCache: ChatGptResponseDomCache = {};
       let consecutiveObservationRebinds = 0;
       let internalObservationFaults = 0;
       let observedThisIteration = false;
       let completionFenceRevision: number | undefined;
+      const submitPendingSteering = async (): Promise<void> => {
+        let item = turn.steering?.take();
+        while (item) {
+          try {
+            const accepted = await this.submitInFlightSteering(page, item, responseTurn, turn.abortSignal);
+            const replyIdentity = accepted.replyIdentity;
+            responseTurn = {
+              ...responseTurn,
+              ...(replyIdentity ? {
+                identity: replyIdentity,
+                locator: page.locator(`[data-turn-id=${JSON.stringify(replyIdentity)}]`),
+              } : {}),
+              acceptedTurnIdentities: accepted.state.turnIdentities,
+              acceptedUserTurnIdentities: accepted.state.userIdentities,
+            };
+            submissionBaseline = {
+              ...submissionBaseline,
+              initialUserTurnCount: accepted.state.userIdentities.length,
+              initialResponseTurnCount: accepted.state.responseIdentities.length,
+              initialTurnIdentities: accepted.state.turnIdentities,
+              initialUserTurnIdentities: accepted.state.userIdentities,
+              initialResponseTurnIdentities: accepted.state.responseIdentities,
+              domCache: {},
+            };
+            responseDomCache.key = undefined;
+            responseDomCache.snapshot = undefined;
+            completionTracker = new ChatGptCompletionTracker();
+            completionFenceRevision = undefined;
+            if (replyIdentity) {
+              // The steered revision owns its own assistant turn. The Markdown journal keys committed
+              // segments by source range, so it must restart with that turn instead of reconciling the
+              // superseded prefix against a different response root.
+              markdownBuffer = new ChatGptMarkdownBuffer();
+              recoveryIdentity.observeAssistantTurn(replyIdentity);
+              turn.onSteeringReply?.(replyIdentity);
+            }
+            item.complete();
+          } catch (error) {
+            const normalized = error instanceof Error ? error : new Error(String(error));
+            item.complete(normalized);
+            if (normalized instanceof ChatGptSteeringUnavailableError) {
+              item = turn.steering?.take();
+              continue;
+            }
+            throw normalized;
+          }
+          item = turn.steering?.take();
+        }
+      };
       let incompleteCaptureRecoveryAttempted = false;
       let incompleteCaptureRecoveryCanaryInjected = false;
       const attemptIncompleteCaptureRecovery = async (cause: unknown): Promise<boolean> => {
@@ -5783,6 +6248,7 @@ export class ChatGptBrowserWorker {
         if (deadline !== undefined && Date.now() >= deadline) {
           throw new Error("ChatGPT web turn timed out");
         }
+        await submitPendingSteering();
         await throwIfChatGptSessionFailureAlert(page);
         await throwIfChatGptTerminalErrorAlert(responseTurn.locator);
 
@@ -6448,6 +6914,7 @@ export class ChatGptBrowserWorker {
       }
       throw error;
     } finally {
+      turn.steering?.close();
       earlyRecoverySampler?.close();
       if (earlyRecoverySampling) await earlyRecoverySampling.catch(() => {});
       if (generationTurnIdContinuityStarted && generationTurnIdContinuityToken && diagnosticPage && !diagnosticPage.isClosed()) {

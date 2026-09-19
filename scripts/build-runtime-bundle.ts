@@ -124,6 +124,22 @@ exec "$root/runtime/bun" "$root/app/cli.js" "$@"
 writeFileSync(join(binDir, launcherName), launcher, process.platform === "win32" ? undefined : { mode: 0o755 });
 if (process.platform !== "win32") chmodSync(join(binDir, launcherName), 0o755);
 
+if (process.platform === "win32") {
+  const proxyPath = join(binDir, "codex-webgpt-proxy.exe");
+  const proxyBuild = Bun.spawnSync([
+    process.execPath,
+    "build",
+    "--compile",
+    "--target=bun-windows-x64",
+    join(root, "src", "codex-stdio-proxy.ts"),
+    "--outfile",
+    proxyPath,
+  ], { cwd: root, stdout: "pipe", stderr: "pipe" });
+  if (proxyBuild.exitCode !== 0) {
+    throw new Error(`Codex stdio proxy build failed: ${proxyBuild.stderr.toString() || proxyBuild.stdout.toString()}`);
+  }
+}
+
 const notices = Bun.spawnSync([
   process.execPath,
   "run",

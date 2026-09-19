@@ -361,6 +361,8 @@ export type LauncherTurnActivity =
       message?: string;
       retain?: boolean;
       connectorBound?: boolean;
+      /** A fresh surface stopped before its Send permission was acknowledged. */
+      unsubmitted?: boolean;
     };
 
 export const LAUNCHER_TURN_START_TIMEOUT_MS = 5_000;

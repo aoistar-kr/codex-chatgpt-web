@@ -1,7 +1,12 @@
 import { createInterface } from "node:readline";
 import { stdin, stderr, stdout } from "node:process";
 import type { CodexOutputTextAnnotation, CodexProviderConfig } from "../../types";
-import { ChatGptBrowserWorker, closeChatGptBrowserWorkers, type BrowserTurn } from "./browser-worker";
+import {
+  ChatGptBrowserSteeringQueue,
+  ChatGptBrowserWorker,
+  closeChatGptBrowserWorkers,
+  type BrowserTurn,
+} from "./browser-worker";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import type { ChatGptWebCapabilities } from "./model";
 import { createProcessLineWriter } from "./process-line-writer";
@@ -76,6 +81,7 @@ type InputMessage = RunMessage
   | { type: "completion_fence_begin_ack"; id: string; requestId: number; revision: number | null }
   | { type: "completion_fence_commit_ack"; id: string; requestId: number; committed: boolean }
   | { type: "progress"; id: string; snapshot: ChatGptExternalTurnProgressSnapshot }
+  | { type: "steer"; id: string; steeringId: string; prompt: CompiledChatGptWebPrompt }
   | { type: "abort"; id: string; preserveConversation?: boolean }
   | { type: "shutdown" };
 
@@ -100,6 +106,7 @@ console.error = diagnostic;
 const abortControllers = new Map<string, AbortController>();
 const retainConversationAfterAbort = new Set<string>();
 const turnProgress = new Map<string, ChatGptMirroredTurnProgress>();
+const steeringQueues = new Map<string, ChatGptBrowserSteeringQueue>();
 const preparedSelections = new Map<string, ReturnType<typeof createBrowserHelperPromptSelection>>();
 const sendActivationWaiters = new Map<string, {
   resolve: () => void;
@@ -129,6 +136,8 @@ function requestShutdown(): Promise<void> {
   protocolOutput.close();
   diagnosticOutput.close();
   for (const controller of abortControllers.values()) controller.abort();
+  for (const queue of steeringQueues.values()) queue.close(new DOMException("Browser helper is shutting down", "AbortError"));
+  steeringQueues.clear();
   for (const selection of preparedSelections.values()) selection.cancel();
   preparedSelections.clear();
   for (const waiter of sendActivationWaiters.values()) {
@@ -215,6 +224,8 @@ async function run(message: RunMessage): Promise<void> {
     : undefined;
   if (progress) turnProgress.set(message.id, progress);
   const promptSelection = createBrowserHelperPromptSelection();
+  const steering = new ChatGptBrowserSteeringQueue();
+  steeringQueues.set(message.id, steering);
   preparedSelections.set(message.id, promptSelection);
   const prepareSelected = async () => ({ ...await promptSelection.wait(), release: () => {} });
   let outputAnnotations: CodexOutputTextAnnotation[] = [];
@@ -295,6 +306,7 @@ async function run(message: RunMessage): Promise<void> {
     }),
     onCommentary: (text, continuation) => writeProtocol({ type: "event", id: message.id, event: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
     onTextDelta: text => writeProtocol({ type: "event", id: message.id, event: "text", text }),
+    steering,
     onOutputAnnotations: annotations => {
       outputAnnotations = annotations.map(annotation => ({ ...annotation }));
     },
@@ -344,6 +356,8 @@ async function run(message: RunMessage): Promise<void> {
     abortControllers.delete(message.id);
     retainConversationAfterAbort.delete(message.id);
     turnProgress.delete(message.id);
+    steering.close();
+    steeringQueues.delete(message.id);
   }
 }
 
@@ -488,6 +502,28 @@ input.on("line", line => {
         error instanceof Error ? error.message : String(error),
       );
     }
+  } else if (message.type === "steer") {
+    const queue = steeringQueues.get(message.id);
+    const prompt = message.prompt;
+    if (!queue) return;
+    if (!/^[A-Za-z0-9_-]{6,128}$/.test(message.steeringId)
+      || !prompt || typeof prompt.text !== "string" || !prompt.text
+      || !Array.isArray(prompt.images) || prompt.images.length > 0
+      || prompt.multipart !== undefined) {
+      writeProtocol({ type: "event", id: message.id, event: "steer_rejected", steeringId: message.steeringId, message: "Invalid in-flight steering payload" });
+      return;
+    }
+    void queue.submit({ id: message.steeringId, prompt }).then(
+      () => writeProtocol({ type: "event", id: message.id, event: "steer_submitted", steeringId: message.steeringId }),
+      error => writeProtocol({
+        type: "event",
+        id: message.id,
+        event: "steer_rejected",
+        steeringId: message.steeringId,
+        message: error instanceof Error ? error.message : String(error),
+        ...(error instanceof ChatGptWebAdapterError ? { code: error.code } : {}),
+      }),
+    );
   } else if (message.type === "abort") {
     if (message.preserveConversation !== undefined && typeof message.preserveConversation !== "boolean") {
       writeProtocol({ type: "error", id: message.id, message: "Browser helper abort retention flag is invalid" });
@@ -550,4 +586,4 @@ process.once("SIGTERM", () => {
 
 // Advertise optional frames so a newer daemon can tell whether this helper understands them. An
 // older helper omits the field, and the daemon then withholds those frames instead of breaking it.
-writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence"] });
+writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "inflight-steering"] });

@@ -23,13 +23,26 @@ import type {
   ChatGptUnattributedEnvironmentMessage,
 } from "./environment";
 
-type RolloutIdentity = ChatGptRootThreadMetadata | ChatGptRootCompactionRolloutIdentity | ChatGptThreadSpawnLineage;
+export type CodexRolloutIdentity = ChatGptRootThreadMetadata | ChatGptRootCompactionRolloutIdentity | ChatGptThreadSpawnLineage;
 
 const CODEX_ID_SOURCE = "[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
 const CODEX_ID = new RegExp(`^${CODEX_ID_SOURCE}$`, "i");
 const ROLLOUT_READ_CHUNK_BYTES = 64 * 1024;
-const MAX_ROLLOUT_JSON_LINE_BYTES = 16 * 1024 * 1024;
+export const MAX_ROLLOUT_JSON_LINE_BYTES = 16 * 1024 * 1024;
 const MAX_ROLLOUT_DIRECTORY_ENTRIES = 100_000;
+
+export interface AuthenticatedCodexRolloutAuthority {
+  readonly codexHome: string;
+  readonly rolloutPath: string;
+  readonly threadId: string;
+  readonly turnId: string;
+  readonly size: number;
+  readonly device: number;
+  readonly inode: number;
+  readonly birthtimeMs: number;
+  readonly lineage: CodexRolloutIdentity;
+  readonly latestTurnContext: Record<string, unknown>;
+}
 
 type IndexedRollout =
   | { kind: "unavailable" }
@@ -87,7 +100,7 @@ function configuredSqliteHome(codexHome: string, explicit?: string): string {
 
 function indexedRollout(
   sqliteHome: string,
-  identity: RolloutIdentity,
+  identity: CodexRolloutIdentity,
 ): IndexedRollout {
   const databasePath = join(sqliteHome, "state_5.sqlite");
   if (!existsSync(databasePath)) return { kind: "unavailable" };
@@ -283,7 +296,7 @@ function verifyHistoricalEnvironmentMessages(
 
 function validateSessionMeta(
   item: Record<string, unknown>,
-  identity: RolloutIdentity,
+  identity: CodexRolloutIdentity,
 ): void {
   const payload = record(item.payload);
   if (!("parentThreadId" in identity)) {
@@ -582,7 +595,7 @@ function environmentFromTurnContext(
 }
 
 function validateMetadataConsistency(
-  lineage: RolloutIdentity,
+  lineage: CodexRolloutIdentity,
   environment: ChatGptTurnEnvironment,
 ): void {
   // Request sandbox/workspace fields are diagnostic only. They narrow a rollout-derived authority
@@ -606,16 +619,14 @@ function validateMetadataConsistency(
   }
 }
 
-export function resolveCurrentCodexRolloutEnvironment(options: {
+export function resolveCurrentCodexRolloutAuthority(options: {
   codexHome: string;
   sqliteHome?: string;
-  lineage: RolloutIdentity;
+  lineage: CodexRolloutIdentity;
   turnId: string;
   compactionSourceTurnId?: string;
-  tools?: readonly CodexTool[];
-  historicalEnvironmentMessages?: ChatGptUnattributedEnvironmentMessage[];
-}): ChatGptTurnEnvironment | undefined {
-  const { codexHome, lineage, turnId, tools, compactionSourceTurnId } = options;
+}): AuthenticatedCodexRolloutAuthority | undefined {
+  const { codexHome, lineage, turnId, compactionSourceTurnId } = options;
   const nativeThreadId = CODEX_ID.test(lineage.threadId);
   const nativeTurnId = CODEX_ID.test(turnId);
   if (!nativeThreadId && !nativeTurnId) return undefined;
@@ -633,12 +644,13 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
     throw new Error("Codex has no canonical rollout for the requested subagent thread");
   }
 
-  const matching: ChatGptTurnEnvironment[] = [];
+  const matching: AuthenticatedCodexRolloutAuthority[] = [];
   for (const candidate of candidates) {
     const rolloutPath = validateRolloutPath(codexHome, candidate, lineage.threadId);
     const fd = openSync(rolloutPath, "r");
     try {
-      const size = fstatSync(fd).size;
+      const stat = fstatSync(fd);
+      const size = stat.size;
       if (!Number.isSafeInteger(size) || size <= 0) throw new Error("Codex rollout is empty");
       validateSessionMeta(firstRolloutRecord(fd, size), lineage);
       const latest = latestTurnContext(fd, size);
@@ -649,12 +661,18 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
         }
         continue;
       }
-      const environment = environmentFromTurnContext(latest, latest.turn_id as string, tools);
-      validateMetadataConsistency(lineage, environment);
-      if (options.historicalEnvironmentMessages) {
-        verifyHistoricalEnvironmentMessages(fd, size, turnId, options.historicalEnvironmentMessages);
-      }
-      matching.push(environment);
+      matching.push({
+        codexHome: resolve(codexHome),
+        rolloutPath,
+        threadId: lineage.threadId,
+        turnId: latest.turn_id as string,
+        size,
+        device: stat.dev,
+        inode: stat.ino,
+        birthtimeMs: stat.birthtimeMs,
+        lineage,
+        latestTurnContext: latest,
+      });
     } finally {
       closeSync(fd);
     }
@@ -666,4 +684,40 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
     throw new Error("Codex has multiple canonical rollouts for the requested current turn");
   }
   return matching[0]!;
+}
+
+function sameRolloutFile(authority: AuthenticatedCodexRolloutAuthority, fd: number): boolean {
+  const stat = fstatSync(fd);
+  return stat.dev === authority.device
+    && stat.ino === authority.inode
+    && stat.birthtimeMs === authority.birthtimeMs
+    && stat.size >= authority.size;
+}
+
+export function resolveCurrentCodexRolloutEnvironment(options: {
+  codexHome: string;
+  sqliteHome?: string;
+  lineage: CodexRolloutIdentity;
+  turnId: string;
+  compactionSourceTurnId?: string;
+  tools?: readonly CodexTool[];
+  historicalEnvironmentMessages?: ChatGptUnattributedEnvironmentMessage[];
+}): ChatGptTurnEnvironment | undefined {
+  const authority = resolveCurrentCodexRolloutAuthority(options);
+  if (!authority) return undefined;
+
+  const environment = environmentFromTurnContext(authority.latestTurnContext, authority.turnId, options.tools);
+  validateMetadataConsistency(options.lineage, environment);
+  if (options.historicalEnvironmentMessages) {
+    const fd = openSync(authority.rolloutPath, "r");
+    try {
+      if (!sameRolloutFile(authority, fd)) {
+        throw new Error("Codex rollout changed during environment history lookup");
+      }
+      verifyHistoricalEnvironmentMessages(fd, authority.size, options.turnId, options.historicalEnvironmentMessages);
+    } finally {
+      closeSync(fd);
+    }
+  }
+  return environment;
 }

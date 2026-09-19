@@ -327,6 +327,7 @@ class BrowserHost {
     this.hotTemporaryOverlapEnabled = process.env.CODEX_WEB_GPT_HOT_OVERLAP?.trim() !== "0";
     this.closedTurnOwners = new Map();
     this.userCancelledTurnOwners = new Map();
+    this.pendingStopTurnOwners = new Map();
     this.selectedTabId = "home";
     this.manualOperation = null;
     this.loginOperation = null;
@@ -1257,7 +1258,8 @@ class BrowserHost {
     if (!tab) {
       const closedOwner = this.closedTurnOwners.get(traceId);
       if (closedOwner === helperPid) return false;
-      throw new Error(`Browser turn ownership mismatch: no browser tab owns ${traceId}`);
+      this.pendingStopTurnOwners.set(traceId, helperPid);
+      return true;
     }
     if (tab.helperPid !== helperPid) {
       throw new Error(`Browser helper ownership mismatch: expected ${tab.helperPid}, received ${helperPid}`);
@@ -1775,7 +1777,8 @@ class BrowserHost {
     if (this.manualOperation) {
       throw new Error(`ChatGPT browser is busy with ${this.manualOperation}`);
     }
-    if (this.userCancelledTurnOwners.has(traceId)) {
+    if (this.userCancelledTurnOwners.has(traceId) || this.pendingStopTurnOwners?.has(traceId)) {
+      this.pendingStopTurnOwners?.delete(traceId);
       throw new BrowserTurnCancelledError(traceId);
     }
     const sameTrace = [...this.turnTabs.values()].find((tab) => tab.traceId === traceId);
@@ -1787,7 +1790,8 @@ class BrowserHost {
       tab.status === "ready"
       && tab.conversationKey === conversationKey
       && tab.connectorIdentity === connectorIdentity
-      && (!connectorIdentity || tab.connectorBound === true)
+      && (!connectorIdentity || tab.connectorBound === true || tab.unsubmitted === true)
+      && (!requireRetainedConversation || tab.unsubmitted !== true)
     )) : [];
     if (retainedMatches.length > 1) {
       throw new Error(`ChatGPT retained conversation ${conversationKey} owns multiple browser tabs`);
@@ -1853,7 +1857,7 @@ class BrowserHost {
     BrowserHost.prototype.discardWarmingHotTemporarySurfaces.call(this, "turn_started");
     const existing = sameTrace?.status === "running" ? sameTrace : exactRetained;
     if (existing) {
-      const reused = existing.status === "ready";
+      const reused = existing.status === "ready" && existing.unsubmitted !== true;
       if (existing.status === "running" && existing.helperPid !== helperPid) {
         if (processRunning(existing.helperPid)) {
           throw new Error(`ChatGPT browser turn ${traceId} is owned by another helper process`);
@@ -1928,6 +1932,7 @@ class BrowserHost {
     message,
     retain = false,
     connectorBound = false,
+    unsubmitted = false,
   ) {
     const tab = [...this.turnTabs.values()].find((candidate) => candidate.traceId === traceId);
     if (!tab) {
@@ -1948,12 +1953,12 @@ class BrowserHost {
     const retainTerminal = retain === true
       && !cancelledByUser
       && Boolean(tab.conversationKey)
-      && (!tab.connectorIdentity || connectorBound)
+      && (!tab.connectorIdentity || connectorBound || unsubmitted)
       && (status === "completed" || status === "aborted");
     tab.status = retainTerminal ? "ready" : status === "completed" ? "ready" : status === "aborted" ? "aborted" : "error";
     this.syncPowerSaveBlocker();
     tab.message = retainTerminal && status === "aborted"
-      ? "Steering update pending"
+      ? "Turn stopped; Temporary Chat retained"
       : status === "completed" ? "Task completed" : message || `ChatGPT turn ${status}`;
     tab.loading = false;
     if (!tab.view.webContents.isDestroyed()) tab.view.webContents.setBackgroundThrottling(true);
@@ -1961,6 +1966,7 @@ class BrowserHost {
       this.logger.info("browser.tab_completed", { tabId: tab.id, traceId });
     }
     if (retainTerminal) {
+      tab.unsubmitted = unsubmitted === true;
       tab.connectorBound = connectorBound === true;
       tab.lastHeartbeatAt = Date.now();
       if (hideAfterTurn && !this.activeTraceId) this.hide();

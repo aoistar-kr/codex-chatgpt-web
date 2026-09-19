@@ -2494,7 +2494,7 @@ test("a hot Temporary Chat surface is leased for a fresh turn without creating a
   );
 });
 
-test("active-turn stop is executed by the launcher surface and steering aborts can remain retained", () => {
+test("active-turn stop is executed by the launcher surface and a stopped turn can remain retained", () => {
   const source = fs.readFileSync(
     resolve(__dirname, "../electron/browser-host.cjs"),
     "utf8",
@@ -2503,7 +2503,7 @@ test("active-turn stop is executed by the launcher surface and steering aborts c
   assert.match(source, /querySelectorAll\('\[data-testid="stop-button"\]'\)/);
   assert.match(source, /button\.click\(\)/);
   assert.match(source, /status === "completed" \|\| status === "aborted"/);
-  assert.match(source, /Steering update pending/);
+  assert.match(source, /Turn stopped; Temporary Chat retained/);
   assert.match(source, /!cancelledByUser/);
 });
 
@@ -3197,6 +3197,29 @@ test("a completed keyed turn is retained for thirty minutes and preserves its ac
   const retainedAt = tab.lastHeartbeatAt;
   BrowserHost.prototype.reapExpiredTurnTabs.call(fixture, retainedAt + (30 * 60 * 1000) - 1);
   assert.equal(fixture.turnTabs.has(tab.id), true);
+});
+
+test("a fresh pre-send Stop retains its surface but the next lease still requires a full prompt", async () => {
+  const tab = {
+    id: "early-stop", surfaceId: "early-surface", traceId: "early-trace",
+    conversationKey: "e".repeat(64), connectorIdentity: "Codex Native2",
+    connectorBound: false, helperPid: 777, status: "running", loading: true,
+    view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {} } },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    manualOperation: null, turnTabs: new Map([[tab.id, tab]]),
+    closedTurnOwners: new Map(), userCancelledTurnOwners: new Map(), selectedTabId: tab.id,
+    syncViewVisibility() {}, writeDescriptor() {}, publishState() {},
+    snapshot: () => ({ tabs: [] }), hide() {}, logger: { info() {} },
+  });
+  await fixture.endTurn(tab.traceId, 777, "aborted", false, undefined, true, false, true);
+  assert.equal(fixture.turnTabs.get(tab.id), tab);
+  assert.equal(tab.unsubmitted, true);
+  assert.equal(tab.connectorBound, false);
+  const lease = fixture.beginTurn("next-trace", false, 888, tab.conversationKey, "Codex Native2");
+  assert.equal(lease.surfaceId, "early-surface");
+  assert.equal(lease.reused, false);
+  assert.equal(lease.connectorBound, false);
 });
 
 test("a retained browser tab expires at thirty minutes", () => {

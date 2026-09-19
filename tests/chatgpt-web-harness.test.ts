@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildResponseJSON } from "../src/bridge";
-import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
+import { ChatGptSteeringUnavailableError, ChatGptTurnSupersededError, ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_RESPONSE_DOM_GRACE_MS, ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
@@ -99,6 +99,130 @@ test("tool-loop timing tracks batch roundtrip and post-result continuation witho
   });
   expect(session.postToolContinuationMs(410)).toBe(60);
   expect(() => session.finishOutstandingToolBatch(500)).toThrow("timing is unavailable");
+});
+
+test("one logical session replaces a stopped browser epoch and wakes active observers", async () => {
+  let settleOld!: () => void;
+  let cancelReason: Error | undefined;
+  const oldSettlement = new Promise<void>(resolve => { settleOld = resolve; });
+  const session = new ChatGptTurnSession({
+    mode: "read-only",
+    browser: new Promise<string>(() => {}),
+    physicalSettlement: oldSettlement,
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    conversationKey: "c".repeat(64),
+    submission: { phase: "accepted" },
+    cancel: reason => {
+      cancelReason = reason;
+      settleOld();
+    },
+  }, "old-trace", "owner", "turn", "thread", "old-instruction");
+
+  const revision = session.runtimeEpoch();
+  const changed = session.waitForRuntimeChange(revision);
+  const source = session.beginRuntimeTransition();
+  source.cancel(new ChatGptWebAdapterError("superseded", {
+    status: 499,
+    errorType: "client_closed_request",
+    code: "client_cancelled",
+    retryable: false,
+  }));
+  await source.physicalSettlement;
+  session.installRuntime({
+    mode: "read-only",
+    browser: new Promise<string>(() => {}),
+    physicalSettlement: new Promise<void>(() => {}),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    conversationKey: "c".repeat(64),
+    cancel: () => {},
+  }, "new-instruction");
+
+  await changed;
+  expect(cancelReason?.message).toBe("superseded");
+  expect(session.runtime).not.toBe(source);
+  expect(session.instruction).toBe("new-instruction");
+  expect(session.hasAbsorbedInstruction("new-instruction")).toBeTrue();
+});
+
+test("a superseded epoch rejection remains observable without preventing replacement", async () => {
+  let rejectOld!: (error: Error) => void;
+  const oldSettlement = new Promise<void>((_, reject) => { rejectOld = reject; });
+  const session = new ChatGptTurnSession({
+    mode: "read-only",
+    browser: new Promise<string>(() => {}),
+    physicalSettlement: oldSettlement,
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel: reason => rejectOld(reason ?? new Error("cancelled")),
+  });
+
+  const source = session.beginRuntimeTransition();
+  const superseded = new ChatGptTurnSupersededError();
+  source.cancel(superseded);
+  await expect(source.physicalSettlement).rejects.toBe(superseded);
+  await expect(session.physicalSettlement).rejects.toBe(superseded);
+  session.installRuntime({
+    mode: "read-only",
+    browser: new Promise<string>(() => {}),
+    physicalSettlement: new Promise<void>(() => {}),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel: () => {},
+  }, "replacement-instruction");
+
+  expect(session.instruction).toBe("replacement-instruction");
+});
+
+test("steering waits until every real tool result is delivered", async () => {
+  const session = new ChatGptTurnSession({
+    mode: "read-only",
+    browser: new Promise<string>(() => {}),
+    physicalSettlement: new Promise<void>(() => {}),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel: () => {},
+  });
+  session.setOutstanding([
+    { callId: "call_a", wireName: "exec_command", freeform: false, arguments: {} },
+    { callId: "call_b", wireName: "exec_command", freeform: false, arguments: {} },
+  ]);
+  let released = false;
+  const waiting = session.waitForOutstandingResults().then(() => { released = true; });
+  session.markResultDelivered("call_a");
+  await Bun.sleep(0);
+  expect(released).toBeFalse();
+  session.markResultDelivered("call_b");
+  await waiting;
+  expect(released).toBeTrue();
+});
+
+test("interrupt wins over steering queued behind an outstanding tool batch", async () => {
+  let cancelled = 0;
+  let successorStarted = false;
+  const session = new ChatGptTurnSession({
+    mode: "read-only",
+    browser: new Promise<string>(() => {}),
+    physicalSettlement: new Promise<void>(() => {}),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel: () => { cancelled += 1; },
+  });
+  session.setOutstanding([
+    { callId: "call_interrupt", wireName: "exec_command", freeform: false, arguments: {} },
+  ]);
+  session.enqueueControl(async () => {
+    await session.waitForOutstandingResults();
+    if (session.isInterrupted()) return;
+    successorStarted = true;
+  });
+  session.enqueueControl(async () => {}, new Error("user stopped"));
+  await session.waitForControlIdle();
+
+  expect(cancelled).toBe(1);
+  expect(successorStarted).toBeFalse();
+  expect(session.isInterrupted()).toBeTrue();
 });
 
 test("Windows command fast path is schema-gated and never rewrites shell-specific command text", () => {
@@ -963,7 +1087,7 @@ describe("ChatGPT outer-native harness v4", () => {
     sessions.clear();
   });
 
-  test("steering retires an active owner only when instruction lineage proves the predecessor", async () => {
+  test("an unclaimed steering replay cannot stop or replace its active browser owner", async () => {
     const sessions = new ChatGptTurnSessions();
     let finishBrowser!: () => void;
     let settlePhysical!: () => void;
@@ -986,7 +1110,7 @@ describe("ChatGPT outer-native harness v4", () => {
       },
     }), "old-trace", "shared-thread", "native-turn", "thread", "old-instruction");
 
-    const replacement = await sessions.getOrCreateAfterOwnerRetirement(
+    const replacement = sessions.getOrCreateAfterOwnerRetirement(
       "new-turn",
       "shared-thread",
       () => ({
@@ -1005,9 +1129,125 @@ describe("ChatGPT outer-native harness v4", () => {
       source => { steeringSource = source; },
     );
 
-    expect(replacement.instruction).toBe("new-instruction");
-    expect(cancellations).toBe(1);
-    expect(steeringSource?.traceId).toBe("old-trace");
+    await expect(replacement).rejects.toMatchObject({ code: "inflight_steering_unavailable" });
+    expect(cancellations).toBe(0);
+    expect(steeringSource).toBeUndefined();
+    expect(sessions.find("old-turn")?.isActive()).toBe(true);
+    sessions.clear();
+  });
+
+  test("a later provider replay reuses a rollout-claimed steering epoch exactly once", async () => {
+    const sessions = new ChatGptTurnSessions();
+    const active = sessions.getOrCreate("old-key", () => ({
+      mode: "read-only" as const,
+      browser: new Promise<string>(() => {}),
+      physicalSettlement: new Promise<void>(() => {}),
+      trace: new ChatGptTraceFeed(),
+      text: new ChatGptTextFeed(),
+      cancel: () => {},
+    }), "trace", "owner", "turn", "thread", "old-instruction");
+    active.claimInstruction("steered-instruction");
+    let starts = 0;
+    const replay = await sessions.getOrCreateAfterOwnerRetirement(
+      "steered-key",
+      "owner",
+      () => {
+        starts += 1;
+        return {
+          mode: "read-only" as const,
+          browser: Promise.resolve("duplicate"),
+          physicalSettlement: Promise.resolve(),
+          trace: new ChatGptTraceFeed(),
+          text: new ChatGptTextFeed(),
+          cancel: () => {},
+        };
+      },
+      "replay-trace",
+      undefined,
+      "turn",
+      "thread",
+      { current: "steered-instruction", predecessors: new Set(["old-instruction"]) },
+    );
+
+    expect(replay).toBe(active);
+    expect(starts).toBe(0);
+    expect(sessions.find("old-key")).toBeUndefined();
+    expect(sessions.find("steered-key")).toBe(active);
+    sessions.clear();
+  });
+
+  test("a direct steer binds one provisional item id to one later Codex-owned revision", () => {
+    const sessions = new ChatGptTurnSessions();
+    const active = sessions.getOrCreate("old-key", () => ({
+      mode: "read-only" as const,
+      browser: new Promise<string>(() => {}),
+      physicalSettlement: new Promise<void>(() => {}),
+      trace: new ChatGptTraceFeed(),
+      text: new ChatGptTextFeed(),
+      cancel: () => {},
+    }), "trace", "owner", "turn", "thread", "old-instruction");
+    const content = [{ type: "input_text", text: "replace the active instruction" }];
+
+    expect(active.claimDirectSteer("proxy-item", "proxy-instruction", content)).toBe(true);
+    expect(active.claimDirectSteer("proxy-item", "duplicate-proxy-instruction", content)).toBe(false);
+    expect(active.absorbDirectSteerAlias("codex-instruction", content)).toBe(true);
+    expect(active.hasAbsorbedInstruction("codex-instruction")).toBe(true);
+    expect(active.isCanonicalDirectSteerAlias("codex-instruction")).toBe(true);
+    expect(active.isCanonicalDirectSteerAlias("proxy-instruction")).toBe(false);
+    expect(active.absorbDirectSteerAlias("unrelated-second-instruction", content)).toBe(false);
+
+    // Equal text is still a separate revision when a second authenticated stdio frame claims it.
+    expect(active.claimDirectSteer("proxy-item-2", "proxy-instruction-2", content)).toBe(true);
+    expect(active.absorbDirectSteerAlias("codex-instruction-2", content)).toBe(true);
+    sessions.clear();
+  });
+
+  test("a late provider observer can find the exact settled native steer session", async () => {
+    const sessions = new ChatGptTurnSessions();
+    const session = sessions.getOrCreate("steered-key", () => ({
+      mode: "read-only" as const,
+      browser: Promise.resolve("STEER_LIVE_OK"),
+      physicalSettlement: Promise.resolve(),
+      trace: new ChatGptTraceFeed(),
+      text: new ChatGptTextFeed(),
+      cancel: () => {},
+    }), "trace", "owner", "turn", "thread", "steered-instruction");
+    await session.physicalSettlement;
+    await session.browserOutcome;
+
+    expect(session.isPhysicallySettled()).toBe(true);
+    expect(sessions.findNativeTurn("thread", "turn", "owner")).toBe(session);
+    expect(sessions.findNativeTurn("other-thread", "turn", "owner")).toBeUndefined();
+    expect(sessions.findNativeTurn("thread", "other-turn", "owner")).toBeUndefined();
+    expect(sessions.findNativeTurn("thread", "turn", "other-owner")).toBeUndefined();
+    sessions.clear();
+  });
+
+  test("rejected steering binds its late canonical replay without cancelling or resubmitting", async () => {
+    const sessions = new ChatGptTurnSessions();
+    let cancellations = 0;
+    const active = sessions.getOrCreate("original", () => ({
+      mode: "read-only", browser: new Promise<string>(() => {}),
+      physicalSettlement: new Promise<void>(() => {}),
+      trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(),
+      cancel: () => { cancellations += 1; },
+    }), "trace", "owner", "turn", "thread", "initial");
+    const content = [{ type: "input_text", text: "new direction" }];
+    active.claimDirectSteer("steer-request", "provisional", content);
+    const error = new ChatGptSteeringUnavailableError();
+    active.rejectInstruction("provisional", error);
+    expect(active.hasAbsorbedInstruction("provisional")).toBe(false);
+    expect(active.absorbDirectSteerAlias("canonical", content)).toBe(true);
+    expect(active.instructionFailure("canonical")).toBe(error);
+    expect(active.absorbDirectSteerAlias("unrelated", content)).toBe(false);
+    const replay = await sessions.getOrCreateAfterOwnerRetirement(
+      "replay", "owner", () => { throw new Error("must not restart"); },
+      "replay-trace", undefined, "turn", "thread",
+      { current: "canonical", predecessors: new Set(["initial"]) },
+    );
+    expect(replay).toBe(active);
+    expect(cancellations).toBe(0);
+    expect(active.isActive()).toBe(true);
     sessions.clear();
   });
 

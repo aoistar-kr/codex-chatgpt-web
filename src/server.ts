@@ -8,7 +8,7 @@ import {
   cancelStructuredCompactionNativeTurn,
   cancelStructuredCompactionTrace,
 } from "./adapters/chatgpt-web/compaction-handoff";
-import { chatGptBrowserTabClosedError } from "./adapters/chatgpt-web/adapter-error";
+import { ChatGptTurnInterruptedError, chatGptBrowserTabClosedError } from "./adapters/chatgpt-web/adapter-error";
 import {
   CHATGPT_TURN_REVISION_CONFLICT_MESSAGE,
   extractChatGptCompactionSourceRevision,
@@ -849,7 +849,9 @@ export function startServer(
         } catch (error) {
           return Response.json({ status: "error", error: error instanceof Error ? error.message : String(error) }, { status: 400 });
         }
-        const reason = new DOMException("Codex turn interrupted", "AbortError");
+        // A native Codex Stop ends the exact browser generation and the logical task. Unlike
+        // steering supersession, it must not retain the cancelled Temporary Chat for a successor.
+        const reason = new ChatGptTurnInterruptedError();
         const browserCancellation = chatGptTurnSessions.cancelNativeTurn(identity.threadId, identity.turnId, reason);
         const compactionCancellation = cancelStructuredCompactionNativeTurn(identity.threadId, identity.turnId, reason);
         const httpCancellation = httpTurns.beginCancelTurn(identity, reason);
@@ -868,6 +870,52 @@ export function startServer(
           cancelled_browser_turns: browserCancellation.cancelled,
           cancelled_compaction_runs: compactionCancellation.cancelled,
         });
+      }
+      if (req.method === "POST" && url.pathname === "/admin/steer-turn") {
+        if (!controlAuthorized(req)) return new Response("Unauthorized", { status: 401 });
+        try {
+          const body = await req.json() as {
+            threadId?: unknown;
+            turnId?: unknown;
+            itemId?: unknown;
+            content?: unknown;
+          };
+          const threadId = typeof body?.threadId === "string" ? body.threadId.trim() : "";
+          const turnId = typeof body?.turnId === "string" ? body.turnId.trim() : "";
+          const itemId = typeof body?.itemId === "string" ? body.itemId.trim() : "";
+          if (!/^[A-Za-z0-9_-]{6,128}$/.test(threadId)
+            || !/^[A-Za-z0-9_-]{6,128}$/.test(turnId)
+            || !/^[A-Za-z0-9_-]{6,128}$/.test(itemId)) {
+            throw new Error("native Codex steering identity is invalid");
+          }
+          if (!Array.isArray(body.content) || body.content.length < 1 || body.content.length > 16) {
+            throw new Error("native Codex steering content is invalid");
+          }
+          let textBytes = 0;
+          for (const part of body.content) {
+            if (!part || typeof part !== "object" || Array.isArray(part)
+              || ((part as { type?: unknown }).type !== "input_text" && (part as { type?: unknown }).type !== "text")
+              || typeof (part as { text?: unknown }).text !== "string") {
+              throw new Error("native Codex steering supports bounded text input only");
+            }
+            textBytes += Buffer.byteLength((part as { text: string }).text, "utf8");
+          }
+          if (textBytes < 1 || textBytes > 32 * 1024) {
+            throw new Error("native Codex steering text is empty or too large");
+          }
+          const accepted = chatGptTurnSessions.steerNativeTurn(
+            threadId,
+            turnId,
+            itemId,
+            body.content,
+          );
+          return Response.json({ status: "ok", accepted_browser_turns: accepted });
+        } catch (error) {
+          return Response.json(
+            { status: "error", error: error instanceof Error ? error.message : String(error) },
+            { status: 400 },
+          );
+        }
       }
       if (req.method === "POST" && url.pathname === "/admin/cancel-turns") {
         if (!controlAuthorized(req)) return new Response("Unauthorized", { status: 401 });

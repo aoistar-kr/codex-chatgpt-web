@@ -159,6 +159,10 @@ class BrowserControlServer {
       if (body.connectorBound !== undefined && typeof body.connectorBound !== "boolean") {
         throw new Error("connectorBound is invalid");
       }
+      if (body.unsubmitted !== undefined && (typeof body.unsubmitted !== "boolean"
+        || (body.unsubmitted && (body.status !== "aborted" || body.retain !== true)))) {
+        throw new Error("unsubmitted is invalid");
+      }
       if (body.refreshViewport !== undefined && typeof body.refreshViewport !== "boolean") {
         throw new Error("refreshViewport is invalid");
       }
@@ -212,6 +216,7 @@ class BrowserControlServer {
           body.message,
           body.retain === true,
           body.connectorBound === true,
+          body.unsubmitted === true,
         );
         this.logger.info("browser.turn_ended", { traceId: body.traceId, status: body.status });
         writeJson(response, 200, { ok: true, ...release });

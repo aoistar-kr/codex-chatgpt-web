@@ -20,12 +20,17 @@ import { formatDoctorReport, runDoctor } from "./doctor";
 import { runChatGptMcpMain } from "./adapters/chatgpt-web/mcp-main";
 import { runCommand } from "./process";
 import { startServer } from "./server";
-import { assertServiceIdle, cancelActiveTurns, getServiceStatus, installService, interruptActiveTurn, restartService, startService, stopService, uninstallService } from "./service";
+import { assertServiceIdle, cancelActiveTurns, getServiceStatus, installService, interruptActiveTurn, restartService, startService, steerActiveTurn, stopService, uninstallService } from "./service";
 import { existingFullSetupCredentials, setup, type SetupOptions } from "./setup";
 import { installRuntimeKeyBytes, managedRuntimeKeyPath, stopTunnel, tunnelStatus, waitForTunnelReady } from "./tunnel";
 import { getTunnelServiceStatus, restartTunnelService, startTunnelService, stopTunnelService, uninstallTunnelService } from "./tunnel-service";
 import { VERSION } from "./version";
 import { runDevCommand } from "./dev-chat/cli";
+import {
+  inspectCodexDesktopProxy,
+  installCodexDesktopProxy,
+  uninstallCodexDesktopProxy,
+} from "./codex-desktop-proxy";
 
 const HELP = `codex-chatgpt-web ${VERSION}
 
@@ -36,6 +41,7 @@ Usage:
   codex-chatgpt-web setup --full --tunnel-id ID --runtime-key-file PATH [options]
   codex-chatgpt-web login
   codex-chatgpt-web doctor [--json]
+  codex-chatgpt-web desktop-proxy <status|doctor|install|uninstall>
   codex-chatgpt-web route <status|connect|disconnect>
   codex-chatgpt-web subagents <status|compatibility-v1|native>
   codex-chatgpt-web browser check
@@ -424,6 +430,41 @@ async function interruptHookCommand(args: string[]): Promise<void> {
   await interruptActiveTurn(loadConfig(), { threadId, turnId });
 }
 
+async function steerHookCommand(args: string[]): Promise<void> {
+  assertNoArgs(args);
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of stdin) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.byteLength;
+    if (bytes > 64 * 1024) throw new Error("Codex steering bridge payload is too large");
+    chunks.push(buffer);
+  }
+  let payload: {
+    session_id?: unknown;
+    turn_id?: unknown;
+    item_id?: unknown;
+    content?: unknown;
+  };
+  try { payload = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+  catch { throw new Error("Codex steering bridge payload is not valid JSON"); }
+  const threadId = typeof payload.session_id === "string" ? payload.session_id.trim() : "";
+  const turnId = typeof payload.turn_id === "string" ? payload.turn_id.trim() : "";
+  const itemId = typeof payload.item_id === "string" ? payload.item_id.trim() : "";
+  if (!/^[A-Za-z0-9_-]{6,128}$/.test(threadId)
+    || !/^[A-Za-z0-9_-]{6,128}$/.test(turnId)
+    || !/^[A-Za-z0-9_-]{6,128}$/.test(itemId)
+    || !Array.isArray(payload.content)) {
+    throw new Error("Codex steering bridge payload has no valid identity or content");
+  }
+  await steerActiveTurn(loadConfig(), {
+    threadId,
+    turnId,
+    itemId,
+    content: payload.content as Array<{ type: "input_text"; text: string }>,
+  });
+}
+
 async function tunnelCommand(args: string[]): Promise<void> {
   const action = args.shift() ?? "status";
   assertNoArgs(args);
@@ -470,6 +511,28 @@ async function openCommand(args: string[]): Promise<void> {
   } else {
     stdout.write(`${url}\n`);
   }
+}
+
+async function desktopProxyCommand(args: string[]): Promise<void> {
+  const action = args.shift();
+  assertNoArgs(args);
+  if (action === "install") {
+    stdout.write(`${JSON.stringify(installCodexDesktopProxy(), null, 2)}\n`);
+    return;
+  }
+  if (action === "uninstall") {
+    stdout.write(`${JSON.stringify(uninstallCodexDesktopProxy(), null, 2)}\n`);
+    return;
+  }
+  if (action === "status" || action === "doctor") {
+    const status = inspectCodexDesktopProxy();
+    stdout.write(`${JSON.stringify(status, null, 2)}\n`);
+    if (action === "doctor" && (!status.installed || !status.activeOverride || !status.versionSmokeOk || status.errors.length > 0)) {
+      process.exitCode = 1;
+    }
+    return;
+  }
+  throw new Error("Desktop proxy command must be one of: status, doctor, install, uninstall");
 }
 
 async function uninstallCommand(args: string[]): Promise<void> {
@@ -522,6 +585,7 @@ async function main(): Promise<void> {
   else if (command === "setup") await setupCommand(args);
   else if (command === "login") await loginCommand(args);
   else if (command === "doctor" || command === "status") await doctorCommand(args);
+  else if (command === "desktop-proxy") await desktopProxyCommand(args);
   else if (command === "route") await routeCommand(args);
   else if (command === "subagents") await subagentsCommand(args);
   else if (command === "browser") {
@@ -547,8 +611,9 @@ async function main(): Promise<void> {
   else if (command === "service") await serviceCommand(args);
   else if (command === "hook") {
     const action = args.shift();
-    if (action !== "interrupt") throw new Error("Hook command must be: hook interrupt");
-    await interruptHookCommand(args);
+    if (action === "interrupt") await interruptHookCommand(args);
+    else if (action === "steer") await steerHookCommand(args);
+    else throw new Error("Hook command must be one of: hook interrupt, hook steer");
   }
   else if (command === "tunnel") await tunnelCommand(args);
   else if (command === "open") await openCommand(args);

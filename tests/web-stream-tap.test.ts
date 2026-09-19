@@ -171,6 +171,8 @@ test("patch SSE is decoded incrementally across arbitrary chunk boundaries", () 
     conversationId: "conversation-1",
     text: "Hello world",
     complete: true,
+    handoffTopicId: undefined,
+    annotations: [],
   });
 });
 
@@ -205,6 +207,7 @@ test("replace patches reset the current final-answer text instead of being appen
     text: "final canonical text",
     complete: true,
     handoffTopicId: undefined,
+    annotations: [],
   });
 });
 
@@ -236,6 +239,8 @@ test("reasoning and tool streams never contaminate the final assistant answer", 
     conversationId: "conversation-2",
     text: "Visible answer",
     complete: true,
+    handoffTopicId: undefined,
+    annotations: [],
   });
 });
 

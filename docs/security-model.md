@@ -111,6 +111,23 @@ control; only then may the helper retain the surface and submit a continuation d
 prompt is never resubmitted into that live conversation. A user Interrupt does not set the retention
 flag, so the exact browser turn is stopped and released rather than resurrected by later cleanup.
 
+The live control source is the canonical Codex rollout selected by the same session metadata and
+path authority used for environment recovery. The watcher pins file identity, rejects symlinks,
+replacement and truncation, parses only bounded complete JSONL records, and accepts events only
+inside the exact task boundary. A cwd-less provider replay may reuse the active session environment
+only after this watcher has claimed the exact revision and only when the replay contains no raw
+environment block; malformed or conflicting current environment data still fails closed.
+
+Desktop activation leaves the Codex application directory untouched. The stable external stdio
+proxy accepts a real CLI only when it is an immediate version-directory child of the canonical
+managed Codex binary root, is not a reparse-point escape or the proxy itself, has the required
+code-mode, command-runner, and sandbox companion executables in the same canonical directory, and
+passes a bounded `codex-cli` version smoke. Installation refuses to take over an unrelated existing
+`CODEX_CLI_PATH`, journals its prior state, and conditionally restores that state only if a later
+user or updater has not changed the value. The override is an internal compatibility point rather
+than a public OpenAI contract, so doctor and post-restart process/hash proof are mandatory release
+gates.
+
 ## Network exposure
 
 - Responses and health listeners bind to `127.0.0.1` only.

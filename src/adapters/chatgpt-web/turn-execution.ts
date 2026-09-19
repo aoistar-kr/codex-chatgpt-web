@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
 import type { AdapterEvent, CodexOutputTextAnnotation, CodexParsedRequest } from "../../types";
 import type { BrokerToolRequest } from "./turn-broker";
-import { chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
+import { ChatGptSteeringUnavailableError, chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
 import {
   chatGptTurnUserRevisionHistory,
   extractChatGptCompactionSourceRevision,
   extractChatGptTurnIdentity,
   extractChatGptTurnUserRevision,
+  type ChatGptTurnEnvironment,
 } from "./environment";
 import { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 import type { ChatGptExternalTurnProgress } from "./turn-progress";
@@ -118,6 +119,16 @@ export class ChatGptTextFeed {
     return this.queued.splice(0);
   }
 
+  /**
+   * Drop the accumulated answer when ChatGPT answered the steered revision in its own assistant
+   * turn. The superseded prefix was already delivered, and the browser Markdown stream must be
+   * reproduced from the turn that now owns the answer.
+   */
+  reset(): void {
+    this.text = "";
+    this.queued.splice(0);
+  }
+
   value(): string {
     return this.text;
   }
@@ -146,7 +157,7 @@ interface ChatGptTurnRuntimeBase {
   trace: ChatGptTraceFeed;
   text: ChatGptTextFeed;
   /** Final structured annotations captured from the authoritative browser response. */
-  outputAnnotations: () => readonly CodexOutputTextAnnotation[];
+  outputAnnotations?: () => readonly CodexOutputTextAnnotation[];
   usageInput?: CodexParsedRequest;
   conversationKey?: string;
   releaseRetainedConversation?: () => Promise<void>;
@@ -201,6 +212,28 @@ export function chatGptTurnExecutionKey(parsed: CodexParsedRequest): string {
 export interface ChatGptInstructionLineage {
   current: string;
   predecessors: ReadonlySet<string>;
+}
+
+function normalizeSteerContentForIdentity(content: unknown): unknown {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return content;
+  return content.map(part => {
+    if (part && typeof part === "object" && !Array.isArray(part)) {
+      const obj = part as Record<string, unknown>;
+      if ((obj.type === "input_text" || obj.type === "text") && typeof obj.text === "string") {
+        return { type: "text", text: obj.text };
+      }
+    }
+    return part;
+  });
+}
+
+function directSteerContentIdentity(content: unknown): string {
+  const normalized = normalizeSteerContentForIdentity(content);
+  const serialized = JSON.stringify(normalized);
+  return createHash("sha256")
+    .update(serialized === undefined ? "undefined" : serialized)
+    .digest("hex");
 }
 
 export function chatGptInstructionLineage(parsed: CodexParsedRequest): ChatGptInstructionLineage {
@@ -271,9 +304,32 @@ export class ChatGptTurnSession {
   supersededError?: Error;
   readonly createdAt = Date.now();
   private lastTouchedAt = this.createdAt;
-  readonly browserOutcome: Promise<ChatGptBrowserOutcome>;
-  readonly physicalSettlement: Promise<void>;
+  private currentRuntime: ChatGptTurnRuntime;
+  private currentBrowserOutcome: Promise<ChatGptBrowserOutcome>;
+  private currentPhysicalSettlement: Promise<void>;
+  private runtimeRevision = 0;
+  private runtimeTransition = false;
+  private readonly runtimeWaiters = new Set<() => void>();
+  private controlAttached = false;
+  private closeControl?: () => void;
+  private pollControl?: () => void;
+  private directSteer?: (itemId: string, content: unknown) => void;
+  private directSteerSequence = 0;
+  private controlTail: Promise<void> = Promise.resolve();
+  private interrupted = false;
+  private cancellationError?: Error;
+  private currentInstruction?: string;
+  private readonly absorbedInstructions = new Set<string>();
+  private readonly pendingInstructions = new Set<string>();
+  private readonly rejectedInstructions = new Map<string, ChatGptSteeringUnavailableError>();
+  private readonly directSteerItems = new Set<string>();
+  private readonly pendingDirectSteerContent = new Map<string, number>();
+  private readonly pendingDirectContentByInstruction = new Map<string, string>();
+  private readonly pendingDirectPrimaryByContent = new Map<string, string[]>();
+  private readonly directAliasesByPrimary = new Map<string, Set<string>>();
+  private readonly canonicalDirectSteerAliases = new Set<string>();
   private readonly outstandingById = new Map<string, BrokerToolRequest>();
+  private readonly outstandingWaiters = new Set<() => void>();
   private readonly deliveredResultIds = new Set<string>();
   private outstandingReasoning: string[] = [];
   private finalReasoning: string[] = [];
@@ -299,28 +355,327 @@ export class ChatGptTurnSession {
   }>();
 
   constructor(
-    readonly runtime: ChatGptTurnRuntime,
+    runtime: ChatGptTurnRuntime,
     readonly traceId?: string,
     readonly ownerKey?: string,
     readonly nativeTurnId?: string,
     readonly nativeThreadId?: string,
-    readonly instruction?: string,
+    instruction?: string,
+    private readonly environment?: ChatGptTurnEnvironment,
+    private readonly environmentContextIdentity?: string,
   ) {
+    this.currentRuntime = runtime;
+    this.currentInstruction = instruction;
     this.attachedConversationKey = runtime.conversationKey;
-    this.physicalSettlement = runtime.physicalSettlement.then(
-      () => { this.settledPhysical = true; },
+    const epoch = this.runtimeRevision;
+    this.currentPhysicalSettlement = runtime.physicalSettlement.then(
+      () => { if (this.runtimeRevision === epoch) this.settledPhysical = true; },
       error => {
-        this.settledPhysical = true;
+        if (this.runtimeRevision === epoch) this.settledPhysical = true;
         throw error;
       },
     );
-    this.browserOutcome = runtime.browser
+    // A replacement observes the raw epoch settlement. Once the epoch advances, however, no
+    // owner is guaranteed to await this obsolete derived promise; keep it observed so Bun does
+    // not promote the expected supersession rejection into a process-fatal unhandled rejection.
+    void this.currentPhysicalSettlement.catch(() => {});
+    this.currentBrowserOutcome = runtime.browser
       .then(answer => ({ type: "final", answer }) as ChatGptBrowserOutcome)
       .catch(error => ({ type: "error", error: error instanceof Error ? error : new Error(String(error)) }) as ChatGptBrowserOutcome)
       .then(outcome => {
-      this.settledBrowserOutcome = outcome;
+      if (this.runtimeRevision === epoch) {
+        this.settledBrowserOutcome = outcome;
+        this.closeControl?.();
+      }
       return outcome;
     });
+  }
+
+  get runtime(): ChatGptTurnRuntime {
+    return this.currentRuntime;
+  }
+
+  get browserOutcome(): Promise<ChatGptBrowserOutcome> {
+    return this.currentBrowserOutcome;
+  }
+
+  get physicalSettlement(): Promise<void> {
+    return this.currentPhysicalSettlement;
+  }
+
+  get instruction(): string | undefined {
+    return this.currentInstruction;
+  }
+
+  runtimeEpoch(): number {
+    return this.runtimeRevision;
+  }
+
+  isRuntimeTransitioning(): boolean {
+    return this.runtimeTransition;
+  }
+
+  waitForRuntimeChange(revision: number, signal?: AbortSignal): Promise<void> {
+    if (revision !== this.runtimeRevision) return Promise.resolve();
+    if (signal?.aborted) return Promise.reject(new DOMException("runtime wait aborted", "AbortError"));
+    return new Promise<void>((resolveWait, rejectWait) => {
+      const waiter = () => {
+        signal?.removeEventListener("abort", onAbort);
+        this.runtimeWaiters.delete(waiter);
+        resolveWait();
+      };
+      const onAbort = () => {
+        this.runtimeWaiters.delete(waiter);
+        rejectWait(new DOMException("runtime wait aborted", "AbortError"));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.runtimeWaiters.add(waiter);
+    });
+  }
+
+  beginRuntimeTransition(): ChatGptTurnRuntime {
+    if (this.runtimeTransition) throw new Error("ChatGPT runtime transition is already active");
+    if (this.outstandingById.size > 0) throw new Error("cannot steer while ChatGPT tool results are outstanding");
+    this.runtimeTransition = true;
+    this.settledBrowserOutcome = undefined;
+    this.settledPhysical = false;
+    this.bumpRuntimeRevision();
+    return this.currentRuntime;
+  }
+
+  installRuntime(runtime: ChatGptTurnRuntime, instruction: string): void {
+    if (!this.runtimeTransition) throw new Error("ChatGPT runtime replacement has no active transition");
+    this.currentRuntime = runtime;
+    this.currentInstruction = instruction;
+    this.absorbedInstructions.add(instruction);
+    this.attachedConversationKey = runtime.conversationKey;
+    this.settledBrowserOutcome = undefined;
+    this.settledPhysical = false;
+    this.capabilityRetirementScheduled = false;
+    const epoch = this.runtimeRevision + 1;
+    this.currentPhysicalSettlement = runtime.physicalSettlement.then(
+      () => { if (this.runtimeRevision === epoch) this.settledPhysical = true; },
+      error => {
+        if (this.runtimeRevision === epoch) this.settledPhysical = true;
+        throw error;
+      },
+    );
+    void this.currentPhysicalSettlement.catch(() => {});
+    this.currentBrowserOutcome = runtime.browser
+      .then(answer => ({ type: "final", answer }) as ChatGptBrowserOutcome)
+      .catch(error => ({ type: "error", error: error instanceof Error ? error : new Error(String(error)) }) as ChatGptBrowserOutcome)
+      .then(outcome => {
+        if (this.runtimeRevision === epoch) {
+          this.settledBrowserOutcome = outcome;
+          this.closeControl?.();
+        }
+        return outcome;
+      });
+    this.runtimeTransition = false;
+    this.runtimeRevision = epoch;
+    this.notifyRuntimeWaiters();
+    this.scheduleCapabilityRetirement();
+  }
+
+  failRuntimeTransition(error: Error): void {
+    this.runtimeTransition = false;
+    this.settledBrowserOutcome = { type: "error", error };
+    this.bumpRuntimeRevision();
+  }
+
+  hasAbsorbedInstruction(instruction: string): boolean {
+    return this.absorbedInstructions.has(instruction) || this.pendingInstructions.has(instruction);
+  }
+
+  hasObservedInstruction(instruction: string): boolean {
+    return this.hasAbsorbedInstruction(instruction) || this.rejectedInstructions.has(instruction);
+  }
+
+  instructionFailure(instruction: string): ChatGptSteeringUnavailableError | undefined {
+    return this.rejectedInstructions.get(instruction);
+  }
+
+  rejectInstruction(instruction: string, error: ChatGptSteeringUnavailableError): void {
+    this.pendingInstructions.delete(instruction);
+    this.rejectedInstructions.set(instruction, error);
+    for (const alias of this.directAliasesByPrimary.get(instruction) ?? []) {
+      this.pendingInstructions.delete(alias);
+      this.rejectedInstructions.set(alias, error);
+    }
+    this.directAliasesByPrimary.delete(instruction);
+    // Keep the single-use content binding: a late canonical replay must see this rejection,
+    // not retire the still-generating browser and resend a rejected instruction as a new turn.
+  }
+
+  claimInstruction(instruction: string): void {
+    this.pendingInstructions.add(instruction);
+  }
+
+  completeInstruction(instruction: string): void {
+    this.pendingInstructions.delete(instruction);
+    this.absorbedInstructions.add(instruction);
+    const aliases = this.directAliasesByPrimary.get(instruction);
+    if (aliases) {
+      for (const alias of aliases) {
+        this.pendingInstructions.delete(alias);
+        this.absorbedInstructions.add(alias);
+      }
+      this.directAliasesByPrimary.delete(instruction);
+    }
+  }
+
+  failInstruction(instruction: string): void {
+    this.pendingInstructions.delete(instruction);
+    // A revision that failed to reach ChatGPT must not stay absorbable, or the provider replay
+    // would attach to a live turn that never actually received it.
+    const identity = this.pendingDirectContentByInstruction.get(instruction);
+    if (identity !== undefined) {
+      this.pendingDirectContentByInstruction.delete(instruction);
+      const remaining = (this.pendingDirectSteerContent.get(identity) ?? 1) - 1;
+      if (remaining <= 0) this.pendingDirectSteerContent.delete(identity);
+      else this.pendingDirectSteerContent.set(identity, remaining);
+    }
+    const aliases = this.directAliasesByPrimary.get(instruction);
+    if (aliases) {
+      for (const alias of aliases) this.pendingInstructions.delete(alias);
+      this.directAliasesByPrimary.delete(instruction);
+    }
+  }
+
+  /**
+   * Claim the provisional revision observed on app-server stdio. Codex assigns the durable
+   * response-item id only after accepting turn/steer, so the later provider replay cannot have
+   * the same instruction fingerprint even though it is the same human revision.
+   */
+  claimDirectSteer(itemId: string, instruction: string, content: unknown): boolean {
+    if (this.directSteerItems.has(itemId)) return false;
+    this.directSteerItems.add(itemId);
+    this.pendingInstructions.add(instruction);
+    const identity = directSteerContentIdentity(content);
+    this.pendingDirectSteerContent.set(identity, (this.pendingDirectSteerContent.get(identity) ?? 0) + 1);
+    this.pendingDirectContentByInstruction.set(instruction, identity);
+    const primaries = this.pendingDirectPrimaryByContent.get(identity) ?? [];
+    primaries.push(instruction);
+    this.pendingDirectPrimaryByContent.set(identity, primaries);
+    return true;
+  }
+
+  /**
+   * Bind one later Codex-owned item id to one already authenticated direct steer. This is scoped
+   * by the session registry's exact native (thread, turn) match and is single-use, so equal text
+   * sent twice remains two distinct revisions instead of becoming a broad content-only dedupe.
+   */
+  absorbDirectSteerAlias(instruction: string, content: unknown): boolean {
+    if (this.hasObservedInstruction(instruction)) return true;
+    const identity = directSteerContentIdentity(content);
+    const remaining = this.pendingDirectSteerContent.get(identity) ?? 0;
+    if (remaining < 1) return false;
+    if (remaining === 1) this.pendingDirectSteerContent.delete(identity);
+    else this.pendingDirectSteerContent.set(identity, remaining - 1);
+    const primaries = this.pendingDirectPrimaryByContent.get(identity);
+    const primary = primaries?.shift();
+    if (primaries?.length === 0) this.pendingDirectPrimaryByContent.delete(identity);
+    if (!primary) return false;
+    this.canonicalDirectSteerAliases.add(instruction);
+    const rejected = this.rejectedInstructions.get(primary);
+    if (rejected) this.rejectedInstructions.set(instruction, rejected);
+    else if (this.absorbedInstructions.has(primary)) this.absorbedInstructions.add(instruction);
+    else {
+      this.pendingInstructions.add(instruction);
+      const aliases = this.directAliasesByPrimary.get(primary) ?? new Set<string>();
+      aliases.add(instruction);
+      this.directAliasesByPrimary.set(primary, aliases);
+    }
+    return true;
+  }
+
+  /**
+   * A canonical Codex provider request created after an authenticated direct steer observes the
+   * same browser answer as the already-open provider request. It still needs its own terminal
+   * response, but must not replay that answer into the same native turn a second time.
+   */
+  isCanonicalDirectSteerAlias(instruction: string): boolean {
+    return this.canonicalDirectSteerAliases.has(instruction);
+  }
+
+  trustedEnvironment(): ChatGptTurnEnvironment | undefined {
+    return this.environment ? structuredClone(this.environment) : undefined;
+  }
+
+  matchesEnvironmentContext(identity: string | undefined): boolean {
+    return identity === undefined || identity === this.environmentContextIdentity;
+  }
+
+  attachControl(close: () => void, poll?: () => void): boolean {
+    if (this.controlAttached) return false;
+    if (this.settledBrowserOutcome) {
+      close();
+      return false;
+    }
+    this.controlAttached = true;
+    this.closeControl = close;
+    this.pollControl = poll;
+    return true;
+  }
+
+  pollControlNow(): void {
+    this.pollControl?.();
+  }
+
+  attachDirectSteer(handler: (itemId: string, content: unknown) => void): void {
+    // Exact HTTP retries/reconnects re-enter adapter setup for the same logical session. The
+    // original controller owns the already-mutated canonical request and must remain authoritative.
+    if (this.directSteer) return;
+    this.directSteer = handler;
+  }
+
+  submitDirectSteer(itemId: string, content: unknown): boolean {
+    if (this.interrupted || this.settledBrowserOutcome || !this.directSteer) return false;
+    this.touch();
+    this.directSteer(itemId, content);
+    return true;
+  }
+
+  nextDirectSteerSequence(): number {
+    return ++this.directSteerSequence;
+  }
+
+  enqueueControl(task: () => Promise<void>, interrupt?: Error): void {
+    if (interrupt) {
+      this.interrupted = true;
+      this.cancellationError = interrupt;
+      this.closeControl?.();
+      this.currentRuntime.cancel(interrupt);
+      const outstandingWaiters = [...this.outstandingWaiters];
+      this.outstandingWaiters.clear();
+      for (const waiter of outstandingWaiters) waiter();
+      this.bumpRuntimeRevision();
+    }
+    this.controlTail = this.controlTail.then(async () => {
+      if (this.interrupted && !interrupt) return;
+      await task();
+    }).catch(error => {
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      this.closeControl?.();
+      this.currentRuntime.cancel(normalized);
+      this.failRuntimeTransition(normalized);
+    });
+  }
+
+  isInterrupted(): boolean {
+    return this.interrupted;
+  }
+
+  cancellationReason(): Error | undefined {
+    return this.cancellationError;
+  }
+
+  async waitForControlIdle(): Promise<void> {
+    await this.controlTail;
+  }
+
+  closeControlTail(): void {
+    this.closeControl?.();
   }
 
   runExclusive<T>(task: () => Promise<T>): Promise<T> {
@@ -341,6 +696,11 @@ export class ChatGptTurnSession {
 
   outstanding(): BrokerToolRequest[] {
     return [...this.outstandingById.values()];
+  }
+
+  waitForOutstandingResults(): Promise<void> {
+    if (this.outstandingById.size === 0) return Promise.resolve();
+    return new Promise(resolveWait => this.outstandingWaiters.add(resolveWait));
   }
 
   settledOutcome(): ChatGptBrowserOutcome | undefined {
@@ -408,6 +768,9 @@ export class ChatGptTurnSession {
     if (this.outstandingById.size === 0) {
       this.outstandingReasoning = [];
       this.outstandingPrelude = [];
+      const waiters = [...this.outstandingWaiters];
+      this.outstandingWaiters.clear();
+      for (const waiter of waiters) waiter();
     }
   }
 
@@ -503,7 +866,20 @@ export class ChatGptTurnSession {
   }
 
   cancel(reason?: Error): void {
-    this.runtime.cancel(reason);
+    this.closeControl?.();
+    if (reason) this.cancellationError = reason;
+    this.currentRuntime.cancel(reason);
+  }
+
+  private bumpRuntimeRevision(): void {
+    this.runtimeRevision += 1;
+    this.notifyRuntimeWaiters();
+  }
+
+  private notifyRuntimeWaiters(): void {
+    const waiters = [...this.runtimeWaiters];
+    this.runtimeWaiters.clear();
+    for (const waiter of waiters) waiter();
   }
 
   private scheduleCapabilityRetirement(): void {
@@ -513,9 +889,11 @@ export class ChatGptTurnSession {
     // completed mocked/real browser cannot revoke its token ahead of the browser-outcome branch.
     // At physical settlement, read the current tail so every tool-result/reconnect observer that
     // was already admitted finishes before the capability is retired.
-    void this.physicalSettlement
+    const runtime = this.currentRuntime;
+    const settlement = this.currentPhysicalSettlement;
+    void settlement
       .then(() => this.tail)
-      .then(() => this.runtime.retireCapability!())
+      .then(() => runtime.retireCapability!())
       .catch(error => {
         console.error(
           `[chatgpt-web] failed to retire settled turn capability: ${error instanceof Error ? error.message : String(error)}`,
@@ -559,6 +937,8 @@ export class ChatGptTurnSessions {
     nativeTurnId?: string,
     nativeThreadId?: string,
     instruction?: string,
+    environment?: ChatGptTurnEnvironment,
+    environmentContextIdentity?: string,
   ): ChatGptTurnSession {
     this.prune();
     const existing = this.entries.get(key);
@@ -574,7 +954,9 @@ export class ChatGptTurnSessions {
       );
     }
     if (this.entries.size >= this.maxEntries) throw new Error(`ChatGPT web session registry is full (${this.maxEntries} entries)`);
-    const session = new ChatGptTurnSession(start(), traceId, ownerKey, nativeTurnId, nativeThreadId, instruction);
+    const session = new ChatGptTurnSession(
+      start(), traceId, ownerKey, nativeTurnId, nativeThreadId, instruction, environment, environmentContextIdentity,
+    );
     this.entries.set(key, session);
     const conversationKey = session.conversationKey();
     // Only conversations deliberately retained after normal completion are durable heads. Read-only
@@ -596,6 +978,8 @@ export class ChatGptTurnSessions {
     nativeThreadId?: string,
     instruction?: ChatGptInstructionLineage,
     onSteeringSource?: (session: ChatGptTurnSession) => void,
+    environment?: ChatGptTurnEnvironment,
+    environmentContextIdentity?: string,
   ): Promise<ChatGptTurnSession> {
     for (;;) {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
@@ -604,6 +988,21 @@ export class ChatGptTurnSessions {
         if (existing.supersededError) throw existing.supersededError;
         existing.touch();
         return existing;
+      }
+      const absorbedOwner = instruction && nativeThreadId && nativeTurnId
+        ? [...this.entries].find(([, session]) => (
+          session.ownerKey === ownerKey
+          && session.nativeThreadId === nativeThreadId
+          && session.nativeTurnId === nativeTurnId
+          && session.hasObservedInstruction(instruction.current)
+        ))
+        : undefined;
+      if (absorbedOwner) {
+        const [absorbedKey, absorbedSession] = absorbedOwner;
+        this.entries.delete(absorbedKey);
+        this.entries.set(key, absorbedSession);
+        absorbedSession.touch();
+        return absorbedSession;
       }
       const pending = this.retirements.get(key) ?? this.ownerRetirements.get(ownerKey);
       if (pending) {
@@ -619,23 +1018,13 @@ export class ChatGptTurnSessions {
           && nativeTurnId !== undefined
           && ownedSession.nativeThreadId === nativeThreadId
           && ownedSession.nativeTurnId === nativeTurnId;
-        if (ownedSession.isActive() && sameNativeTurn && instruction && ownedSession.instruction
-          && instruction.current !== ownedSession.instruction) {
-          if (!instruction.predecessors.has(ownedSession.instruction)) throw chatGptTurnSupersededError();
-          // Native steering appends a new user revision inside the SAME native Codex turn. Stop the
-          // superseded browser response and, only when it had already been accepted on a launcher
-          // conversation, offer that exact Temporary Chat to the successor. The successor decides
-          // from the launcher's reuse acknowledgement whether to send a steering-only delta or to
-          // fall back to a fresh full-context turn; the old prompt is never resubmitted into an
-          // uncertain live conversation.
-          const reason = chatGptTurnSupersededError();
-          ownedSession.supersededError = reason;
-          if (ownedSession.conversationKey() && ownedSession.runtime.submission?.phase === "accepted") {
-            onSteeringSource?.(ownedSession);
-          }
-          this.forgetConversationHead(ownedSession);
-          await awaitWithAbort(this.beginRetirement(ownedKey, ownedSession, reason), signal);
-          continue;
+        const ownedInstruction = ownedSession.instruction;
+        if (ownedSession.isActive() && sameNativeTurn && instruction && ownedInstruction
+          && instruction.current !== ownedInstruction) {
+        if (!instruction.predecessors.has(ownedInstruction)) throw chatGptTurnSupersededError();
+          // A provider replay is not permission to stop the browser. Live revisions must be
+          // claimed by the authenticated control path above; an unclaimed replay fails locally.
+          throw new ChatGptSteeringUnavailableError();
         }
         // A completed response may still be releasing its browser surface. Sequential work
         // waits for that cleanup; preemption requires a proven newer canonical instruction.
@@ -643,8 +1032,26 @@ export class ChatGptTurnSessions {
         continue;
       }
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
-      return this.getOrCreate(key, start, traceId, ownerKey, nativeTurnId, nativeThreadId, instruction?.current);
+      return this.getOrCreate(
+        key, start, traceId, ownerKey, nativeTurnId, nativeThreadId,
+        instruction?.current, environment, environmentContextIdentity,
+      );
     }
+  }
+
+  findNativeTurn(threadId: string, turnId: string, ownerKey?: string): ChatGptTurnSession | undefined {
+    const session = [...new Set(this.entries.values())].find(candidate => (
+      candidate.nativeThreadId === threadId
+      && candidate.nativeTurnId === turnId
+      && (ownerKey === undefined || candidate.ownerKey === ownerKey)
+    ));
+    // Keep a normally settled exact native turn discoverable for its registry TTL. Codex's
+    // turn/steer implementation can open a provider observer only after the direct replacement
+    // epoch has already completed; the absorbed instruction gate at the caller then replays that
+    // same session journal without another browser submission. Failed/retired sessions are
+    // removed from entries and cannot use this path.
+    session?.touch();
+    return session;
   }
 
   find(key: string): ChatGptTurnSession | undefined {
@@ -829,6 +1236,22 @@ export class ChatGptTurnSessions {
       matches.map(([key, session]) => this.beginRetirement(key, session, reason)),
     ).then(() => undefined);
     return { cancelled: matches.length, settlement };
+  }
+
+  steerNativeTurn(
+    threadId: string,
+    turnId: string,
+    itemId: string,
+    content: unknown,
+  ): number {
+    const matches = [...new Set(this.entries.values())].filter(session => (
+      session.nativeThreadId === threadId
+      && session.nativeTurnId === turnId
+      && session.isActive()
+    ));
+    let accepted = 0;
+    for (const session of matches) if (session.submitDirectSteer(itemId, content)) accepted += 1;
+    return accepted;
   }
 
   cancelledError(traceId: string): Error | undefined {

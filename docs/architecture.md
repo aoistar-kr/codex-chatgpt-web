@@ -91,16 +91,28 @@ partition and keep independent documents and lifecycles. Closing a running tab d
 and terminates that browser turn. A sixth concurrent turn fails explicitly; the cap avoids excessive
 parallel traffic that could trigger account abuse controls.
 
-Active-turn control is bidirectional. Public ChatGPT commentary and work/status rows are projected
-into Codex commentary/reasoning output; actual Codex Native requests still travel through the broker
-and remain native Codex tool calls. A newer user revision is steering only when native thread and
-turn identity both match the active browser owner and instruction lineage proves the predecessor.
+Active-turn control is bidirectional. Public ChatGPT work/status rows are projected into Codex
+reasoning-summary/Working items, while stable public prose remains commentary; actual Codex Native
+requests still travel through the broker and remain native Codex tool calls. A session-owned watcher incrementally tails the exact authenticated
+Codex rollout, so it continues after an HTTP observer detaches. A newer user revision is steering
+only when native thread and turn identity both match the active browser owner and instruction
+lineage proves the predecessor. One logical Codex turn may therefore own successive browser epochs.
 The launcher stops that superseded response on the exact Electron surface; if the stop is
 acknowledged and the surface is retained, the replacement sends only the new steering delta (plus
 matching just-returned tool results) into that same Temporary Chat. If reuse is unavailable, the
 replacement uses a fresh surface with canonical full context instead of replaying the old prompt
-into an uncertain conversation. Ordinary Codex Interrupt follows the same exact-surface stop path
-but never preserves the cancelled chat.
+into an uncertain conversation. Real tool results form a rendezvous boundary before a queued steer.
+The exact rollout `turn_aborted` event outranks that queue and follows the same exact-surface stop
+path, but never preserves the cancelled chat. A later provider replay of a rollout-consumed revision
+reattaches to the logical session instead of submitting that revision twice.
+
+Codex Desktop integration does not replace or patch the application-owned CLI. A user-level
+`CODEX_CLI_PATH` points to one stable WebGPT-managed stdio proxy outside the versioned application
+tree. The proxy forwards the app-server protocol unchanged, mirrors only authenticated
+`turn/steer` and `turn/interrupt` frames to loopback control endpoints, and launches a dynamically
+resolved original versioned Codex CLI. Installation journals the prior environment value and
+rollback restores it only while the current value still points to the managed proxy. Codex updates
+may replace versioned originals without requiring an application-file rewrite.
 
 Sign-in uses that same persistent Electron partition. ChatGPT login pages and allowed identity-
 provider popups are adopted into a temporary `WebContentsView` inside the launcher instead of being
