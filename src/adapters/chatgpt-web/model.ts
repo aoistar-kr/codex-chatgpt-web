@@ -9,6 +9,8 @@ export const CHATGPT_WEB_LUNA_MODEL_ID = CHATGPT_WEB_LUNA_BACKEND_MODEL;
 export interface ChatGptWebCapabilities {
   localToolsEnabled: boolean;
   solAvailable: boolean;
+  /** ChatGPT exposes the Extra High effort selector for this account. */
+  extraHighAvailable?: boolean;
   proAvailable: boolean;
 }
 

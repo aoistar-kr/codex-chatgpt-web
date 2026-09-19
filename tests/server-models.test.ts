@@ -11,6 +11,7 @@ test("proxies official /models auth and query, then appends the fixed ChatGPT We
   const config = defaultConfig("full");
   config.subagentProtocol = "native";
   config.proAvailable = true;
+  config.extraHighAvailable = true;
   const response = await modelsRequest(request, config, async input => {
     upstream = input;
     return Response.json({

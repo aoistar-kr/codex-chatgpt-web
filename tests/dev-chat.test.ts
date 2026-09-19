@@ -167,6 +167,7 @@ test("Bigger Context triples the DEV compaction window and fails closed for Luna
     ...defaultConfig("browser-only"),
     purpose: "dev-harness" as const,
     solAvailable: true,
+    extraHighAvailable: true,
     proAvailable: true,
   };
   const factory = (): ProviderAdapter => ({
@@ -209,6 +210,7 @@ test("browser-only DEV driver runs real turns without advertising simulated tool
     ...defaultConfig("browser-only"),
     purpose: "dev-harness" as const,
     solAvailable: true,
+    extraHighAvailable: true,
     proAvailable: true,
   };
   const factory = (): ProviderAdapter => ({
@@ -264,7 +266,7 @@ test("DEV chat attaches its broker to the launcher-owned tunnel without a Respon
     });
     expect(transport.config).toBe(config);
     expect(await callTurnBroker(transport.config.brokerSocketPath, { method: "owner_status" }))
-      .toMatchObject({ protocolVersion: 2 });
+      .toMatchObject({ protocolVersion: 5 });
     expect(await (await fetch(`http://127.0.0.1:${occupied.port}`)).text()).toBe("normal Codex route");
   } finally {
     await transport?.close();

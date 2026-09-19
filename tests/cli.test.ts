@@ -182,6 +182,7 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
       authenticated: true,
       temporary: true,
       solAvailable: true,
+      extraHighAvailable: true,
       proAvailable: false,
       url: "https://chatgpt.com/?temporary-chat=true",
     }));
@@ -235,6 +236,7 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
       browserHost: "launcher",
       browserHostDescriptorPath: descriptorPath,
       solAvailable: true,
+      extraHighAvailable: true,
       proAvailable: false,
     });
     expect(existsSync(join(root, "production-codex", "config.toml"))).toBe(false);

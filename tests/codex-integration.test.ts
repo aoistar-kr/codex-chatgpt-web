@@ -803,12 +803,15 @@ describe("reversible native Codex route integration", () => {
     writeFileSync(configPath, 'model = "gpt-5.6-sol"\n');
     installCodexIntegration(compatibilityV1Config("full"));
 
-    const externallyRouted = readFileSync(configPath, "utf8")
-      .replace(
-        'openai_base_url = "http://127.0.0.1:17841/v1"',
-        'openai_base_url = "http://127.0.0.1:10100/v1"',
-      )
-      + 'model_catalog_json = "C:\\\\Users\\\\Example\\\\.codex\\\\opencodex-catalog.json"\n';
+    // An external tool rewrote our route. Keep the extra key above the managed block: appending it
+    // after our interrupt-hook tables would make it a member of the last managed table, which the
+    // fail-closed hook parser must refuse to interpret.
+    const externallyRouted = 'model_catalog_json = "C:\\\\Users\\\\Example\\\\.codex\\\\opencodex-catalog.json"\n'
+      + readFileSync(configPath, "utf8")
+        .replace(
+          'openai_base_url = "http://127.0.0.1:17841/v1"',
+          'openai_base_url = "http://127.0.0.1:10100/v1"',
+        );
     writeFileSync(configPath, externallyRouted);
     writeFileSync(cachePath, '{"models":["external"]}\n');
 

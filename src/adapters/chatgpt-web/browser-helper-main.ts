@@ -7,7 +7,7 @@ import {
   closeChatGptBrowserWorkers,
   type BrowserTurn,
 } from "./browser-worker";
-import { ChatGptWebAdapterError } from "./adapter-error";
+import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { ChatGptWebCapabilities } from "./model";
 import { createProcessLineWriter } from "./process-line-writer";
 import { createBrowserHelperPromptSelection } from "./browser-helper-prompt-selection";
@@ -82,7 +82,7 @@ type InputMessage = RunMessage
   | { type: "completion_fence_commit_ack"; id: string; requestId: number; committed: boolean }
   | { type: "progress"; id: string; snapshot: ChatGptExternalTurnProgressSnapshot }
   | { type: "steer"; id: string; steeringId: string; prompt: CompiledChatGptWebPrompt }
-  | { type: "abort"; id: string; preserveConversation?: boolean }
+  | { type: "abort"; id: string; preserveConversation?: boolean; reason?: "compaction_handoff_accepted" }
   | { type: "shutdown" };
 
 let outputFailure: Error | undefined;
@@ -529,9 +529,17 @@ input.on("line", line => {
       writeProtocol({ type: "error", id: message.id, message: "Browser helper abort retention flag is invalid" });
       return;
     }
+    if (message.reason !== undefined && message.reason !== "compaction_handoff_accepted") {
+      writeProtocol({ type: "error", id: message.id, message: "Browser helper abort reason is invalid" });
+      return;
+    }
     if (!abortControllers.has(message.id)) return;
     if (message.preserveConversation === true) retainConversationAfterAbort.add(message.id);
-    abortControllers.get(message.id)?.abort();
+    // An accepted compaction handoff must abort with its own reason so the worker classifies the
+    // browser stop as the accepted handoff instead of a user cancellation.
+    abortControllers.get(message.id)?.abort(message.reason === "compaction_handoff_accepted"
+      ? new ChatGptCompactionHandoffAccepted()
+      : undefined);
     preparedSelections.get(message.id)?.cancel();
     const waiter = sendActivationWaiters.get(message.id);
     sendActivationWaiters.delete(message.id);

@@ -3,6 +3,7 @@ export interface ChatGptWebAdapterErrorOptions {
   errorType: string;
   code: string;
   retryable: boolean;
+  cause?: unknown;
 }
 
 export class ChatGptWebAdapterError extends Error {
@@ -12,7 +13,7 @@ export class ChatGptWebAdapterError extends Error {
   readonly retryable: boolean;
 
   constructor(message: string, options: ChatGptWebAdapterErrorOptions) {
-    super(message);
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
     this.name = "ChatGptWebAdapterError";
     this.status = options.status;
     this.errorType = options.errorType;
@@ -76,6 +77,8 @@ export function chatGptBrowserTabClosedError(): ChatGptWebAdapterError {
 
 export function chatGptStoppedThinkingError(): ChatGptWebAdapterError {
   return new ChatGptWebAdapterError(
+    // Our fork classifies a persistent 'Stopped thinking' as a terminal cancelled turn: Codex must
+    // not retry it. Upstream returns a retryable server_error here, which our contract test rejects.
     "ChatGPT remained in 'Stopped thinking' for 5 seconds, so the Codex turn was cancelled.",
     {
       status: 499,
