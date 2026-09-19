@@ -43,6 +43,8 @@ import {
   type CompiledChatGptWebPrompt,
   type ChatGptWebPromptImage,
   type ChatGptWebMultipartStage,
+  type ChatGptWebMultipartPartCount,
+  isChatGptWebMultipartPartCount,
 } from "./prompt";
 import { estimateCompiledChatGptWebInputTokens } from "./input-tokens";
 import {
@@ -929,7 +931,7 @@ export function assertChatGptWebMultipartInputWithinLimits(
   effort: ChatGptWebModelMode["effort"],
   capabilities: ChatGptWebCapabilities,
   maxMessageChars: number,
-  partCount: 2 | 3,
+  partCount: number,
   transport?: {
     stagingEffort: ChatGptWebModelMode["effort"];
     maxStageMessageTokens: number;
@@ -938,6 +940,9 @@ export function assertChatGptWebMultipartInputWithinLimits(
     finalMessageChars: number;
   },
 ): void {
+  if (!isChatGptWebMultipartPartCount(partCount)) {
+    throw new Error("Bigger Context requires a supported context part count");
+  }
   if (modelId === CHATGPT_WEB_LUNA_MODEL_ID) {
     throw new ChatGptWebAdapterError(
       "Bigger Context is unavailable for Luna because every later browser request includes the accumulated transcript inside the same 28,000-token transport budget.",
@@ -3763,7 +3768,10 @@ export class ChatGptBrowserWorker {
     await sendButton.press("Enter", {
       noWaitAfter: true,
       signal: abortSignal,
-      timeout: browserStageTimeouts.send,
+      // runStage owns the operation budget. A second Locator timeout would silently collapse the
+      // 180-second Bigger Context budget back to the ordinary 20 seconds after Enter has already
+      // submitted the message; semantic submission evidence below remains the authority.
+      timeout: 0,
     });
     recordTiming("press_enter");
     await requestRewriteProbe?.(abortSignal);

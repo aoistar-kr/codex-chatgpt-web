@@ -423,19 +423,20 @@ test("retained compaction deadline bounds browser settlement after the control h
 
 test("a rejected exact compaction run is evicted while a successful run remains replayable", async () => {
   const key = `exact-retry-${Date.now()}-${Math.random()}`;
+  const owner = { ownerKey: `owner-${key}`, traceIds: [`trace-${key}`] };
   let starts = 0;
-  await expect(runStructuredCompactionOnce(key, async () => {
+  await expect(runStructuredCompactionOnce(key, owner, async () => {
     starts += 1;
     throw new Error("first handoff failed");
   })).rejects.toThrow("first handoff failed");
   await Bun.sleep(0);
   expect(existingStructuredCompactionRun(key)).toBeUndefined();
 
-  const retry = runStructuredCompactionOnce(key, async () => {
+  const retry = runStructuredCompactionOnce(key, owner, async () => {
     starts += 1;
     return "recovered checkpoint";
   });
-  expect(runStructuredCompactionOnce(key, async () => "must not start")).toBe(retry);
+  expect(runStructuredCompactionOnce(key, owner, async () => "must not start")).toBe(retry);
   await expect(retry).resolves.toBe("recovered checkpoint");
   await expect(existingStructuredCompactionRun(key)).resolves.toBe("recovered checkpoint");
   expect(starts).toBe(2);

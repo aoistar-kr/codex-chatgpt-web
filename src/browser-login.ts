@@ -16,6 +16,7 @@ export interface BrowserLoginResult {
   storageStatePath: string;
   accountSurfaceUrl: string;
   solAvailable: boolean;
+  extraHighAvailable: boolean;
   proAvailable: boolean;
 }
 
@@ -43,6 +44,7 @@ interface LoginVerificationMarker {
   authenticated: true;
   verifiedAt: string;
   solAvailable?: boolean;
+  extraHighAvailable?: boolean;
   proAvailable?: boolean;
 }
 
@@ -53,6 +55,14 @@ const CHATGPT_ORIGIN = new URL(CHATGPT_TEMPORARY_CHAT_URL).origin;
 
 function browserProcessExited(browser: ChildProcess): boolean {
   return browser.exitCode !== null || browser.signalCode !== null;
+}
+
+function removeTemporaryChromeTabSessions(profileDir: string): void {
+  const defaultProfile = join(profileDir, "Default");
+  rmSync(join(defaultProfile, "Sessions"), { recursive: true, force: true });
+  for (const name of ["Current Session", "Current Tabs", "Last Session", "Last Tabs"]) {
+    rmSync(join(defaultProfile, name), { force: true });
+  }
 }
 
 async function waitForBrowserExit(browser: ChildProcess, timeoutMs: number): Promise<boolean> {
@@ -173,7 +183,7 @@ export async function inspectBrowserLoginCapabilities(config: AppConfig): Promis
   if (!browserLoginStateExists(config)) throw new Error("ChatGPT login state is missing or unverified");
   const inspected = await inspectStoredState(config, config.storageStatePath);
   writeVerificationMarker(config.storageStatePath, inspected);
-  return { solAvailable: inspected.solAvailable, proAvailable: inspected.proAvailable };
+  return { solAvailable: inspected.solAvailable, extraHighAvailable: inspected.extraHighAvailable, proAvailable: inspected.proAvailable };
 }
 
 export function storedBrowserLoginCapabilities(
@@ -184,6 +194,7 @@ export function storedBrowserLoginCapabilities(
     const marker = JSON.parse(readFileSync(loginVerificationMarkerPath(config.storageStatePath), "utf8")) as Partial<LoginVerificationMarker>;
     return {
       ...(typeof marker.solAvailable === "boolean" ? { solAvailable: marker.solAvailable } : {}),
+      ...(typeof marker.extraHighAvailable === "boolean" ? { extraHighAvailable: marker.extraHighAvailable } : {}),
       ...(typeof marker.proAvailable === "boolean" ? { proAvailable: marker.proAvailable } : {}),
     };
   } catch {
@@ -265,13 +276,16 @@ export async function captureSystemBrowserLogin(
       if (timeout) clearTimeout(timeout);
     }
 
-    // Authentication happens before Playwright ever owns this profile. Capture is then performed
-    // offline over an inherited pipe, so the automated phase cannot reach ChatGPT or the identity
-    // provider and cannot interfere with the platform passkey challenge.
+    // Authentication happens before Playwright ever owns this profile. Chrome does not load
+    // session-only cookies after a normal restart unless session restore is requested. Remove only
+    // the disposable profile's tab-session files first, so restoring cookies cannot reopen the
+    // authenticated or identity-provider pages during the offline capture.
+    removeTemporaryChromeTabSessions(profileDir);
     context = await chromium.launchPersistentContext(profileDir, {
       executablePath: config.chromeExecutablePath,
       headless: true,
       chromiumSandbox: true,
+      offline: true,
       serviceWorkers: "block",
       ignoreDefaultArgs: [
         "--no-sandbox",
@@ -279,7 +293,13 @@ export async function captureSystemBrowserLogin(
         "--password-store=basic",
         "--use-mock-keychain",
       ],
-      args: ["--disable-background-mode", "--no-first-run", "--no-default-browser-check"],
+      args: [
+        "--disable-background-mode",
+        "--disable-background-networking",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--restore-last-session",
+      ],
       timeout: Math.min(30_000, remainingTime()),
     });
     await context.setOffline(true);
@@ -409,6 +429,7 @@ export async function loginToChatGpt(
       storageStatePath: config.storageStatePath,
       accountSurfaceUrl: page.url(),
       solAvailable: inspected.solAvailable,
+      extraHighAvailable: inspected.extraHighAvailable === true,
       proAvailable: inspected.proAvailable,
     };
   } finally {

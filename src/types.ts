@@ -37,6 +37,8 @@ export type CodexMessage =
 
 export interface CodexUserMessage {
   role: "user";
+  /** Native Responses metadata, never inferred from message text. */
+  origin?: "codex_skill";
   content: string | CodexContentPart[];
   timestamp: number;
 }
@@ -275,6 +277,12 @@ export interface CodexProviderConfig {
   chatgptWeb?: {
     /** ChatGPT custom connector attached to tool-capable temporary chats. */
     appName?: string;
+    /** Whether ChatGPT DOM interaction is automatic or explicitly driven by the user. */
+    browserInteractionMode?: "automatic" | "manual";
+    /** ChatGPT exposes the Extra High effort selector for this account. */
+    extraHighAvailable?: boolean;
+    /** Send selected Codex skills as attached files instead of inline text. */
+    experimentalSkillAttachments?: boolean;
     /** Explicit browser owner. Launcher mode attaches to the embedded Electron ChatGPT surface. */
     browserHost?: "managed-chrome" | "launcher";
     /** Owner-only descriptor containing the launcher's loopback CDP and control endpoints. */
