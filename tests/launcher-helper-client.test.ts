@@ -256,17 +256,17 @@ test("an abort dispatched during run submission cannot overtake the run frame", 
   expect(released).toBe(false);
 });
 
-test("helper cancellation asks the launcher to stop the exact surface before preserving steering", () => {
+test("helper cancellation asks the launcher to stop the exact surface before preserving the acknowledged conversation", () => {
   const source = readFileSync(new URL("../src/adapters/chatgpt-web/launcher-helper-client.ts", import.meta.url), "utf8");
   const abortStart = source.indexOf("const abortListener = () => {");
   const abortEnd = source.indexOf("pending.abortListener = abortListener", abortStart);
   const block = source.slice(abortStart, abortEnd);
   expect(block).toContain('phase: "stop"');
   expect(block).toContain("turn.abortSignal?.reason instanceof ChatGptTurnSupersededError");
-  // Steering may retain the proven chat for its successor; a user Stop terminates the task and
-  // therefore must not preserve the cancelled conversation.
-  expect(block).not.toContain("turn.abortSignal?.reason instanceof ChatGptTurnInterruptedError");
-  expect(block).toContain("preserveConversation = preserveRequested && stop.stopped === true");
+  // A positively acknowledged Stop keeps the Temporary Chat alive: the interrupted turn ends, but
+  // the same conversation stays available for the next Codex turn instead of being destroyed.
+  expect(block).toContain("turn.abortSignal?.reason instanceof ChatGptTurnInterruptedError");
+  expect(block).toContain("preserveConversation = stop.stopped === true");
   expect(block.indexOf('phase: "stop"')).toBeLessThan(block.indexOf('type: "abort"'));
 });
 

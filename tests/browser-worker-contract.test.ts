@@ -2764,7 +2764,7 @@ test("Codex cancellation has a launcher-owned direct stop path before helper tea
   const control = readFileSync(new URL("../launcher/electron/control-server.cjs", import.meta.url), "utf8");
   const host = readFileSync(new URL("../launcher/electron/browser-host.cjs", import.meta.url), "utf8");
   expect(client).toContain('phase: "stop"');
-  expect(client).toContain("preserveConversation = preserveRequested && stop.stopped === true");
+  expect(client).toContain("preserveConversation = stop.stopped === true");
   expect(control).toContain('request.url === "/v1/turn/stop"');
   expect(control).toContain("host.stopTurnGeneration(body.traceId, body.helperPid)");
   expect(host).toContain("async stopTurnGeneration(traceId, helperPid)");
@@ -3775,7 +3775,7 @@ test("direct steering replaces the browser epoch and uses the retained continuat
   expect(adapter).not.toContain("const steering = new ChatGptBrowserSteeringQueue();");
 });
 
-test("Codex Stop interrupts the browser generation without retaining the cancelled Temporary Chat", () => {
+test("Codex Stop interrupts the browser generation while retaining the Temporary Chat", () => {
   const adapter = readFileSync("src/adapters/chatgpt-web/index.ts", "utf8");
   const at = adapter.indexOf('if (event.type === "interrupt") {');
   expect(at).toBeGreaterThan(-1);
@@ -3784,8 +3784,10 @@ test("Codex Stop interrupts the browser generation without retaining the cancell
   expect(block).not.toContain("chatGptBrowserTabClosedError()");
 
   const client = readFileSync("src/adapters/chatgpt-web/launcher-helper-client.ts", "utf8");
-  expect(client).not.toContain("turn.abortSignal?.reason instanceof ChatGptTurnInterruptedError");
-  expect(client).toContain("preserveConversation = preserveRequested && stop.stopped === true");
+  // The acknowledged Stop cancels the generation but keeps the chat, so the next Codex turn can
+  // continue in the same Temporary Chat instead of starting a fresh one.
+  expect(client).toContain("turn.abortSignal?.reason instanceof ChatGptTurnInterruptedError");
+  expect(client).toContain("preserveConversation = stop.stopped === true");
 });
 
 test("in-flight steering submits into the live composer without stopping the active generation", () => {

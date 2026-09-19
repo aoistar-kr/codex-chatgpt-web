@@ -7,6 +7,7 @@ import type { CodexOutputTextAnnotation } from "../../types";
 import {
   ChatGptCompactionHandoffAccepted,
   ChatGptSteeringUnavailableError,
+  ChatGptTurnInterruptedError,
   ChatGptTurnSupersededError,
   ChatGptWebAdapterError,
 } from "./adapter-error";
@@ -303,7 +304,12 @@ export class LauncherBrowserHelperClient {
               );
               return;
             }
-            const preserveRequested = turn.abortSignal?.reason instanceof ChatGptTurnSupersededError;
+            // A positively acknowledged Stop must keep the Temporary Chat alive whether it came from
+            // an in-flight steering supersession or from the user's native turn interrupt. The
+            // acknowledgement below is still required: an unacknowledged stop keeps the fail-closed
+            // fresh-turn path so no prompt is replayed into an uncertain live conversation.
+            const preserveRequested = turn.abortSignal?.reason instanceof ChatGptTurnSupersededError
+              || turn.abortSignal?.reason instanceof ChatGptTurnInterruptedError;
             const compactionHandoffAccepted = turn.abortSignal?.reason instanceof ChatGptCompactionHandoffAccepted;
             // Stop is a launcher-owned control action, not a side effect of observing AbortSignal in
             // the Playwright loop. This reaches the exact Electron surface even while the helper is
@@ -320,7 +326,10 @@ export class LauncherBrowserHelperClient {
                   traceId: turn.traceId,
                   helperPid,
                 });
-                preserveConversation = preserveRequested && stop.stopped === true;
+                // The launcher's positive acknowledgement is the gate: once it confirms it stopped
+                // the exact generation, the Temporary Chat must survive so the next Codex turn can
+                // continue in it. An unacknowledged stop keeps the fail-closed fresh-turn path.
+                preserveConversation = stop.stopped === true;
               } catch (error) {
                 console.warn(
                   `[chatgpt-web] launcher stop command failed for ${turn.traceId}: ${error instanceof Error ? error.message : String(error)}`,

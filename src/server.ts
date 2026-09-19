@@ -8,7 +8,11 @@ import {
   cancelStructuredCompactionNativeTurn,
   cancelStructuredCompactionTrace,
 } from "./adapters/chatgpt-web/compaction-handoff";
-import { ChatGptWebAdapterError, chatGptBrowserTabClosedError } from "./adapters/chatgpt-web/adapter-error";
+import {
+  ChatGptTurnInterruptedError,
+  ChatGptWebAdapterError,
+  chatGptBrowserTabClosedError,
+} from "./adapters/chatgpt-web/adapter-error";
 import {
   CHATGPT_TURN_REVISION_CONFLICT_MESSAGE,
   extractChatGptTurnIdentity,
@@ -914,11 +918,14 @@ export function startServer(
             { status: 400 },
           );
         }
+        // The browser turn must see the typed interrupt so its acknowledged Stop can retain the
+        // Temporary Chat; the HTTP/compaction cancellations keep the plain abort surface.
         const reason = new DOMException("Codex turn interrupted", "AbortError");
+        const browserReason = new ChatGptTurnInterruptedError();
         const browserCancellation = chatGptTurnSessions.cancelNativeTurn(
           identity.threadId,
           identity.turnId,
-          reason,
+          browserReason,
         );
         const compactionCancellation = cancelStructuredCompactionNativeTurn(
           identity.threadId,
