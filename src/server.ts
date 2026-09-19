@@ -104,6 +104,9 @@ const reportHttpStreamFailure: HttpStreamFailureReporter = evidence => {
   console.warn(`[codex-chatgpt-web] http_stream_failed ${JSON.stringify(evidence)}`);
 };
 
+/** Bound for waiting on aborted compaction owners during cancel-all; cleanup may outlive it. */
+const COMPACTION_CANCEL_WAIT_MS = 2_000;
+
 function emitHttpStreamFailure(
   reporter: HttpStreamFailureReporter,
   evidence: HttpStreamFailureEvidence,
@@ -1002,10 +1005,26 @@ export function startServer(
         // registry.
         const compactionCancellation = cancelAllStructuredCompactions(reason);
         const cancelledBrowserTurns = chatGptTurnSessions.clear() + (turnBroker?.revokeExternalOwners() ?? 0);
-        const [cancelledHttpTurns, cancelledCompactionRuns] = await Promise.all([
-          httpTurns.cancelAll(reason),
-          compactionCancellation,
+        // Owners are aborted above; their settlement waits for browser/helper cleanup. A browser that
+        // never acknowledges the abort must not hang the launcher's cancel-all forever, so bound the
+        // wait and report the abort as done with cleanup still pending.
+        const compactionSettlement = Promise.race([
+          compactionCancellation.then(count => ({ count })),
+          new Promise<undefined>(resolve => {
+            const timer = setTimeout(() => resolve(undefined), COMPACTION_CANCEL_WAIT_MS);
+            timer.unref?.();
+          }),
         ]);
+        const [cancelledHttpTurns, settledCompactions] = await Promise.all([
+          httpTurns.cancelAll(reason),
+          compactionSettlement,
+        ]);
+        if (settledCompactions === undefined) {
+          console.warn(
+            "[chatgpt-web] cancel-all aborted structured compaction owners whose cleanup is still pending",
+          );
+        }
+        const cancelledCompactionRuns = settledCompactions?.count ?? 0;
         return Response.json({
           status: "ok",
           cancelled_http_turns: cancelledHttpTurns,
