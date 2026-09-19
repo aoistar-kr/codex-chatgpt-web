@@ -273,6 +273,16 @@ async function setupCommand(args: string[]): Promise<void> {
     options.subagentProtocol = subagentProtocol;
   }
   const appName = takeOption(args, "--app-name");
+  const automaticBrowserInteraction = takeFlag(args, "--automatic-browser-interaction");
+  const manualBrowserInteraction = takeFlag(args, "--zero-risk-browser-interaction");
+  if (automaticBrowserInteraction && manualBrowserInteraction) {
+    throw new Error(
+      "Choose at most one browser interaction mode: --automatic-browser-interaction or --zero-risk-browser-interaction",
+    );
+  }
+  if (automaticBrowserInteraction || manualBrowserInteraction) {
+    options.browserInteractionMode = manualBrowserInteraction ? "manual" : "automatic";
+  }
   const tunnelId = takeOption(args, "--tunnel-id");
   const runtimeKeyFile = takeOption(args, "--runtime-key-file");
   const chrome = takeOption(args, "--chrome");
@@ -292,6 +302,16 @@ async function setupCommand(args: string[]): Promise<void> {
     throw new Error("Choose at most one context mode: --bigger-context or --standard-context");
   }
   if (biggerContext || standardContext) options.experimentalBiggerContext = biggerContext;
+  const skillAttachments = takeFlag(args, "--skill-attachments");
+  const inlineSkills = takeFlag(args, "--inline-skills");
+  if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");
+  if (skillAttachments || inlineSkills) options.experimentalSkillAttachments = skillAttachments;
+  const zeroRiskPro = takeFlag(args, "--zero-risk-pro");
+  const zeroRiskDefault = takeFlag(args, "--zero-risk-default");
+  if (zeroRiskPro && zeroRiskDefault) {
+    throw new Error("Choose at most one Zero Risk model profile: --zero-risk-pro or --zero-risk-default");
+  }
+  if (zeroRiskPro || zeroRiskDefault) options.zeroRiskProEnabled = zeroRiskPro;
   options.replaceCodexRoute = takeFlag(args, "--replace-codex-route");
   options.restartService = takeFlag(args, "--restart-service");
   assertNoArgs(args);
