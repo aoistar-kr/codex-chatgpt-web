@@ -1388,8 +1388,12 @@ export function createChatGptWebAdapter(
           });
         } catch (error) {
           if (error instanceof ChatGptSteeringUnavailableError) {
-            emitRoundEvent({ type: "error", message: error.message, status: error.status,
-              errorType: error.errorType, code: error.code, retryable: false });
+            // A rejected in-flight revision is not a provider failure. The owned browser response
+            // and the Temporary Chat stay active, so the turn must survive: report the rejected
+            // instruction as commentary and keep observing the original generation instead of
+            // tearing the Codex turn down.
+            emitRoundEvent({ type: "assistant_boundary" });
+            emitRoundEvent({ type: "text_delta", text: error.message, phase: "commentary" });
             session.completeRound(roundKey);
             return;
           }
