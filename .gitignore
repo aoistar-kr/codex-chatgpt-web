@@ -17,3 +17,5 @@ launcher/artifacts/
 .playwright-cli/
 output/
 notes.md
+# Local live-verification scratch (harness logs, receipts, UIA drivers, staging copies).
+.tmp-live/
