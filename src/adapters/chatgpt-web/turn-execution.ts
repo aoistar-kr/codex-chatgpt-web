@@ -327,7 +327,7 @@ export class ChatGptTurnSession {
   private readonly pendingDirectContentByInstruction = new Map<string, string>();
   private readonly pendingDirectPrimaryByContent = new Map<string, string[]>();
   private readonly directAliasesByPrimary = new Map<string, Set<string>>();
-  private readonly canonicalDirectSteerAliases = new Set<string>();
+  private deliveredAnswerEpoch?: number;
   private readonly outstandingById = new Map<string, BrokerToolRequest>();
   private readonly outstandingWaiters = new Set<() => void>();
   private readonly deliveredResultIds = new Set<string>();
@@ -548,7 +548,10 @@ export class ChatGptTurnSession {
    * the same instruction fingerprint even though it is the same human revision.
    */
   claimDirectSteer(itemId: string, instruction: string, content: unknown): boolean {
-    if (this.directSteerItems.has(itemId)) return false;
+    if (this.directSteerItems.has(itemId)) {
+      console.warn(`[chatgpt-web] direct steer ${itemId.slice(0, 12)} was already claimed`);
+      return false;
+    }
     this.directSteerItems.add(itemId);
     this.pendingInstructions.add(instruction);
     const identity = directSteerContentIdentity(content);
@@ -569,14 +572,55 @@ export class ChatGptTurnSession {
     if (this.hasObservedInstruction(instruction)) return true;
     const identity = directSteerContentIdentity(content);
     const remaining = this.pendingDirectSteerContent.get(identity) ?? 0;
-    if (remaining < 1) return false;
-    if (remaining === 1) this.pendingDirectSteerContent.delete(identity);
-    else this.pendingDirectSteerContent.set(identity, remaining - 1);
+    if (remaining < 1) {
+      // A same-turn continuation whose newest revision is neither claimed nor bound to a claimed
+      // direct steer cannot inherit the trusted environment, so the caller needs this mismatch.
+      console.warn(
+        `[chatgpt-web] steering alias was not absorbed (pendingContent=${this.pendingDirectSteerContent.size}`
+        + `, claimedItems=${this.directSteerItems.size}, contentIdentity=${identity.slice(0, 8)})`,
+      );
+      return false;
+    }
+    return this.bindDirectSteerAlias(instruction, identity, true);
+  }
+
+  /**
+   * Read-only variant for the rollout watcher. Codex records one human revision in three shapes: the
+   * stdio control frame (provisional item id), the rollout record (durable item id), and the
+   * canonical provider request, which carries the steering message with no item id at all. The
+   * single-use content binding therefore has to survive the watcher, or the provider request that
+   * continues the same native turn can never prove that this exact revision was authenticated.
+   */
+  observeClaimedSteerRevision(instruction: string, content: unknown): boolean {
+    if (this.hasObservedInstruction(instruction)) return true;
+    const identity = directSteerContentIdentity(content);
+    if ((this.pendingDirectSteerContent.get(identity) ?? 0) < 1) return false;
+    return this.bindDirectSteerAlias(instruction, identity, false);
+  }
+
+  /**
+   * Claim a revision that only the authenticated rollout recorded, and register its content so the
+   * id-less canonical provider request Codex opens for it can still bind to this live turn.
+   */
+  claimRolloutSteer(instruction: string, content: unknown): void {
+    this.claimInstruction(instruction);
+    const identity = directSteerContentIdentity(content);
+    this.pendingDirectSteerContent.set(identity, (this.pendingDirectSteerContent.get(identity) ?? 0) + 1);
+    const primaries = this.pendingDirectPrimaryByContent.get(identity) ?? [];
+    primaries.push(instruction);
+    this.pendingDirectPrimaryByContent.set(identity, primaries);
+  }
+
+  private bindDirectSteerAlias(instruction: string, identity: string, consume: boolean): boolean {
     const primaries = this.pendingDirectPrimaryByContent.get(identity);
-    const primary = primaries?.shift();
-    if (primaries?.length === 0) this.pendingDirectPrimaryByContent.delete(identity);
+    const primary = consume ? primaries?.shift() : primaries?.[0];
     if (!primary) return false;
-    this.canonicalDirectSteerAliases.add(instruction);
+    if (consume) {
+      const remaining = this.pendingDirectSteerContent.get(identity) ?? 0;
+      if (remaining <= 1) this.pendingDirectSteerContent.delete(identity);
+      else this.pendingDirectSteerContent.set(identity, remaining - 1);
+      if (primaries?.length === 0) this.pendingDirectPrimaryByContent.delete(identity);
+    }
     const rejected = this.rejectedInstructions.get(primary);
     if (rejected) this.rejectedInstructions.set(instruction, rejected);
     else if (this.absorbedInstructions.has(primary)) this.absorbedInstructions.add(instruction);
@@ -590,12 +634,19 @@ export class ChatGptTurnSession {
   }
 
   /**
-   * A canonical Codex provider request created after an authenticated direct steer observes the
-   * same browser answer as the already-open provider request. It still needs its own terminal
-   * response, but must not replay that answer into the same native turn a second time.
+   * A canonical Codex provider request created after an authenticated direct steer may observe the
+   * same browser answer as the request that already delivered it. Suppressing the duplicate is
+   * decided when the answer settles, not when the revision is bound: the steered revision is
+   * applied at Codex's sampling boundary, so the delivering request can already be detached (tool
+   * continuation) or still attached (a superseded generation), and only the runtime epoch records
+   * which answer this logical turn already received.
    */
-  isCanonicalDirectSteerAlias(instruction: string): boolean {
-    return this.canonicalDirectSteerAliases.has(instruction);
+  markAnswerDelivered(): void {
+    this.deliveredAnswerEpoch = this.runtimeRevision;
+  }
+
+  answerAlreadyDelivered(): boolean {
+    return this.deliveredAnswerEpoch === this.runtimeRevision;
   }
 
   trustedEnvironment(): ChatGptTurnEnvironment | undefined {
@@ -630,10 +681,38 @@ export class ChatGptTurnSession {
   }
 
   submitDirectSteer(itemId: string, content: unknown): boolean {
-    if (this.interrupted || this.settledBrowserOutcome || !this.directSteer) return false;
+    if (this.interrupted || this.settledBrowserOutcome || !this.directSteer) {
+      console.warn(
+        `[chatgpt-web] direct steer ${itemId.slice(0, 12)} was not accepted (interrupted=${this.interrupted}`
+        + `, settled=${this.settledBrowserOutcome !== undefined}, controller=${this.directSteer !== undefined})`,
+      );
+      return false;
+    }
     this.touch();
     this.directSteer(itemId, content);
     return true;
+  }
+
+  /** Side-effect free counters for diagnosing a refused steering continuation. */
+  steeringDiagnostics(): {
+    pendingContent: number;
+    claimedItems: number;
+    pendingInstructions: number;
+    absorbedInstructions: number;
+    rejectedInstructions: number;
+    fingerprints: string[];
+    contentIdentities: string[];
+  } {
+    return {
+      pendingContent: this.pendingDirectSteerContent.size,
+      claimedItems: this.directSteerItems.size,
+      pendingInstructions: this.pendingInstructions.size,
+      absorbedInstructions: this.absorbedInstructions.size,
+      rejectedInstructions: this.rejectedInstructions.size,
+      fingerprints: [...this.pendingInstructions, ...this.absorbedInstructions, ...this.rejectedInstructions.keys()]
+        .map(value => value.slice(0, 8)),
+      contentIdentities: [...this.pendingDirectSteerContent.keys()].map(value => value.slice(0, 8)),
+    };
   }
 
   nextDirectSteerSequence(): number {
@@ -1251,6 +1330,11 @@ export class ChatGptTurnSessions {
     ));
     let accepted = 0;
     for (const session of matches) if (session.submitDirectSteer(itemId, content)) accepted += 1;
+    if (accepted === 0) {
+      console.warn(
+        `[chatgpt-web] no active ChatGPT session accepted the exact native steering turn (matches=${matches.length})`,
+      );
+    }
     return accepted;
   }
 

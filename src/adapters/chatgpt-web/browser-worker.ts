@@ -196,6 +196,12 @@ const CHATGPT_SMOKE_EXPECTED = "CODEX WEB GPT READY";
  */
 export const CHATGPT_UI_SETTLE_MS = 250;
 export const CHATGPT_SEND_ENABLE_GRACE_MS = 5_000;
+/**
+ * A retained Temporary Chat that was just stopped can still expose ChatGPT's generation control.
+ * Sending then queues the revision instead of submitting it: no request reaches the injector, and the
+ * placeholder stays in the composer. Wait for the surface to report idle before activating Send.
+ */
+export const CHATGPT_SEND_IDLE_GRACE_MS = 20_000;
 const CHATGPT_RESPONSE_DOM_MIN_OBSERVATION_INTERVAL_MS = 250;
 const CHATGPT_RESPONSE_DOM_IDLE_WAIT_MS = 1_000;
 /** How long an in-flight steering revision may take to prove it left the composer. */
@@ -1239,6 +1245,12 @@ export interface BrowserTurn {
   onSendActivated?: () => void | Promise<void>;
   /** Semantic submission evidence proved that ChatGPT accepted the prompt. */
   onSubmitted?: () => void;
+  /**
+   * A request-injection rollback was proven, so the ambiguous send did not commit and replaying this
+   * prompt on a fresh surface is safe again. Without this, a post-rollback failure such as a composer
+   * ChatGPT refuses to clear is reported as an ambiguous terminal send and tears the turn down.
+   */
+  onSendRolledBack?: () => void;
   /** Visible ChatGPT reasoning-summary step titles only; never hidden chain-of-thought. */
   onReasoningSummary?: (text: string, continuation?: boolean) => void;
   /** Stable visible ChatGPT prose between status/tool rows. */
@@ -3398,16 +3410,44 @@ export class ChatGptBrowserWorker {
       await waitForChatGptPersonalizationPoll(CHATGPT_UI_SETTLE_MS, signal);
       const settledComposer = await this.activeComposer(page, Math.max(1, deadline - Date.now()), signal);
       const remainingMs = Math.max(1, deadline - Date.now());
-      const remainingText = await settledComposer.evaluate(
+      let remainingText = await settledComposer.evaluate(
         element => element.textContent?.trim() ?? "",
         undefined,
         { timeout: remainingMs, signal },
       );
-      const connectorSelected = await this.connectorIsSelected(settledComposer, signal);
+      let connectorSelected = await this.connectorIsSelected(settledComposer, signal);
+      if (remainingText.length > 0) {
+        // A revision ChatGPT queued instead of consuming survives a programmatic fill(""). Clear it
+        // with editor-scoped keyboard editing: the locator focuses the composer before typing, so no
+        // key can reach the personalization menu or any other surface and abort its preflight.
+        const focused = await settledComposer.click({
+          timeout: Math.max(1, Math.min(CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS, deadline - Date.now())),
+          signal,
+        }).then(() => true, () => false);
+        if (focused) {
+          await settledComposer.press("Control+A", { timeout: Math.max(1, deadline - Date.now()) }).catch(() => {});
+          await settledComposer.press("Backspace", { timeout: Math.max(1, deadline - Date.now()) }).catch(() => {});
+          await waitForChatGptPersonalizationPoll(CHATGPT_UI_SETTLE_MS, signal);
+          remainingText = await settledComposer.evaluate(
+            element => element.textContent?.trim() ?? "",
+            undefined,
+            { timeout: Math.max(1, deadline - Date.now()), signal },
+          );
+          connectorSelected = await this.connectorIsSelected(settledComposer, signal);
+        }
+      }
       if (remainingText.length > 0 || connectorSelected) {
-        throw new Error(
+        // Structural diagnostics only: the leftover text itself is never logged.
+        const queuedChips = await page.evaluate(() => document.querySelectorAll(
+          '[data-testid*="queued"], [data-testid*="pending"], [aria-label*="queued" i]',
+        ).length).catch(() => -1);
+        // A composer ChatGPT refuses to clear poisons every later submission on this surface, so the
+        // failure is retryable: the retry policy discards this browser surface and starts a fresh
+        // one instead of replaying a rejected outcome on the same poisoned Temporary Chat.
+        throw new ChatGptWebAdapterError(
           `ChatGPT connector cleanup did not produce an empty composer`
-          + ` (visibleCharacters=${remainingText.length}, connectorSelected=${connectorSelected})`,
+          + ` (visibleCharacters=${remainingText.length}, connectorSelected=${connectorSelected}, queuedChips=${queuedChips})`,
+          { status: 502, errorType: "server_error", code: "browser_composer_dirty", retryable: true },
         );
       }
     });
@@ -3768,6 +3808,28 @@ export class ChatGptBrowserWorker {
       recordTiming("disabled_settle");
     }
     recordTiming("button_enabled");
+    // A reused retained surface can still expose ChatGPT's own generation control after our stop.
+    // Activating Send there queues the revision instead of submitting it, so wait for idle first.
+    const idleDeadline = Date.now() + CHATGPT_SEND_IDLE_GRACE_MS;
+    for (;;) {
+      if (abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+      if (page.isClosed()) throw chatGptBrowserTabClosedError();
+      const stillGenerating = await page.locator(CHATGPT_STOP_BUTTON_SELECTOR).last()
+        .isVisible().catch(() => false);
+      if (!stillGenerating) break;
+      if (Date.now() >= idleDeadline) {
+        await captureDiagnostic?.("send-surface-busy");
+        // Nothing was activated and no request was created, so this surface can be discarded and the
+        // canonical prompt replayed safely on a fresh one.
+        throw new ChatGptWebAdapterError(
+          "ChatGPT still exposed an active generation control when the prompt was ready to send",
+          { status: 502, errorType: "server_error", code: "browser_surface_busy", retryable: true },
+        );
+      }
+      await settleChatGptUi();
+      recordTiming("surface_busy_settle");
+    }
+    recordTiming("surface_idle");
     await captureDiagnostic?.("send-ready");
     recordTiming("send_ready_capture");
     const initialToolBatchRevision = externalProgress?.snapshot().lastToolBatchRevision ?? 0;
@@ -3782,7 +3844,28 @@ export class ChatGptBrowserWorker {
       timeout: 0,
     });
     recordTiming("press_enter");
-    await requestRewriteProbe?.(abortSignal);
+    if (requestRewriteProbe) {
+      // ChatGPT occasionally ignores the first Enter on a reused Temporary Chat surface. While no
+      // request was observed the placeholder is still the only composer content, so pressing Send
+      // again is idempotent: a submission that already left the page cleared the composer and an
+      // empty second Enter is a no-op. The injection fallback stays authoritative after the retry.
+      for (let attempt = 1; ; attempt += 1) {
+        try {
+          await requestRewriteProbe(abortSignal);
+          break;
+        } catch (error) {
+          if (!(error instanceof ChatGptRequestInjectionFallbackError) || abortSignal?.aborted || attempt >= 2) {
+            throw error;
+          }
+          console.info(
+            "[chatgpt-web] ChatGPT ignored the first Send activation on this surface;"
+            + " pressing Send again before falling back",
+          );
+          await settleChatGptUi();
+          await sendButton.press("Enter", { noWaitAfter: true, signal: abortSignal, timeout: 0 }).catch(() => {});
+        }
+      }
+    }
     recordTiming("rewrite_proof");
     const evidence = await this.waitForSubmissionAccepted(
       page,
@@ -3984,8 +4067,11 @@ export class ChatGptBrowserWorker {
       }
       if (Date.now() >= acceptedDeadline) {
         // Do not poison the live runtime when ChatGPT consumed neither (or cannot prove consuming)
-        // this revision. The single-use instruction binding prevents a later canonical replay from
-        // resubmitting an uncertain revision.
+        // this revision: the leftover editor text would fail the next submission's composer
+        // cleanup ("connector cleanup did not produce an empty composer") and tear the turn down.
+        // The single-use instruction binding prevents a later canonical replay from resubmitting
+        // an uncertain revision.
+        await this.clearSteeringRevision(page).catch(() => {});
         throw new ChatGptSteeringUnavailableError();
       }
       await this.waitForTurnDomMutation(page, 50);
@@ -5616,6 +5702,14 @@ export class ChatGptBrowserWorker {
         );
       } catch (error) {
         const activeRequestInjector = requestInjector ?? requestInjectionCdpInjector;
+        if (turn.abortSignal?.aborted) {
+          // A cancelled turn is not a submission failure. The probe only failed because the turn was
+          // aborted while the placeholder was still in the composer, so the injection fallback must
+          // not re-attach or re-send anything. Clear the composer best-effort: the retained
+          // Temporary Chat has to stay usable for the next turn.
+          await this.clearChatGptComposerState(page).catch(() => {});
+          throw new DOMException("ChatGPT web turn aborted", "AbortError");
+        }
         if (!(error instanceof ChatGptRequestInjectionFallbackError) || !activeRequestInjector) throw error;
         const injectionFailure = activeRequestInjector.snapshot();
         console.warn(`[chatgpt-web-metric] ${JSON.stringify({
@@ -5633,6 +5727,9 @@ export class ChatGptBrowserWorker {
         await diagnostics.capture(page, `request-injection-fallback-${injectionFailure.failureCode ?? "unknown"}-e${injectionFailure.exactValueMatches ?? "x"}-l${injectionFailure.literalMatches ?? "x"}`);
         await this.assertRequestInjectionFallbackSafe(page, submissionBaseline, turn.abortSignal);
         submissionDisposition.proveRollback();
+        // The rollback proof rewinds the ambiguity boundary, so every later failure of this attempt
+        // is a pre-send failure again and may safely replay the canonical prompt on a fresh surface.
+        turn.onSendRolledBack?.();
         recoveryIdentity.resetAfterProvenRollback();
         if (webStreamTap) {
           stopRecoveryWireObservation?.();

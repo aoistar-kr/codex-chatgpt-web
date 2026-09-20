@@ -8,7 +8,7 @@ import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
 import { ChatGptSteeringUnavailableError, ChatGptTurnInterruptedError, ChatGptWebAdapterError, chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
 import { ChatGptBrowserWorker } from "./browser-worker";
-import { chatGptRawEnvironmentContextIdentity, chatGptTurnUserRevisionHistory, extractChatGptRootThreadMetadata, extractChatGptThreadSpawnLineage, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, hasRawChatGptEnvironmentContext } from "./environment";
+import { chatGptRawEnvironmentContextIdentity, chatGptTurnUserRevisionHistory, extractChatGptRootThreadMetadata, extractChatGptThreadSpawnLineage, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, hasRawChatGptEnvironmentContext, MissingTrustedCodexEnvironmentError } from "./environment";
 import { createCodexRolloutControlTail, type CodexTurnControlEvent } from "./codex-rollout-control";
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
@@ -243,6 +243,11 @@ function replayEvents(events: AdapterEvent[], emit: (event: AdapterEvent) => voi
 function submittedTurnFailure(session: ChatGptTurnSession, error: unknown): Error {
   const normalized = error instanceof Error ? error : new Error(String(error));
   const phase = session.runtime.submission?.phase;
+  console.warn(
+    "[chatgpt-web] phase-classification diagnostic: phase=" + (phase ?? "none")
+    + " retryable=" + (normalized instanceof ChatGptWebAdapterError ? String(normalized.retryable) : "n/a")
+    + " code=" + (normalized instanceof ChatGptWebAdapterError ? normalized.code : "n/a"),
+  );
   if (!phase || phase === "prepared") return normalized;
   // A deterministic non-retryable adapter error is already safe to replay from this session.
   // A *retryable* error is different once Send activation has crossed the ambiguity boundary:
@@ -385,6 +390,28 @@ function validateBatchTools(parsed: CodexParsedRequest, requests: BrokerToolRequ
 /** Keep the Responses bridge alive during every awaited phase of a browser turn. */
 export const CHATGPT_WEB_ADAPTER_HEARTBEAT_MS = 10_000;
 
+// The authenticated environment of a live logical turn, keyed by its exact native identity. The
+// HTTP bridge creates one adapter per request, so a retry (or a steering successor) that re-sends
+// the sampling request without the complete environment block, or a surface-level failure that
+// retired the browser session entirely, has to find this cache outside the adapter instance.
+const trustedEnvironmentByTurn = new Map<string, ReturnType<typeof extractChatGptTurnEnvironment>>();
+
+function rememberTrustedEnvironment(
+  threadId: string | undefined,
+  turnId: string | undefined,
+  environment: ReturnType<typeof extractChatGptTurnEnvironment>,
+): void {
+  if (!threadId || !turnId) return;
+  const key = `${threadId}:${turnId}`;
+  trustedEnvironmentByTurn.delete(key);
+  trustedEnvironmentByTurn.set(key, environment);
+  while (trustedEnvironmentByTurn.size > 32) {
+    const oldest = trustedEnvironmentByTurn.keys().next().value;
+    if (oldest === undefined) break;
+    trustedEnvironmentByTurn.delete(oldest);
+  }
+}
+
 export function createChatGptWebAdapter(
   provider: CodexProviderConfig,
   dependencies: { broker?: TurnBrokerOwner } = {},
@@ -502,6 +529,12 @@ export function createChatGptWebAdapter(
     const submissionLifecycle = parsed._compactionRequest ? {} : {
       onSendActivated: () => { submission.phase = "send_activated" as const; },
       onSubmitted: () => { submission.phase = "accepted" as const; },
+      // A proven request-injection rollback rewinds the ambiguity boundary: the send never committed,
+      // so a later failure of this attempt may replay the canonical prompt on a fresh surface.
+      onSendRolledBack: () => {
+        submission.phase = "prepared" as const;
+        console.warn("[chatgpt-web] phase-rewind diagnostic: submission phase rewound after a proven rollback");
+      },
     };
     if (!mode.localTools) {
       const browserTurn = cancellableBrowserTurn(finalizeCheckpoint(worker.run({
@@ -716,11 +749,52 @@ export function createChatGptWebAdapter(
             }
             if (authenticatedReplay) environment = activeLogicalTurn!.trustedEnvironment();
             if (!environment) throw new Error("Active ChatGPT logical turn lost its trusted environment");
+            rememberTrustedEnvironment(nativeIdentity.threadId, nativeIdentity.turnId, environment);
           } catch (error) {
-            console.warn(
-              `[chatgpt-web] trusted environment unavailable (thread_id=${nativeIdentity.threadId ? "present" : "missing"}, turn_id=${nativeIdentity.turnId ? "present" : "missing"}, previous_response_id=${parsed.previousResponseId ?? "none"}, replay_prefix_items=${parsed._replayPrefixLen ?? 0}, context_messages=${parsed.context.messages.length})`,
-            );
-            throw error;
+            // A same-logical-turn retry (or a steering successor) can carry a partial environment
+            // block: Codex re-sends the sampling request without the complete trusted context. The
+            // live turn that already claimed this exact instruction keeps its authenticated
+            // environment, so a missing field is inherited instead of failing the turn closed. A
+            // block that contradicts the session still fails closed above.
+            const inheritable = error instanceof MissingTrustedCodexEnvironmentError
+              && activeLogicalTurn
+              && incomingInstruction
+              && (activeLogicalTurn.hasObservedInstruction(incomingInstruction.current)
+                || activeLogicalTurn.absorbDirectSteerAlias(
+                  incomingInstruction.current,
+                  chatGptTurnUserRevisionHistory(parsed).at(-1)?.content,
+                ));
+            if (inheritable) {
+              console.warn(
+                `[chatgpt-web] inheriting the authenticated environment for a same-turn retry (missing_field_error=${error.message.slice(0, 80)})`,
+              );
+              const inheritedEnvironment = activeLogicalTurn!.trustedEnvironment();
+              if (!inheritedEnvironment) throw error;
+              environment = inheritedEnvironment;
+              rememberTrustedEnvironment(nativeIdentity.threadId, nativeIdentity.turnId, inheritedEnvironment);
+            } else {
+              const cached = nativeIdentity.threadId && nativeIdentity.turnId
+                ? trustedEnvironmentByTurn.get(`${nativeIdentity.threadId}:${nativeIdentity.turnId}`)
+                : undefined;
+              if (cached) {
+                console.warn(
+                  "[chatgpt-web] reusing the authenticated environment cached for this exact turn",
+                );
+                environment = cached;
+              } else {
+                const newestRevision = chatGptTurnUserRevisionHistory(parsed).at(-1);
+                const newestFingerprint = newestRevision
+                  ? createHash("sha256")
+                    .update(JSON.stringify([newestRevision.itemId ?? null, newestRevision.content]))
+                    .digest("hex").slice(0, 8)
+                  : "none";
+                const steering = activeLogicalTurn?.steeringDiagnostics();
+                console.warn(
+                  `[chatgpt-web] trusted environment unavailable (thread_id=${nativeIdentity.threadId ? "present" : "missing"}, turn_id=${nativeIdentity.turnId ? "present" : "missing"}, previous_response_id=${parsed.previousResponseId ?? "none"}, replay_prefix_items=${parsed._replayPrefixLen ?? 0}, context_messages=${parsed.context.messages.length}, active_turn=${activeLogicalTurn ? "present" : "missing"}, instruction=${incomingInstruction ? "present" : "missing"}, observed=${activeLogicalTurn && incomingInstruction ? activeLogicalTurn.hasObservedInstruction(incomingInstruction.current) : false}, steer_pending_content=${steering?.pendingContent ?? 0}, steer_claimed_items=${steering?.claimedItems ?? 0}, steer_pending_instructions=${steering?.pendingInstructions ?? 0}, steer_absorbed=${steering?.absorbedInstructions ?? 0}, steer_rejected=${steering?.rejectedInstructions ?? 0}, request_instruction=${incomingInstruction?.current.slice(0, 8) ?? "none"}, session_instruction=${activeLogicalTurn?.instruction?.slice(0, 8) ?? "none"}, newest_revision=${newestRevision ? `${newestRevision.itemId ? "id" : "no-id"}:${newestFingerprint}` : "none"}, fingerprints=${steering?.fingerprints.join(",") ?? ""}, content_identities=${steering?.contentIdentities.join(",") ?? ""})`,
+                );
+                throw error;
+              }
+            }
           }
         }
         if (parsed._compactionRequest) {
@@ -933,19 +1007,36 @@ export function createChatGptWebAdapter(
         const ownerKey = logicalOwnerKey;
         const traceId = createHash("sha256").update(executionKey).digest("hex").slice(0, 12);
         let steeringSource: ChatGptTurnSession | undefined;
-        const session = await chatGptTurnSessions.getOrCreateAfterOwnerRetirement(
-          executionKey,
-          ownerKey,
-          () => startRuntime(parsed, environment, traceId, turnCapabilities, steeringSource),
-          traceId,
-          incoming.abortSignal,
-          nativeIdentity.turnId,
-          nativeIdentity.threadId,
-          chatGptInstructionLineage(parsed),
-          source => { steeringSource = source; },
-          environment,
-          chatGptRawEnvironmentContextIdentity(parsed),
-        );
+        let session: ChatGptTurnSession;
+        try {
+          session = await chatGptTurnSessions.getOrCreateAfterOwnerRetirement(
+            executionKey,
+            ownerKey,
+            () => startRuntime(parsed, environment, traceId, turnCapabilities, steeringSource),
+            traceId,
+            incoming.abortSignal,
+            nativeIdentity.turnId,
+            nativeIdentity.threadId,
+            chatGptInstructionLineage(parsed),
+            source => { steeringSource = source; },
+            environment,
+            chatGptRawEnvironmentContextIdentity(parsed),
+          );
+        } catch (error) {
+          // An unclaimed replay may never preempt the live browser epoch, but it must not tear the
+          // Codex turn down either: that is exactly the "stream disconnected before completion"
+          // failure the operator sees. Journal the rejection on the live turn instead, so the round
+          // reports it as commentary and the owned response keeps streaming.
+          const liveTurn = !parsed._compactionRequest && nativeIdentity.threadId && nativeIdentity.turnId
+            ? chatGptTurnSessions.findNativeTurn(nativeIdentity.threadId, nativeIdentity.turnId, logicalOwnerKey)
+            : undefined;
+          if (!(error instanceof ChatGptSteeringUnavailableError) || !liveTurn || !incomingInstruction) throw error;
+          console.warn(
+            "[chatgpt-web] refusing to preempt the live browser for an unclaimed revision; reporting it as commentary",
+          );
+          liveTurn.rejectInstruction(incomingInstruction.current, error);
+          session = liveTurn;
+        }
         if (!parsed._compactionRequest && nativeIdentity.turnId && nativeIdentity.threadId) {
           const rolloutLineage = extractChatGptThreadSpawnLineage(parsed)
             ?? extractChatGptRootThreadMetadata(parsed);
@@ -971,7 +1062,10 @@ export function createChatGptWebAdapter(
               // records the same revision later at the sampling boundary; treat that second signal
               // as acknowledgement rather than submitting it to ChatGPT twice.
               if (session.hasObservedInstruction(nextInstruction)) return;
-              if (source === "rollout" && session.absorbDirectSteerAlias(nextInstruction, event.content)) {
+              // The watcher must not consume the single-use content binding: Codex opens the
+              // canonical provider request for this revision with no item id, so that request can
+              // only prove its authority through the binding this watcher would otherwise spend.
+              if (source === "rollout" && session.observeClaimedSteerRevision(nextInstruction, event.content)) {
                 controlledParsed = nextParsed;
                 return;
               }
@@ -982,7 +1076,7 @@ export function createChatGptWebAdapter(
               if (source === "direct") {
                 if (!session.claimDirectSteer(event.itemId, nextInstruction, event.content)) return;
               } else {
-                session.claimInstruction(nextInstruction);
+                session.claimRolloutSteer(nextInstruction, event.content);
               }
               session.enqueueControl(async () => {
                 let transitionStarted = false;
@@ -1053,9 +1147,6 @@ export function createChatGptWebAdapter(
           }
         }
         const roundKey = chatGptTurnRoundKey(parsed);
-        const canonicalDirectSteerReplay = incomingInstruction
-          ? session.isCanonicalDirectSteerAlias(incomingInstruction.current)
-          : false;
         const emitRoundEvents = (events: readonly AdapterEvent[]): void => {
           // Journal the complete synchronous event batch before touching the HTTP observer. If the
           // observer disconnects midway through emission, an exact reconnect can replay the entire
@@ -1092,11 +1183,12 @@ export function createChatGptWebAdapter(
             const settled = session.settledOutcome();
             if (settled) {
               if (settled.type === "error") throw settled.error;
-              if (canonicalDirectSteerReplay) {
-                // The original provider observer stayed attached while the direct control path
-                // steered the same browser turn, so it already delivered this final answer. Codex
-                // later opens a canonical provider request for the accepted steer item; terminate
-                // that request without replaying the same text/commentary into the native turn.
+              if (session.answerAlreadyDelivered()) {
+                // The authenticated steering revision was applied at Codex's sampling boundary, so
+                // the request that opened the successor epoch already delivered this answer into
+                // the same native turn. Codex then opens the canonical provider request for the
+                // accepted steer item; terminate it without replaying the same answer twice. A tool
+                // continuation is the only observer of its successor epoch and still delivers here.
                 structuredOutputValidator?.(settled.answer);
                 emitRoundBatch(buffer => emitBrowserCompletion(
                   settled,
@@ -1143,6 +1235,9 @@ export function createChatGptWebAdapter(
                 buffer,
                 session.runtime.outputAnnotations?.() ?? [],
               ));
+              // This logical turn has now received the successor epoch's answer; a later canonical
+              // provider request for the same accepted steer must not deliver it a second time.
+              session.markAnswerDelivered();
               session.completeRound(roundKey);
               chatGptWebTurnRetryPolicy.clear(retryKey);
               return;
@@ -1359,6 +1454,10 @@ export function createChatGptWebAdapter(
                     buffer,
                     runtime.outputAnnotations?.() ?? [],
                   ));
+                  // This round delivered the successor epoch's answer into the native turn, so the
+                  // canonical provider request Codex opens for the accepted steer must not deliver
+                  // the same answer a second time.
+                  session.markAnswerDelivered();
                   session.completeRound(roundKey);
                   chatGptWebTurnRetryPolicy.clear(retryKey);
                   return;

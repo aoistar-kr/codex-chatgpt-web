@@ -297,6 +297,11 @@ async function run(message: RunMessage): Promise<void> {
         throw new Error("Browser helper could not persist ChatGPT submission evidence");
       }
     },
+    // The rollback proof has to reach the daemon: only the daemon knows that the prompt may be
+    // replayed on a fresh surface, so the helper cannot rewind the ambiguity boundary by itself.
+    onSendRolledBack: () => {
+      writeProtocol({ type: "event", id: message.id, event: "send_rolled_back" });
+    },
     onReasoningSummary: (text, continuation) => writeProtocol({
       type: "event",
       id: message.id,

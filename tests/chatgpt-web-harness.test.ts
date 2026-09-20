@@ -1192,9 +1192,13 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(active.claimDirectSteer("proxy-item", "duplicate-proxy-instruction", content)).toBe(false);
     expect(active.absorbDirectSteerAlias("codex-instruction", content)).toBe(true);
     expect(active.hasAbsorbedInstruction("codex-instruction")).toBe(true);
-    expect(active.isCanonicalDirectSteerAlias("codex-instruction")).toBe(true);
-    expect(active.isCanonicalDirectSteerAlias("proxy-instruction")).toBe(false);
     expect(active.absorbDirectSteerAlias("unrelated-second-instruction", content)).toBe(false);
+    // Duplicate delivery is decided per runtime epoch, not per revision identity: the request that
+    // settles the successor epoch marks the answer, and a later canonical request for the same
+    // accepted steer observes that mark instead of replaying the answer into the native turn.
+    expect(active.answerAlreadyDelivered()).toBe(false);
+    active.markAnswerDelivered();
+    expect(active.answerAlreadyDelivered()).toBe(true);
 
     // Equal text is still a separate revision when a second authenticated stdio frame claims it.
     expect(active.claimDirectSteer("proxy-item-2", "proxy-instruction-2", content)).toBe(true);

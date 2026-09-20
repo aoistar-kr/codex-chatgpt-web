@@ -16,11 +16,27 @@ const MODEL = process.env.CODEX_CHATGPT_WEB_LIVE_MODEL?.trim() || "webgpt/chatgp
 const INTERRUPT_ONLY = process.env.CODEX_CHATGPT_WEB_LIVE_INTERRUPT_ONLY === "1";
 const STEERING_ONLY = process.env.CODEX_CHATGPT_WEB_LIVE_STEERING_ONLY === "1";
 const EXPECT_STEER_REJECTION = process.env.CODEX_CHATGPT_WEB_LIVE_EXPECT_STEER_REJECTION === "1";
+const TOOL_STEERING = process.env.CODEX_CHATGPT_WEB_LIVE_TOOL_STEERING === "1";
+const TOOL_PROMPT = process.env.CODEX_CHATGPT_WEB_LIVE_TOOL_PROMPT?.trim();
 const launcherLog = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "Codex Web GPT", "logs", "launcher.jsonl");
 const launcherLogOffset = existsSync(launcherLog) ? readFileSync(launcherLog, "utf8").length : 0;
 function launcherEvents(): JsonObject[] {
   return readFileSync(launcherLog, "utf8").slice(launcherLogOffset).split(/\r?\n/)
     .filter(Boolean).map(line => asObject(JSON.parse(line)));
+}
+
+/** The browser turn the launcher most recently opened in this run's log window. */
+function latestBrowserTrace(): string | undefined {
+  const started = launcherEvents().filter(event => event.event === "browser.turn_started").at(-1);
+  const trace = started && asObject(started.detail).traceId;
+  return typeof trace === "string" ? trace : undefined;
+}
+
+/** True once the launcher proved ChatGPT accepted that exact browser turn's prompt. */
+function browserSubmissionAccepted(trace: string): boolean {
+  return launcherEvents().some(event => event.event === "runtime.daemon_stdout"
+    && typeof asObject(event.detail).line === "string"
+    && String(asObject(event.detail).line).includes(`browser turn ${trace} submission accepted`));
 }
 
 if (!existsSync(CODEX_BIN)) throw new Error(`Codex executable is missing: ${CODEX_BIN}`);
@@ -152,7 +168,15 @@ function rolloutEvidence(path: string, turnId: string): {
     exactAbortEvents: 0,
   };
   let activeTurnId: string | undefined;
-  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
+  // The rollout file may not exist yet, or Windows may briefly hold it while Codex flushes. A read
+  // failure is not evidence, so report zeroed evidence and let the caller's poll retry.
+  let rolloutText: string;
+  try {
+    rolloutText = readFileSync(path, "utf8");
+  } catch {
+    return evidence;
+  }
+  for (const line of rolloutText.split(/\r?\n/)) {
     if (!line.trim()) continue;
     let record: JsonObject;
     try {
@@ -274,17 +298,61 @@ try {
   let interruptTurnId: string | undefined;
   if (!INTERRUPT_ONLY) {
   if (!STEERING_ONLY) {
+  // ChatGPT Web sometimes answers the tool instruction with prose instead of the required tool call.
+  // That is a setup failure rather than a steering result, so the turn is cancelled and retried.
+  for (let toolAttempt = 1; ; toolAttempt += 1) {
   const toolStart = await request("turn/start", {
     threadId,
     cwd: CWD,
     model: MODEL,
     approvalPolicy: "never",
     input: textInput(
-      "Use the available command execution tool exactly once to run cmd.exe /d /c echo WEBGPT_REAL_TOOL_OK. "
-      + "After the real tool result arrives, reply with exactly TOOLLIVEOK.",
+      TOOL_PROMPT
+      || (TOOL_STEERING
+        ? "Your first output must be one tool call to the command execution tool with exactly this "
+          + "command: cmd.exe /d /c ping -n 25 127.0.0.1 . Writing prose instead of that tool call is "
+          + "incorrect. After the tool result arrives, reply with exactly TOOLLIVEOK."
+        : "Use the available command execution tool exactly once to run cmd.exe /d /c echo WEBGPT_REAL_TOOL_OK. "
+          + "After the real tool result arrives, reply with exactly TOOLLIVEOK."),
     ),
   });
   const toolTurnId = stringField(responseTurn(toolStart), "id");
+  if (TOOL_STEERING) {
+    // Steer while the long tool call is still executing: the revision must reach the live browser
+    // response without tearing the turn down, and the real tool round must still complete.
+    // The gate is strict: a steer that arrives before the tool call exists would replace the
+    // instruction before ChatGPT ever produced it, which proves nothing about in-flight steering.
+    const toolGate = await waitForRolloutEvidence(
+      rolloutPath,
+      toolTurnId,
+      evidence => evidence.functionCalls + evidence.customToolCalls >= 1,
+      Number(process.env.CODEX_CHATGPT_WEB_LIVE_TOOL_GATE_TIMEOUT_MS || 120_000),
+    );
+    if (toolGate.functionCalls + toolGate.customToolCalls < 1) {
+      if (toolAttempt >= 3) {
+        throw new Error("Steering gate failed: no real tool call was recorded before the steer");
+      }
+      await request("turn/interrupt", { threadId, turnId: toolTurnId }).catch(() => {});
+      const idleDeadline = Date.now() + 60_000;
+      let idle = await health();
+      while ((Number(idle.active_http_turns) > 0 || Number(idle.active_browser_turns) > 0)
+        && Date.now() < idleDeadline) {
+        await Bun.sleep(ACTIVE_POLL_MS);
+        idle = await health();
+      }
+      continue;
+    }
+    await Bun.sleep(Number(process.env.CODEX_CHATGPT_WEB_LIVE_TOOL_STEERING_DELAY_MS || 1_000));
+    const steerDuringTool = await request("turn/steer", {
+      threadId,
+      expectedTurnId: toolTurnId,
+      input: textInput("Also reply with exactly TOOL_STEER_LIVE_OK when this turn finishes."),
+    });
+    if (stringField(asObject(steerDuringTool.result), "turnId") !== toolTurnId) {
+      throw new Error("turn/steer during a tool call changed the logical turn id");
+    }
+    process.stdout.write(`${JSON.stringify({ tool_steering_submitted: true })}\n`);
+  }
   const toolCompleted = await waitForNotification(notification => {
     if (notification.method !== "turn/completed") return false;
     const params = asObject(notification.params);
@@ -292,7 +360,18 @@ try {
   });
   const toolStatus = stringField(notificationTurn(toolCompleted), "status");
   if (toolStatus !== "completed") throw new Error(`Real-tool turn ended with ${toolStatus}`);
-  if (!finalText(threadId, toolTurnId).includes("TOOLLIVEOK")) {
+  const toolAnswerText = finalText(threadId, toolTurnId);
+  // Codex delivers the browser Markdown with its own escaping, so markers are compared on a
+  // de-escaped copy exactly like the steering round below.
+  const toolAnswerPlain = toolAnswerText.replace(/\\(?=[^A-Za-z0-9])/g, "");
+  if (TOOL_STEERING) {
+    // The revision submitted while the tool was running supersedes the original instruction, so the
+    // delivered answer must carry the steering marker. Its absence means the revision never reached
+    // the live response.
+    if (!toolAnswerPlain.includes("TOOL_STEER_LIVE_OK")) {
+      throw new Error(`Steered marker was not observed during the real-tool round; delivered=${JSON.stringify(toolAnswerText.slice(0, 400))}`);
+    }
+  } else if (!toolAnswerPlain.includes("TOOLLIVEOK")) {
     throw new Error("Real-tool answer marker was not observed");
   }
   const toolRollout = await waitForRolloutEvidence(
@@ -305,8 +384,13 @@ try {
   if (realToolCalls < 1 || toolRollout.toolOutputs < 1) {
     throw new Error(`Real tool round was not recorded: calls=${realToolCalls} outputs=${toolRollout.toolOutputs}`);
   }
+  break;
+  }
   }
 
+  // ChatGPT Web occasionally ignores "do not use tools" on the steered revision. That is a setup
+  // failure rather than a steering result, so the turn is cancelled and retried.
+  for (let steeringAttempt = 1; ; steeringAttempt += 1) {
   const steeringStart = await request("turn/start", {
     threadId,
     cwd: CWD,
@@ -375,66 +459,136 @@ try {
   // reply may legitimately have none; answer completeness and single delivery are gated above.
   commentaryItems = steeringRollout.commentaryItems;
   syntheticToolCalls = steeringRollout.functionCalls + steeringRollout.customToolCalls;
-  if (syntheticToolCalls !== 0) throw new Error("Browser progress was represented by a tool call");
+  if (syntheticToolCalls !== 0) {
+    if (steeringAttempt >= 3) throw new Error("Browser progress was represented by a tool call");
+    await request("turn/interrupt", { threadId, turnId: steeringTurnId }).catch(() => {});
+    const steeringIdleDeadline = Date.now() + 60_000;
+    let steeringIdle = await health();
+    while ((Number(steeringIdle.active_http_turns) > 0 || Number(steeringIdle.active_browser_turns) > 0)
+      && Date.now() < steeringIdleDeadline) {
+      await Bun.sleep(ACTIVE_POLL_MS);
+      steeringIdle = await health();
+    }
+    continue;
+  }
+  break;
   }
   }
-
-  if (!interruptTurnId) {
-  const interruptStart = await request("turn/start", {
-    threadId,
-    cwd: CWD,
-    model: MODEL,
-    approvalPolicy: "never",
-    input: textInput(
-      "Do not use tools. Write a deliberately very long answer with at least 160 numbered sections and do not finish early.",
-    ),
-  });
-  interruptTurnId = stringField(responseTurn(interruptStart), "id");
-  await waitForActiveTurn();
-  // Exercise Stop after browser submission, rather than merely after HTTP registration.
-  await Bun.sleep(Number(process.env.CODEX_CHATGPT_WEB_LIVE_INTERRUPT_DELAY_MS || 12_000));
-  }
-  await request("turn/interrupt", { threadId, turnId: interruptTurnId });
-  const interruptCompleted = await waitForNotification(notification => {
-    if (notification.method !== "turn/completed") return false;
-    const params = asObject(notification.params);
-    return params.threadId === threadId && stringField(notificationTurn(notification), "id") === interruptTurnId;
-  });
-  const interruptStatus = stringField(notificationTurn(interruptCompleted), "status");
-  if (interruptStatus !== "interrupted") throw new Error(`Interrupted turn ended with ${interruptStatus}`);
-
-  const settleDeadline = Date.now() + 30_000;
-  let settled = await health();
-  while ((Number(settled.active_http_turns) > 0 || Number(settled.active_browser_turns) > 0) && Date.now() < settleDeadline) {
-    await Bun.sleep(ACTIVE_POLL_MS);
-    settled = await health();
-  }
-  if (Number(settled.active_http_turns) !== 0 || Number(settled.active_browser_turns) !== 0) {
-    throw new Error("Interrupted WebGPT turn did not settle to idle");
-  }
-  if (Number(settled.pid) !== initialDaemonPid) throw new Error("WebGPT daemon restarted during active-turn validation");
-  const interruptRollout = await waitForRolloutEvidence(
-    rolloutPath,
-    interruptTurnId,
-    evidence => evidence.exactAbortEvents >= 1,
-  );
-  if (interruptRollout.exactAbortEvents !== 1) {
-    throw new Error(`Expected one exact turn_aborted event, observed ${interruptRollout.exactAbortEvents}`);
   }
 
-  const retentionDeadline = Date.now() + 20_000;
+  // Stop is only proven when the launcher still found ChatGPT's own generation control to click. A
+  // generation that already finished would acknowledge nothing, so such an attempt proves nothing
+  // about Stop and is retried instead of being reported as a retention failure.
   let retained = false;
-  while (Date.now() < retentionDeadline) {
-    const events = launcherEvents();
-    const started = events.filter(event => event.event === "browser.turn_started").at(-1);
-    const trace = started && asObject(started.detail).traceId;
-    if (trace && events.some(event => event.event === "browser.tab_released"
-      && asObject(event.detail).traceId === trace)) throw new Error("Stop destroyed the Temporary Chat");
-    retained = !!trace && events.some(event => event.event === "browser.tab_retained"
-      && asObject(event.detail).traceId === trace && asObject(event.detail).status === "aborted");
-    if (retained) break;
-    await Bun.sleep(100);
+  let stopAcknowledged = false;
+  let interruptEvidence = {
+    commentaryItems: 0,
+    functionCalls: 0,
+    customToolCalls: 0,
+    toolOutputs: 0,
+    exactAbortEvents: 0,
+  };
+  let settled = await health();
+  for (let attempt = 1; attempt <= 3 && !retained; attempt += 1) {
+    if (!interruptTurnId) {
+      // Captured before the turn starts: the interrupt turn's own browser turn becomes the latest
+      // one, so only a trace newer than this baseline can belong to the turn being interrupted.
+      const previousTrace = latestBrowserTrace();
+      const interruptStart = await request("turn/start", {
+        threadId,
+        cwd: CWD,
+        model: MODEL,
+        approvalPolicy: "never",
+        input: textInput(
+          "Do not use tools. Write a deliberately very long answer with at least 160 numbered sections and do not finish early.",
+        ),
+      });
+      interruptTurnId = stringField(responseTurn(interruptStart), "id");
+      await waitForActiveTurn();
+      // Exercise Stop after the browser proved it accepted the prompt, rather than merely after HTTP
+      // registration: cancelling during the send stage cancels a submission that never started, which
+      // is a different contract from stopping a live generation.
+      const acceptanceDeadline = Date.now() + 90_000;
+      let interruptTrace = previousTrace;
+      while (Date.now() < acceptanceDeadline) {
+        interruptTrace = latestBrowserTrace();
+        if (interruptTrace && interruptTrace !== previousTrace && browserSubmissionAccepted(interruptTrace)) break;
+        await Bun.sleep(200);
+      }
+      if (!interruptTrace || interruptTrace === previousTrace || !browserSubmissionAccepted(interruptTrace)) {
+        throw new Error("Interrupt turn never proved browser submission acceptance");
+      }
+      await Bun.sleep(Number(process.env.CODEX_CHATGPT_WEB_LIVE_INTERRUPT_DELAY_MS || 1_500));
+    }
+    const interruptTraceId = latestBrowserTrace();
+    const interruptedTurnId = interruptTurnId;
+    // One logical turn reuses its trace id across retries, so retention is judged only from the
+    // events that follow this interrupt rather than from any earlier instance of the same trace.
+    const eventBaseline = launcherEvents().length;
+    await request("turn/interrupt", { threadId, turnId: interruptedTurnId });
+    const interruptCompleted = await waitForNotification(notification => {
+      if (notification.method !== "turn/completed") return false;
+      const params = asObject(notification.params);
+      return params.threadId === threadId && stringField(notificationTurn(notification), "id") === interruptedTurnId;
+    });
+    const interruptStatus = stringField(notificationTurn(interruptCompleted), "status");
+    if (interruptStatus !== "interrupted") throw new Error(`Interrupted turn ended with ${interruptStatus}`);
+
+    const settleDeadline = Date.now() + 30_000;
+    settled = await health();
+    while ((Number(settled.active_http_turns) > 0 || Number(settled.active_browser_turns) > 0)
+      && Date.now() < settleDeadline) {
+      await Bun.sleep(ACTIVE_POLL_MS);
+      settled = await health();
+    }
+    if (Number(settled.active_http_turns) !== 0 || Number(settled.active_browser_turns) !== 0) {
+      throw new Error("Interrupted WebGPT turn did not settle to idle");
+    }
+    if (Number(settled.pid) !== initialDaemonPid) throw new Error("WebGPT daemon restarted during active-turn validation");
+    interruptEvidence = await waitForRolloutEvidence(
+      rolloutPath,
+      interruptedTurnId,
+      evidence => evidence.exactAbortEvents >= 1,
+    );
+    if (interruptEvidence.exactAbortEvents !== 1) {
+      throw new Error(`Expected one exact turn_aborted event, observed ${interruptEvidence.exactAbortEvents}`);
+    }
+    // The launcher performs the Stop from the helper's abort listener, which can land after the Codex
+    // turn already reported itself as interrupted, so the acknowledgement is awaited explicitly.
+    const stopDeadline = Date.now() + 20_000;
+    let stopEvents = launcherEvents().filter(event => event.event === "browser.turn_stop_requested"
+      && asObject(event.detail).traceId === interruptTraceId);
+    while (stopEvents.length === 0 && Date.now() < stopDeadline) {
+      await Bun.sleep(100);
+      stopEvents = launcherEvents().filter(event => event.event === "browser.turn_stop_requested"
+        && asObject(event.detail).traceId === interruptTraceId);
+    }
+    stopAcknowledged = stopEvents.length > 0 && asObject(stopEvents.at(-1)!.detail).stopped === true;
+    process.stdout.write(`${JSON.stringify({
+      interrupt_attempt: attempt,
+      interrupt_trace: interruptTraceId ?? null,
+      stop_events: stopEvents.length,
+      stopped: stopEvents.length > 0 ? asObject(stopEvents.at(-1)!.detail).stopped : null,
+      started_traces: launcherEvents().filter(event => event.event === "browser.turn_started")
+        .map(event => asObject(event.detail).traceId).slice(-4),
+    })}\n`);
+    if (!stopAcknowledged) {
+      interruptTurnId = undefined;
+      continue;
+    }
+    const retentionDeadline = Date.now() + 20_000;
+    while (Date.now() < retentionDeadline) {
+      const events = launcherEvents().slice(eventBaseline);
+      if (events.some(event => event.event === "browser.tab_released"
+        && asObject(event.detail).traceId === interruptTraceId)) throw new Error("Stop destroyed the Temporary Chat");
+      retained = events.some(event => event.event === "browser.tab_retained"
+        && asObject(event.detail).traceId === interruptTraceId && asObject(event.detail).status === "aborted");
+      if (retained) break;
+      await Bun.sleep(100);
+    }
+    if (!retained) interruptTurnId = undefined;
   }
+  if (!stopAcknowledged) throw new Error("Interrupt never stopped a live ChatGPT generation");
   if (!retained) throw new Error("No exact stopped Temporary Chat retention acknowledgement");
 
   process.stdout.write(`${JSON.stringify({
@@ -449,7 +603,7 @@ try {
     commentaryItems,
     fakeToolCalls: syntheticToolCalls,
     steeredAnswerCopies,
-    exactAbortEvents: interruptRollout.exactAbortEvents,
+    exactAbortEvents: interruptEvidence.exactAbortEvents,
     finalHealth: {
       pid: settled.pid,
       activeHttpTurns: settled.active_http_turns,
