@@ -58,12 +58,12 @@ test("request-injection plan preserves the existing primary/shadow eligibility b
       expected: "shadow",
     },
     {
-      name: "image blocks primary but not compatibility shadow",
+      name: "image turns use the request-body writer",
       input: {
         imageCount: 1,
         features: { requestInjectionPrimary: true, requestInjectionShadow: true },
       },
-      expected: "shadow",
+      expected: "primary",
     },
     {
       name: "compaction uses the request-body writer",
@@ -107,8 +107,8 @@ test("request-injection plan preserves the existing primary/shadow eligibility b
       expected: "primary",
     },
     {
-      name: "ineligible primary does not invent shadow when shadow is disabled",
-      input: { imageCount: 1, features: { requestInjectionPrimary: true } },
+      name: "disabled primary stays off even for an image turn",
+      input: { imageCount: 1, features: {} },
       expected: "off",
     },
   ];

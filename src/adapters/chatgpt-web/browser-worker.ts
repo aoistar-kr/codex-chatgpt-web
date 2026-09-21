@@ -5385,7 +5385,6 @@ export class ChatGptBrowserWorker {
       const directRequestMode = turnPlan.requestInjection === "primary"
         && !reuseConversation
         && turn.modelId === CHATGPT_WEB_MODEL_ID
-        && prepared.images.length === 0
         ? resolveChatGptDirectRequestMode(requestedMode.effort)
         : undefined;
       const directModeRequested = directRequestMode !== undefined;

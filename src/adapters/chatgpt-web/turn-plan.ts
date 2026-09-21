@@ -61,10 +61,13 @@ export function resolveChatGptTurnPlan(input: ChatGptTurnPlanInput): ChatGptTurn
   // system (compaction always splits into six parts) and typing them into the composer stalls the
   // ChatGPT renderer for tens of seconds on real content. The request-body writer keeps those bytes
   // out of the composer, which is the only place the client would otherwise parse and lay them out.
-  const requestPrimaryEligible = input.imageCount === 0;
+  // Image turns are admitted as well: the writer only swaps the prompt value, and attachments ride
+  // the same request through their own upload path, so the composer never holds the prompt text.
+  const requestPrimaryEligible = true;
   const requestPrimary = input.features.requestInjectionPrimary && requestPrimaryEligible;
   // The CDP writer still pauses every intercepted request, so it keeps the previous exclusions.
   const requestCdpPrimaryEligible = requestPrimaryEligible
+    && input.imageCount === 0
     && !input.reuseConversation
     && !input.multipart
     && !input.compaction;

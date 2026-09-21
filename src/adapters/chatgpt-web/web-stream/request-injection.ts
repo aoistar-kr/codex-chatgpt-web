@@ -785,9 +785,17 @@ export class ChatGptRequestInjector {
                 || !metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
                 return fail("request-shape", exactValueMatches, literalMatches, rawBody.length);
               }
-              const parts = (content as Record<string, unknown>).parts;
-              if (!Array.isArray(parts) || parts.length !== 1 || typeof parts[0] !== "string"
-                || parts[0].split(placeholderValue).length - 1 !== 1) {
+              const partsValue = (content as Record<string, unknown>).parts;
+              const parts: unknown[] | undefined = Array.isArray(partsValue) ? partsValue : undefined;
+              // An image or file attachment adds its own part, so the mention has to be prepended to
+              // the single text part that carries the placeholder rather than to a lone first part.
+              // Attachment parts are left byte-for-byte untouched; the whole-body cardinality check
+              // below still proves the placeholder appears exactly once.
+              const textPartIndex = parts !== undefined
+                ? parts.findIndex(part => typeof part === "string"
+                  && part.split(placeholderValue).length - 1 === 1)
+                : -1;
+              if (parts === undefined || textPartIndex === -1) {
                 return fail("request-shape", exactValueMatches, literalMatches, rawBody.length);
               }
               const topHints = body.system_hints;
@@ -812,7 +820,7 @@ export class ChatGptRequestInjector {
                 return fail("request-shape", exactValueMatches, literalMatches, rawBody.length);
               }
               const mention = `@${appName}`;
-              parts[0] = `${mention}  ${parts[0]}`;
+              parts[textPartIndex] = `${mention}  ${parts[textPartIndex] as string}`;
               body.system_hints = [pluginId];
               messageMetadata.system_hints = [pluginId];
               serializationObject.custom_symbol_offsets = [{
