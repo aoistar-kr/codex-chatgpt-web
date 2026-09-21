@@ -2379,6 +2379,54 @@ describe("ChatGPT outer-native harness v4", () => {
     await broker.close();
   });
 
+  test("releasing one abandoned binding keeps the turn token valid for the next claim", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-release-binding-${process.pid}-${Date.now()}`);
+    const broker = TurnBroker.forSocket(socketPath);
+    const token = await broker.register(
+      extractChatGptTurnEnvironment(parsed(environmentXml)),
+      10_000,
+      "release-binding",
+    );
+    const first = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
+    await callTurnBroker(socketPath, { method: "release", bindingId: first.bindingId });
+    // Revoking the whole token here used to strand the browser response: its next Codex Native
+    // call was rejected as "already finished" and the response could never settle.
+    const second = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
+    expect(second.bindingId).toBeTruthy();
+    expect(second.bindingId).not.toBe(first.bindingId);
+    await broker.close();
+  });
+
+  test("a released invocation absorbs its late native result instead of failing the turn", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-release-late-result-${process.pid}-${Date.now()}`);
+    const broker = TurnBroker.forSocket(socketPath);
+    const token = await broker.register(
+      extractChatGptTurnEnvironment(parsed(environmentXml)),
+      10_000,
+      "release-late-result",
+    );
+    const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
+    const invocation = callTurnBroker(socketPath, {
+      method: "invoke",
+      bindingId: claimed.bindingId,
+      wireName: "exec_command",
+      freeform: false,
+      arguments: { cmd: "sleep 120" },
+    }, 10_000);
+    const [request] = await broker.nextToolBatch(token);
+    // The MCP transport deadline abandons the invocation while the native tool is still running.
+    await callTurnBroker(socketPath, { method: "release", bindingId: claimed.bindingId });
+    await expect(invocation).rejects.toThrow("released before it completed");
+    // The native result arrives after the deadline. Absorbing it keeps the response that is still
+    // generating alive; failing here used to tear the whole turn down as "tool call is not pending".
+    expect(() => broker.completeTool(token, request.callId, toolResult({ output: "late" }))).not.toThrow();
+    expect(() => broker.completeTool(token, request.callId, toolResult({ output: "late" })))
+      .toThrow("tool call is not pending");
+    const reclaimed = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
+    expect(reclaimed.bindingId).not.toBe(claimed.bindingId);
+    await broker.close();
+  });
+
   test("commits browser completion only across an unchanged broker activity fence", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h3-terminal-fence-${process.pid}-${Date.now()}`);
     const broker = TurnBroker.forSocket(socketPath);

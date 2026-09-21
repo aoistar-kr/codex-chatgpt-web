@@ -618,7 +618,7 @@ export function createChatGptWebAdapter(
         );
         return { ...compiled, release: () => {} };
       } catch (error) {
-        await broker.revoke(turnToken);
+        await broker.revoke(turnToken, new Error("turn preparation failed"));
         activeToken = undefined;
         throw error;
       }
@@ -668,7 +668,7 @@ export function createChatGptWebAdapter(
       ...(conversationKey ? { conversationKey } : {}),
       ...(releaseRetainedConversation ? { releaseRetainedConversation } : {}),
       retireCapability: async () => {
-        if (activeToken) await broker.revoke(activeToken);
+        if (activeToken) await broker.revoke(activeToken, new Error("retired capability"));
       },
       submission,
       cancel: (reason?: Error) => {
@@ -1440,7 +1440,7 @@ export function createChatGptWebAdapter(
                   }
                   session.setFinalReasoning(roundReasoning);
                   session.setFinalEvents(session.roundEvents(roundKey));
-                  if (turnToken) await broker.revoke(turnToken);
+                  if (turnToken) await broker.revoke(turnToken, new Error("browser completion accepted"));
                   if (runtime.text.value() !== completedOutcome.answer) {
                     throw new Error("ChatGPT browser Markdown stream did not reproduce the completed answer");
                   }
@@ -1518,7 +1518,9 @@ export function createChatGptWebAdapter(
             chatGptTurnSessions.retire(executionKey, session);
           }
           if (session.runtime.mode === "tools") {
-            void session.runtime.token.then(turnToken => broker.revoke(turnToken)).catch(() => {});
+            void session.runtime.token
+              .then(turnToken => broker.revoke(turnToken, new Error("turn round failed")))
+              .catch(() => {});
           }
           if (handledError instanceof ChatGptWebAdapterError) {
             emitRoundEvent({

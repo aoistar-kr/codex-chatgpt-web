@@ -94,7 +94,10 @@ test("message proof exposes missing, empty, malformed, duplicate, hidden collisi
 });
 
 test("completed diagnostic is observation-only, fresh, privacy-safe and cannot resume capture", () => {
-  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  // The assertion below matches LF-separated source text. A Windows checkout can hand back CRLF,
+  // which would fail the match for a reason that has nothing to do with the cleanup ordering.
+  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8")
+    .replaceAll("\r\n", "\n");
   const start = source.lastIndexOf("      if (chatGptCompletedRebindDiagnosticsEnabled())");
   const block = source.slice(start, source.indexOf("      return finalText;", start));
   expect(source.slice(start - 45, start)).toContain("captureDisposition.complete()");
@@ -129,7 +132,8 @@ test("completed diagnostic is observation-only, fresh, privacy-safe and cannot r
 });
 
 test("generation turn-id observer is finished after fresh rebind fencing and cleanup targets the rebound page", () => {
-  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8")
+    .replaceAll("\r\n", "\n");
   const completed = source.lastIndexOf("      if (chatGptCompletedRebindDiagnosticsEnabled())");
   const fence = source.indexOf("sameChatGptRecoveryDomSnapshot(after, fence)", completed);
   const finish = source.indexOf("finishChatGptRecoveryTurnIdMutationContinuity, generationTurnIdContinuityToken", completed);
@@ -154,7 +158,8 @@ test("atomic early activity uses the same DOM read and fails closed for completi
 });
 
 test("early sampler is opt-in active-loop-only and never backfills completion or terminal boundaries", () => {
-  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8")
+    .replaceAll("\r\n", "\n");
   expect(source).toContain("const recoveryEvidenceEnabled = completedRebindEligible");
   expect(source).toContain("chatGptCompletedRebindDiagnosticsEnabled() || turnPlan.incompleteCaptureRecovery");
   expect(source).toContain('captureDisposition.snapshot() === "capturing" && recoveryIdentity.lifecycle() === "committed"');
@@ -168,7 +173,8 @@ test("early sampler is opt-in active-loop-only and never backfills completion or
 });
 
 test("first opt-in active read precedes the send-accepted screenshot without changing default ordering", () => {
-  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8")
+    .replaceAll("\r\n", "\n");
   const defaultCapture = source.indexOf('if (!prioritizeEarlyRecoveryEvidence) await diagnostics.capture(page, "send-accepted")');
   const binding = source.indexOf("let responseTurn = await responseTurnPromise");
   const sample = source.indexOf("await earlyMessageSampler.sample()");

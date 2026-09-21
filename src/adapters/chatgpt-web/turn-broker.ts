@@ -69,6 +69,12 @@ interface TurnChannel {
   queuedCallIds: string[];
   deliveredCallIds: Set<string>;
   invocations: Map<string, PendingInvocation>;
+  /**
+   * Calls whose invocation was released on purpose. A released call was already answered on the MCP
+   * side, so the native result that arrives later has no consumer and must be absorbed instead of
+   * failing the owner's completion call.
+   */
+  abandonedCallIds: Set<string>;
   waiters: Set<ToolWaiter>;
   compactionRequested: boolean;
   compactionResult?: BrokerToolResult;
@@ -299,6 +305,7 @@ export class TurnBroker implements TurnBrokerOwner {
       queuedCallIds: [],
       deliveredCallIds: new Set(),
       invocations: new Map(),
+      abandonedCallIds: new Set(),
       waiters: new Set(),
       compactionRequested: false,
       compactionDeliveryCount: 0,
@@ -430,7 +437,18 @@ export class TurnBroker implements TurnBrokerOwner {
     if (!channel) throw new Error("turn token is invalid or expired");
     this.assertSafeHarnessRunning(channel, true);
     const invocation = channel.invocations.get(callId);
-    if (!invocation) throw new Error(`tool call is not pending: ${callId}`);
+    if (!invocation) {
+      // A released invocation was already answered on the MCP side with an explicit timeout, so its
+      // late native result has no consumer. Absorbing it keeps the turn alive instead of failing the
+      // owner's completion call and tearing down a response that is still generating.
+      if (channel.abandonedCallIds.delete(callId)) {
+        console.info(
+          `[chatgpt-web] broker trace=${channel.traceId} absorbed late result for released call=${callId.slice(0, 17)}`,
+        );
+        return;
+      }
+      throw new Error(`tool call is not pending: ${callId}`);
+    }
     if (!channel.deliveredCallIds.delete(callId)) {
       throw new Error(`tool call was completed before it was delivered: ${callId}`);
     }
@@ -612,6 +630,12 @@ export class TurnBroker implements TurnBrokerOwner {
   revoke(token: string, reason = new Error("Codex turn binding was revoked")): void {
     const channel = this.channels.get(token);
     if (!channel) return;
+    // A revocation that races an in-flight Codex Native call leaves the browser response waiting for
+    // a tool result that can never arrive. Name the caller here so a later "already finished"
+    // rejection can be traced back to the path that retired the token.
+    console.info(
+      `[chatgpt-web] broker trace=${channel.traceId} revoked turn token (reason=${reason.message.slice(0, 120)})`,
+    );
     this.channels.delete(token);
     this.pending.delete(token);
     if (channel.bindingId) {
@@ -1104,7 +1128,32 @@ export class TurnBroker implements TurnBrokerOwner {
         : "internal Codex turn binding is invalid or expired");
     }
     if (request.method === "release") {
-      this.revoke(binding.token);
+      // Release only this binding. Revoking the whole turn token here killed a healthy browser
+      // response that merely had one slow or cancelled tool call: its next Codex Native call was
+      // then rejected against the retired token, the pending invocation never settled, and the
+      // response could never close. The turn stays valid so the model can continue.
+      const channel = binding.channel;
+      const abandoned = new Error("Codex Native invocation was released before it completed");
+      for (const [callId, invocation] of channel.invocations) {
+        // Remember the abandoned ids so the owner's late completion is absorbed instead of failing
+        // the turn. The window is bounded because each entry costs one released invocation.
+        if (channel.abandonedCallIds.size >= 128) {
+          const oldest = channel.abandonedCallIds.values().next().value;
+          if (oldest !== undefined) channel.abandonedCallIds.delete(oldest);
+        }
+        channel.abandonedCallIds.add(callId);
+        invocation.reject(abandoned);
+      }
+      channel.invocations.clear();
+      channel.queuedCallIds = [];
+      channel.deliveredCallIds.clear();
+      this.bindings.delete(bindingId);
+      this.retire(this.retiredBindings, bindingId, channel.traceId);
+      if (channel.bindingId === bindingId) channel.bindingId = undefined;
+      channel.activityRevision += 1;
+      console.info(
+        `[chatgpt-web] broker trace=${channel.traceId} released binding ${bindingId.slice(0, 17)} without retiring the turn`,
+      );
       return { released: true };
     }
     if (request.method === "resolve") return { environment: binding.channel.environment };
@@ -1192,6 +1241,7 @@ export class TurnBroker implements TurnBrokerOwner {
     channel.invocations.clear();
     channel.queuedCallIds = [];
     channel.deliveredCallIds.clear();
+    channel.abandonedCallIds.clear();
   }
 
   private prune(): void {
