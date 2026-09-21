@@ -5160,6 +5160,8 @@ export class ChatGptBrowserWorker {
     let requestInjectionCdpShadow: ChatGptCdpRequestInjectionShadow | undefined;
     let requestInjectionCdpInjector: ChatGptCdpRequestInjector | undefined;
     let requestInjector: ChatGptRequestInjector | undefined;
+    // Multipart stages rewrite their own request body so the composer never holds a payload.
+    let stageRequestInjector: ChatGptRequestInjector | undefined;
     const submissionDisposition = new ChatGptSubmissionDispositionTracker();
     const captureDisposition = new ChatGptCaptureDispositionTracker();
     const recoveryIdentity = new ChatGptTurnRecoveryIdentityTracker(launcherSurfaceId);
@@ -5383,7 +5385,6 @@ export class ChatGptBrowserWorker {
       const directRequestMode = turnPlan.requestInjection === "primary"
         && !reuseConversation
         && turn.modelId === CHATGPT_WEB_MODEL_ID
-        && !prepared.multipart
         && prepared.images.length === 0
         ? resolveChatGptDirectRequestMode(requestedMode.effort)
         : undefined;
@@ -5416,13 +5417,39 @@ export class ChatGptBrowserWorker {
         for (let index = 0; index < multipartStages.length; index += 1) {
           const stage = multipartStages[index]!;
           const stageBaseline = await this.captureSubmissionBaseline(page);
+          // Keep each stage payload out of the composer. The request writer swaps the body after the
+          // page-fetch leaves it, so the renderer never parses or lays out the raw context records.
+          if (stageRequestInjector) {
+            await stageRequestInjector.close().catch(() => {});
+            stageRequestInjector = undefined;
+          }
+          let stageAttachment = stage.text;
+          if (directModeRequested) {
+            const stagePlaceholder = createChatGptRequestInjectionPlaceholder(stage.text);
+            try {
+              stageRequestInjector = await ChatGptRequestInjector.install(
+                page,
+                turn.traceId,
+                stagePlaceholder,
+                stage.text,
+                { mode: resolveChatGptDirectRequestMode(stagingMode.effort) },
+              );
+              stageAttachment = stagePlaceholder;
+            } catch (error) {
+              console.warn(
+                `[chatgpt-web] browser turn ${turn.traceId} could not inject multipart stage ${index + 1}; using the DOM prompt path:`
+                + ` ${redactChatGptUiDiagnostic(error instanceof Error ? error.message : String(error))}`,
+              );
+              stageRequestInjector = undefined;
+            }
+          }
           await this.runStage(
             turn.traceId,
             `multipart_stage_${index + 1}_attachment`,
             browserStageTimeouts.promptAttachment,
             (stageSignal) => this.attachPrompt(
               page,
-              stage.text,
+              stageAttachment,
               false,
               checkpoint => diagnostics.capture(page, `multipart-${index + 1}-${checkpoint}`),
               turn.abortSignal ? AbortSignal.any([stageSignal, turn.abortSignal]) : stageSignal,
@@ -5465,6 +5492,10 @@ export class ChatGptBrowserWorker {
             turn.externalProgress,
           );
           await diagnostics.capture(page, `multipart-stage-${index + 1}-acknowledged`);
+          if (stageRequestInjector) {
+            await stageRequestInjector.close().catch(() => {});
+            stageRequestInjector = undefined;
+          }
         }
         if (mode.effort !== requestedMode.effort) {
           mode = await this.runStage(
@@ -7118,6 +7149,7 @@ export class ChatGptBrowserWorker {
       if (requestInjectionCdpShadow) await requestInjectionCdpShadow.close().catch(() => {});
       if (requestInjectionCdpInjector) await requestInjectionCdpInjector.close().catch(() => {});
       if (requestInjector) await requestInjector.close().catch(() => {});
+      if (stageRequestInjector) await stageRequestInjector.close().catch(() => {});
       if (requestInjectionShadow) await requestInjectionShadow.close().catch(() => {});
       if (turnConnection) {
         await turnConnection.close().catch(error => {

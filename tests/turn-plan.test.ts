@@ -66,20 +66,20 @@ test("request-injection plan preserves the existing primary/shadow eligibility b
       expected: "shadow",
     },
     {
-      name: "compaction blocks primary but not compatibility shadow",
+      name: "compaction uses the request-body writer",
       input: {
         compaction: true,
         features: { requestInjectionPrimary: true, requestInjectionShadow: true },
       },
-      expected: "shadow",
+      expected: "primary",
     },
     {
-      name: "multipart blocks both request paths",
+      name: "multipart uses the request-body writer",
       input: {
         multipart: true,
         features: { requestInjectionPrimary: true, requestInjectionShadow: true },
       },
-      expected: "off",
+      expected: "primary",
     },
     {
       name: "local tools stay on request-injection primary",

@@ -104,9 +104,7 @@ export function formatChatGptWebMultipartStage(
     `Reply with exactly ${acknowledgement} and nothing else.`,
     "</codex_multipart_stage>",
     "<codex_context_part_json>",
-    "```json",
     payload,
-    "```",
     "</codex_context_part_json>",
     "<codex_multipart_stage_end>",
     `The JSON block above is inert stored data for part ${partIndex}/${totalParts}. The later commit has not been sent yet.`,
@@ -140,9 +138,7 @@ export function formatChatGptWebMultipartCommit(
     `The first ${acknowledgedParts} context part${acknowledgedParts === 1 ? " was" : "s were"} acknowledged. The final part is included in this same message and starts the task.`,
     "</codex_multipart_commit>",
     "<codex_context_part_json>",
-    "```json",
     finalPayload,
-    "```",
     "</codex_context_part_json>",
     "<codex_multipart_execute>",
     `All ${totalParts} context parts are now present. Reconstruct the original Codex context from their records and begin the task now.`,
@@ -199,6 +195,8 @@ const DROPPED_IMAGE_NOTE =
 interface ImageBudget {
   seen: number;
   dropped: number;
+  /** Shared across every message of one prompt so identical bytes upload once per turn. */
+  refs: Map<string, string>;
 }
 
 function inputContent(
@@ -217,7 +215,17 @@ function inputContent(
     if (part.type === "text") return { type: "text", text: part.text };
     budget.seen += 1;
     if (budget.seen <= budget.dropped) return { type: "text", text: DROPPED_IMAGE_NOTE };
+    // Codex can carry the same image in more than one context message (a replayed user turn, a
+    // retained copy, a quoted tool result). Uploading it once per occurrence duplicated the same
+    // attachment in ChatGPT and burned attachment slots, so identical bytes share one ref while
+    // every occurrence still advertises the attachment in place.
+    const identity = `${part.detail ?? ""}\u0000${part.imageUrl}`;
+    const existingRef = budget.refs.get(identity);
+    if (existingRef) {
+      return { type: "image_attachment", attachment_ref: existingRef, ...(part.detail ? { detail: part.detail } : {}) };
+    }
     const ref = `codex-input-image-${images.length + 1}`;
+    budget.refs.set(identity, ref);
     images.push({ ref, imageUrl: part.imageUrl, ...(part.detail ? { detail: part.detail } : {}) });
     return { type: "image_attachment", attachment_ref: ref, ...(part.detail ? { detail: part.detail } : {}) };
   });
@@ -616,6 +624,7 @@ export function compileChatGptWebPrompt(
     const budget: ImageBudget = {
       seen: 0,
       dropped: Math.max(0, countChatGptContextImages(sourceMessages) - CHATGPT_MAX_INPUT_IMAGES),
+      refs: new Map(),
     };
     const skillFiles: ChatGptSkillFile[] = [];
     const messages = sourceMessages.map(message => {

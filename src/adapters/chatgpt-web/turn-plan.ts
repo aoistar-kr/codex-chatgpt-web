@@ -57,11 +57,17 @@ export function chatGptEffortSelectionRequired(
  * how their fail-closed fallbacks execute.
  */
 export function resolveChatGptTurnPlan(input: ChatGptTurnPlanInput): ChatGptTurnPlan {
-  const requestPrimaryEligible = !input.multipart
-    && input.imageCount === 0
-    && !input.compaction;
+  // Multipart and compaction are deliberately eligible: their messages are the largest in the
+  // system (compaction always splits into six parts) and typing them into the composer stalls the
+  // ChatGPT renderer for tens of seconds on real content. The request-body writer keeps those bytes
+  // out of the composer, which is the only place the client would otherwise parse and lay them out.
+  const requestPrimaryEligible = input.imageCount === 0;
   const requestPrimary = input.features.requestInjectionPrimary && requestPrimaryEligible;
-  const requestCdpPrimaryEligible = requestPrimaryEligible && !input.reuseConversation;
+  // The CDP writer still pauses every intercepted request, so it keeps the previous exclusions.
+  const requestCdpPrimaryEligible = requestPrimaryEligible
+    && !input.reuseConversation
+    && !input.multipart
+    && !input.compaction;
   // The proven page-fetch writer wins if both experimental flags are accidentally enabled.
   // A turn never has two request-body writers.
   const requestCdpPrimary = !requestPrimary

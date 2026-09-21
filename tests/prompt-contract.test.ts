@@ -207,7 +207,7 @@ test("Bigger Context sends six semantic record envelopes and starts work from th
     expect(stage.acknowledgement).toBe(
       `CODEX_MULTIPART_ACK ${transactionId} ${index + 1}/${CHATGPT_BIGGER_CONTEXT_PARTS} ${stage.sha256}`,
     );
-    expect(stage.text).toContain("```json\n");
+    expect(stage.text).not.toContain("```");
     expect(stage.text).toContain("<codex_multipart_stage_end>");
     expect(stage.text).toEndWith("</codex_multipart_stage_end>");
     expect(stage.text.lastIndexOf(stage.acknowledgement)).toBeGreaterThan(
@@ -464,6 +464,32 @@ test("a long task keeps the newest images and drops the overflow instead of fail
   expect(compiled.text).toContain("older image not attached");
   expect(compiled.text).toContain("step 1");
   expect(compiled.text).toContain("step 13");
+});
+
+test("the same image is attached once even when several context messages carry it", () => {
+  const image = { type: "image" as const, imageUrl: "data:image/png;base64,DUPLICATED" };
+  const replayed: CodexParsedRequest = {
+    modelId: CHATGPT_WEB_MODEL_ID,
+    context: {
+      systemPrompt: ["preserve-system"],
+      messages: [
+        { role: "user" as const, content: [{ type: "text" as const, text: "first" }, image], timestamp: 1 },
+        { role: "user" as const, content: [{ type: "text" as const, text: "second" }, image], timestamp: 2 },
+      ],
+    },
+    stream: true,
+    options: { reasoning: "high" },
+  };
+
+  const compiled = compileChatGptWebPrompt(
+    replayed,
+    { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+  );
+
+  expect(compiled.images).toHaveLength(1);
+  const refs = [...compiled.text.matchAll(/codex-input-image-\d+/g)].map(match => match[0]);
+  expect(refs).toHaveLength(2);
+  expect(new Set(refs).size).toBe(1);
 });
 
 test("Web compaction attaches the newest ten images as files and never embeds their base64 in prompt text", () => {
