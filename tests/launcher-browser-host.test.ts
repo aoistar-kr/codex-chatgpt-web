@@ -138,6 +138,7 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
       conversationKey: "a".repeat(64),
       connectorIdentity: "Codex Native2",
       requireRetainedConversation: true,
+      resumeAvailable: true,
     })).resolves.toEqual({
       surfaceId: "launcher_surface_id_0123456789AB",
       reused: true,
@@ -151,6 +152,7 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
       conversationKey: "a".repeat(64),
       connectorIdentity: "Codex Native2",
       requireRetainedConversation: true,
+      resumeAvailable: true,
     });
     await notifyLauncherTurn(path, {
       phase: "heartbeat",
@@ -310,6 +312,7 @@ test("launcher turn control preserves a missing retained conversation as a typed
       helperPid: process.pid,
       conversationKey: "a".repeat(64),
       requireRetainedConversation: true,
+      resumeAvailable: true,
     }).catch(caught => caught);
     expect(error).toBeInstanceOf(LauncherRetainedConversationUnavailableError);
     expect(error.message).toContain("retained source missing");

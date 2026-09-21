@@ -373,6 +373,8 @@ export type LauncherTurnActivity =
       conversationKey?: string;
       connectorIdentity?: string;
       requireRetainedConversation?: boolean;
+      /** The browser worker can construct a continuation prompt for a submitted retained turn. */
+      resumeAvailable?: boolean;
       modelId?: string;
       reasoning?: string;
     }

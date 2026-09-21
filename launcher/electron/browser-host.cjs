@@ -1773,6 +1773,7 @@ class BrowserHost {
     requireRetainedConversation = false,
     modelId,
     reasoning,
+    resumeAvailable = false,
   ) {
     if (this.manualOperation) {
       throw new Error(`ChatGPT browser is busy with ${this.manualOperation}`);
@@ -1796,9 +1797,21 @@ class BrowserHost {
     if (retainedMatches.length > 1) {
       throw new Error(`ChatGPT retained conversation ${conversationKey} owns multiple browser tabs`);
     }
-    const exactRetained = retainedMatches[0];
+    let exactRetained = retainedMatches[0];
     if (sameTrace?.status === "ready" && sameTrace !== exactRetained) {
       throw new Error(`ChatGPT browser turn ${traceId} is retained under different conversation metadata`);
+    }
+    if (exactRetained && exactRetained.unsubmitted !== true && !resumeAvailable) {
+      if (sameTrace === exactRetained) {
+        throw new Error(`ChatGPT browser turn ${traceId} has no continuation prompt for its submitted retained tab`);
+      }
+      this.logger.info("browser.retained_tab_released", {
+        tabId: exactRetained.id,
+        traceId,
+        reason: "continuation_unavailable",
+      });
+      this.removeTurnTab(exactRetained, false);
+      exactRetained = undefined;
     }
     if (!requireRetainedConversation && !exactRetained) {
       const hot = BrowserHost.prototype.findHotTemporarySurface.call(this, connectorIdentity);

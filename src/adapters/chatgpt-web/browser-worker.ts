@@ -5014,6 +5014,7 @@ export class ChatGptBrowserWorker {
         ? { connectorIdentity: this.config.appName }
         : {}),
       ...(turn.requireRetainedConversation ? { requireRetainedConversation: true } : {}),
+      resumeAvailable: turn.prepareResume !== undefined,
       modelId: turn.modelId,
       ...(turn.reasoning ? { reasoning: turn.reasoning } : {}),
     }).catch(error => {

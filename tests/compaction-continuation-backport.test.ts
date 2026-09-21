@@ -4,11 +4,12 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { rememberCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
 import {
+  extractChatGptTurnUserRevision,
   extractChatGptTurnIdentity,
   isChatGptCompactionContinuation,
 } from "../src/adapters/chatgpt-web/environment";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
-import { encodeCompactionSummary } from "../src/responses/compaction";
+import { encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import type { CodexParsedRequest } from "../src/types";
 
 const roots: string[] = [];
@@ -20,7 +21,7 @@ const threadId = "01a06c66-4232-7ae1-9108-69b5f70e0671";
 const turnId = "01a06c66-4380-75c6-a0df-318f890ef6de";
 const oldTurnId = "01a06c66-0000-75c6-a0df-318f890ef6de";
 
-function fixture(environmentRoot?: string) {
+function fixture(environmentRoot?: string, summary = "Verified compacted state") {
   const codexHome = mkdtempSync(join(tmpdir(), "cgw-compaction-authority-"));
   roots.push(codexHome);
   const cwd = resolve(environmentRoot ?? codexHome, "workspace");
@@ -43,7 +44,6 @@ function fixture(environmentRoot?: string) {
     request_kind: "turn", thread_id: threadId, turn_id: turnId, agent_name: "/root",
     sandbox_mode: "danger-full-access", workspaces: { [cwd]: { has_changes: true } },
   };
-  const summary = "Verified compacted state";
   const parsed: CodexParsedRequest = {
     modelId: "chatgpt-web/high", stream: false,
     context: { messages: [{ role: "user", content: "Continue the original task", timestamp: 1 }] },
@@ -68,7 +68,16 @@ function fixture(environmentRoot?: string) {
       sandbox_policy: { type: "danger-full-access" }, permission_profile: { type: "disabled" },
     } }),
   ].join("\n") + "\n");
-  return { codexHome, cwd, parsed, currentEnvironment };
+  return { codexHome, cwd, parsed, currentEnvironment, summary };
+}
+
+function replaceCompactionWithReadableSummary(parsed: CodexParsedRequest, text: string): void {
+  const input = (parsed._rawBody as { input: unknown[] }).input;
+  input[input.length - 1] = {
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text }],
+  };
 }
 
 test("exact completed compaction continuation re-authenticates cwd and sandbox from the current rollout", () => {
@@ -77,6 +86,36 @@ test("exact completed compaction continuation re-authenticates cwd and sandbox f
   expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(parsed)).toMatchObject({
     cwd, roots: [cwd], writableRoots: [cwd], sandboxPolicy: { type: "dangerFullAccess" },
   });
+});
+
+test.each([
+  ["native v1", "\n"],
+  ["transparent v2", "\n\n"],
+])("%s readable summary re-authenticates the exact completed compaction", (_shape, separator) => {
+  const { codexHome, cwd, parsed, summary } = fixture();
+  replaceCompactionWithReadableSummary(parsed, `${SUMMARY_PREFIX}${separator}${summary}`);
+
+  expect(isChatGptCompactionContinuation(parsed)).toBeTrue();
+  expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(parsed)).toMatchObject({
+    cwd, roots: [cwd], writableRoots: [cwd], sandboxPolicy: { type: "dangerFullAccess" },
+  });
+});
+
+test("transparent v2 preserves an intentional leading newline in the summary", () => {
+  const summary = "\nVerified compacted state with a leading newline";
+  const { parsed } = fixture(undefined, summary);
+  replaceCompactionWithReadableSummary(parsed, `${SUMMARY_PREFIX}\n\n${summary}`);
+
+  expect(isChatGptCompactionContinuation(parsed)).toBeTrue();
+});
+
+test("readable compaction continuation rejects a modified summary", () => {
+  const { parsed, summary } = fixture();
+  replaceCompactionWithReadableSummary(parsed, `${SUMMARY_PREFIX}\n\n${summary} modified`);
+
+  expect(isChatGptCompactionContinuation(parsed)).toBeFalse();
+  expect(() => extractChatGptTurnUserRevision(parsed))
+    .toThrow("conflicts with native Codex turn_id metadata");
 });
 
 test("compaction continuation rejects a current environment claim that disagrees with the native rollout", () => {

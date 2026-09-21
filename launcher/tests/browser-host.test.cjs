@@ -2040,6 +2040,10 @@ test("a later provider round reuses only its exact connector-bound conversation"
     222,
     conversationKey,
     "Codex Native2",
+    false,
+    undefined,
+    undefined,
+    true,
   );
 
   assert.deepEqual(lease, {
@@ -2758,12 +2762,79 @@ test("an exact retained conversation wins over a hot Temporary Chat surface", ()
     222,
     conversationKey,
     "Codex Native2",
+    false,
+    undefined,
+    undefined,
+    true,
   );
 
   assert.equal(lease.tabId, "retained");
   assert.equal(lease.reused, true);
   assert.equal(hot.status, "ready");
   assert.equal(hot.hotTemporarySurface, true);
+});
+
+test("a submitted retained conversation is released when the new turn has no continuation prompt", () => {
+  const conversationKey = "9".repeat(64);
+  const retained = {
+    id: "retained-no-resume", traceId: "trace_old", surfaceId: "surface-retained",
+    helperPid: 111, conversationKey, connectorIdentity: "Codex Native2", connectorBound: true,
+    status: "ready", loading: false,
+    view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {} } },
+  };
+  const hot = {
+    id: "hot-no-resume", traceId: "hot_unused", surfaceId: "surface-hot",
+    status: "ready", hotTemporarySurface: true, conversationKey: undefined,
+    connectorIdentity: undefined, bootstrapReady: true, rendererReady: true, loading: false,
+    view: { webContents: {
+      isDestroyed: () => false,
+      setBackgroundThrottling() {},
+      getURL: () => "https://chatgpt.com/?temporary-chat=true",
+    } },
+  };
+  const released = [];
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    manualOperation: null,
+    turnTabs: new Map([[retained.id, retained], [hot.id, hot]]),
+    userCancelledTurnOwners: new Map(),
+    findHotTemporarySurface: () => hot,
+    removeTurnTab(tab, abortRunning) {
+      released.push([tab.id, abortRunning]);
+      this.turnTabs.delete(tab.id);
+    },
+    show() {}, syncViewVisibility() {}, publishState() {}, writeDescriptor() {},
+    snapshot: () => ({ tabs: [] }), logger: { info() {} },
+  });
+
+  const lease = BrowserHost.prototype.beginTurn.call(
+    fixture, "trace_new", false, 222, conversationKey, "Codex Native2",
+  );
+
+  assert.deepEqual(released, [[retained.id, false]]);
+  assert.equal(lease.tabId, hot.id);
+  assert.equal(lease.reused, false);
+  assert.equal(fixture.turnTabs.has(retained.id), false);
+});
+
+test("a same-trace submitted retained conversation is never replayed without a continuation prompt", () => {
+  const conversationKey = "8".repeat(64);
+  const retained = {
+    id: "retained-same-trace", traceId: "trace_same", surfaceId: "surface-retained",
+    helperPid: 111, conversationKey, connectorIdentity: "Codex Native2", connectorBound: true,
+    status: "ready",
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    manualOperation: null, turnTabs: new Map([[retained.id, retained]]),
+    userCancelledTurnOwners: new Map(), logger: { info() {} },
+  });
+
+  assert.throws(
+    () => BrowserHost.prototype.beginTurn.call(
+      fixture, retained.traceId, false, 222, conversationKey, "Codex Native2",
+    ),
+    /no continuation prompt/,
+  );
+  assert.equal(fixture.turnTabs.get(retained.id), retained);
 });
 
 test("active-turn hot replacement hydration is admitted only for exactly one running turn", async () => {
@@ -3045,6 +3116,9 @@ test("a required retained conversation fails before creating a browser tab", () 
       false,
       222,
       "d".repeat(64),
+      undefined,
+      true,
+      undefined,
       undefined,
       true,
     ),

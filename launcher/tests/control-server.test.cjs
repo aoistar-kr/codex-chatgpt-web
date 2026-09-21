@@ -63,6 +63,7 @@ test("browser control server authenticates and owns turn visibility", async () =
         conversationKey: "a".repeat(64),
         connectorIdentity: "Codex Native2",
         requireRetainedConversation: true,
+        resumeAvailable: true,
       }),
     });
     assert.equal(start.status, 200);
@@ -140,6 +141,9 @@ test("browser control server authenticates and owns turn visibility", async () =
         "a".repeat(64),
         "Codex Native2",
         true,
+        undefined,
+        undefined,
+        true,
       ],
       ["heartbeat", "abcdef123456", process.pid, true],
       ["stop", "abcdef123456", process.pid],
@@ -176,6 +180,7 @@ test("browser control server reports a missing retained conversation as a typed 
         helperPid: process.pid,
         conversationKey: "a".repeat(64),
         requireRetainedConversation: true,
+        resumeAvailable: true,
       }),
     });
     assert.equal(response.status, 409);
@@ -267,6 +272,11 @@ test("browser control server rejects malformed retained-conversation contracts",
   try {
     assert.equal((await post({ conversationKey: "ABC" })).status, 400);
     assert.equal((await post({ requireRetainedConversation: true })).status, 400);
+    assert.equal((await post({
+      conversationKey: "a".repeat(64),
+      requireRetainedConversation: true,
+    })).status, 400);
+    assert.equal((await post({ resumeAvailable: "yes" })).status, 400);
     assert.equal((await post({ connectorIdentity: "Codex Native2" })).status, 400);
   } finally {
     await server.close();

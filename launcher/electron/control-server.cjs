@@ -157,6 +157,15 @@ class BrowserControlServer {
       if (body.requireRetainedConversation === true && body.conversationKey === undefined) {
         throw new Error("requireRetainedConversation requires conversationKey");
       }
+      if (body.resumeAvailable !== undefined && typeof body.resumeAvailable !== "boolean") {
+        throw new Error("resumeAvailable is invalid");
+      }
+      if (body.resumeAvailable !== undefined && request.url !== "/v1/turn/start") {
+        throw new Error("resumeAvailable is only valid for a turn start");
+      }
+      if (body.requireRetainedConversation === true && body.resumeAvailable !== true) {
+        throw new Error("requireRetainedConversation requires resumeAvailable");
+      }
       if (body.modelId !== undefined
         && (typeof body.modelId !== "string" || !body.modelId.trim() || body.modelId.length > 128)) {
         throw new Error("modelId is invalid");
@@ -196,18 +205,17 @@ class BrowserControlServer {
             reasoning: body.reasoning,
           });
         }
-        const beginArgs = [
+        const lease = host.beginTurn(
           body.traceId,
           preferences.showBrowserDuringTurns === true,
           body.helperPid,
           body.conversationKey,
           body.connectorIdentity,
           body.requireRetainedConversation === true,
-        ];
-        if (body.modelId !== undefined || body.reasoning !== undefined) {
-          beginArgs.push(body.modelId, body.reasoning);
-        }
-        const lease = host.beginTurn(...beginArgs);
+          body.modelId,
+          body.reasoning,
+          body.resumeAvailable === true,
+        );
         this.logger.info("browser.turn_started", { traceId: body.traceId });
         writeJson(response, 200, { ok: true, ...lease });
         return;

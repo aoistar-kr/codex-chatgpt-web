@@ -60,7 +60,12 @@ export function isAcceptedCompactionContinuation(
     const text = typeof item.content === "string" ? item.content : Array.isArray(item.content)
       ? item.content.map(part => part?.text ?? "").join("\n") : "";
     if (isReadableCompactionSummaryText(text)) {
-      return acceptsSummary(key, checkpoint, text.slice(SUMMARY_PREFIX.length + 1));
+      const summary = text.slice(SUMMARY_PREFIX.length + 1);
+      if (acceptsSummary(key, checkpoint, summary)) return true;
+      // Native v1 uses one newline after the prefix, while transparent v2 replay uses two.
+      // Compare both producer-defined shapes against the exact checkpoint hash instead of
+      // trimming arbitrary whitespace or guessing from the text alone.
+      return summary.startsWith("\n") && acceptsSummary(key, checkpoint, summary.slice(1));
     }
   }
   return false;
