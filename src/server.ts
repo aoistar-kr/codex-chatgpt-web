@@ -12,6 +12,7 @@ import {
   ChatGptTurnInterruptedError,
   ChatGptWebAdapterError,
   chatGptBrowserTabClosedError,
+  chatGptFollowUpRoundMissingError,
 } from "./adapters/chatgpt-web/adapter-error";
 import {
   CHATGPT_TURN_REVISION_CONFLICT_MESSAGE,
@@ -952,6 +953,44 @@ export function startServer(
           cancelled_http_turns: httpCancellation.cancelled,
           cancelled_browser_turns: browserCancellation.cancelled,
           cancelled_compaction_runs: compactionCancellation.cancelled,
+        });
+      }
+      if (req.method === "POST" && url.pathname === "/admin/retire-turn") {
+        if (!controlAuthorized(req)) return new Response("Unauthorized", { status: 401 });
+        let identity: NativeCodexTurnIdentity;
+        try {
+          const body = await req.json() as { threadId?: unknown; turnId?: unknown };
+          const threadId = typeof body?.threadId === "string" ? body.threadId.trim() : "";
+          const turnId = typeof body?.turnId === "string" ? body.turnId.trim() : "";
+          if (!/^[A-Za-z0-9_-]{6,128}$/.test(threadId) || !/^[A-Za-z0-9_-]{6,128}$/.test(turnId)) {
+            throw new Error("native Codex threadId or turnId is invalid");
+          }
+          identity = { threadId, turnId };
+        } catch (error) {
+          return Response.json(
+            { status: "error", error: error instanceof Error ? error.message : String(error) },
+            { status: 400 },
+          );
+        }
+        // The outer Codex turn is over. A browser turn that is still waiting for the tool results of
+        // an emitted batch can never be resumed, so it must stop holding the ChatGPT surface and its
+        // turn token while the app waits for a follow-up round that will never arrive.
+        const retirement = chatGptTurnSessions.retireWaitingForFollowUp(
+          identity.threadId,
+          identity.turnId,
+          chatGptFollowUpRoundMissingError(),
+        );
+        if (retirement.retired > 0) {
+          console.info(
+            `[chatgpt-web] retired ${retirement.retired} browser turn(s) still waiting for the tool`
+            + ` results of native turn ${identity.turnId}`,
+          );
+        }
+        await retirement.settlement;
+        return Response.json({
+          status: "ok",
+          retired_browser_turns: retirement.retired,
+          ...activity(),
         });
       }
       if (req.method === "POST" && url.pathname === "/admin/steer-turn") {

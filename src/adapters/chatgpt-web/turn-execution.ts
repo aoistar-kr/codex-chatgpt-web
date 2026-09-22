@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { AdapterEvent, CodexOutputTextAnnotation, CodexParsedRequest } from "../../types";
 import type { BrokerToolRequest } from "./turn-broker";
-import { ChatGptSteeringUnavailableError, chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
+import { ChatGptSteeringUnavailableError, chatGptBrowserTabClosedError, chatGptFollowUpRoundMissingError, chatGptTurnSupersededError } from "./adapter-error";
 import {
   chatGptTurnUserRevisionHistory,
   extractChatGptCompactionSourceRevision,
@@ -815,6 +815,17 @@ export class ChatGptTurnSession {
       : Math.max(0, now - this.lastToolResultsSettledAt);
   }
 
+  /**
+   * Milliseconds the emitted tool batch has been waiting for the outer Codex's follow-up round. A
+   * batch whose follow-up never arrives has no consumer left: the outer turn was aborted, replaced
+   * or lost, so nothing can ever deliver those tool results.
+   */
+  followUpWaitMs(now = performance.now()): number | undefined {
+    return this.outstandingToolBatchTiming === undefined
+      ? undefined
+      : Math.max(0, now - this.outstandingToolBatchTiming.emittedAt);
+  }
+
   setOutstanding(
     requests: BrokerToolRequest[],
     reasoning: string[] = [],
@@ -1006,6 +1017,12 @@ export class ChatGptTurnSessions {
   constructor(
     private readonly ttlMs = 30 * 60_000,
     private readonly maxEntries = 256,
+    /**
+     * An active browser turn that emitted a tool batch and never received the outer Codex's
+     * follow-up round is a zombie. It is retired once this much time has passed without the
+     * follow-up, which keeps the registry from holding the surface until the process restarts.
+     */
+    private readonly followUpTimeoutMs = 10 * 60_000,
   ) {}
 
   getOrCreate(
@@ -1317,6 +1334,32 @@ export class ChatGptTurnSessions {
     return { cancelled: matches.length, settlement };
   }
 
+  /**
+   * The outer Codex turn is over, so a browser turn for it that is still waiting for the tool
+   * results of an emitted batch can never be resumed. Retiring only those sessions keeps an ordinary
+   * completed turn and its retained conversation untouched.
+   */
+  retireWaitingForFollowUp(
+    threadId: string,
+    turnId: string,
+    reason: Error,
+  ): { retired: number; settlement: Promise<void> } {
+    const matches = [...this.entries].filter(([, session]) => (
+      session.nativeThreadId === threadId
+      && session.nativeTurnId === turnId
+      && session.outstanding().length > 0
+    ));
+    for (const [key, session] of matches) {
+      if (this.entries.get(key) !== session) continue;
+      this.entries.delete(key);
+      this.forgetConversationHead(session);
+    }
+    const settlement = Promise.all(
+      matches.map(([key, session]) => this.beginRetirement(key, session, reason)),
+    ).then(() => undefined);
+    return { retired: matches.length, settlement };
+  }
+
   steerNativeTurn(
     threadId: string,
     turnId: string,
@@ -1359,7 +1402,15 @@ export class ChatGptTurnSessions {
   private prune(): void {
     const cutoff = Date.now() - this.ttlMs;
     for (const [key, session] of this.entries) {
-      if (session.isActive() || session.lastUsedAt() >= cutoff) continue;
+      if (session.isActive()) {
+        const waited = session.followUpWaitMs();
+        if (waited === undefined || waited < this.followUpTimeoutMs) continue;
+        session.cancel(chatGptFollowUpRoundMissingError());
+        this.entries.delete(key);
+        this.forgetConversationHead(session);
+        continue;
+      }
+      if (session.lastUsedAt() >= cutoff) continue;
       session.cancel();
       this.entries.delete(key);
       this.forgetConversationHead(session);

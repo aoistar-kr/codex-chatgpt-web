@@ -1085,6 +1085,91 @@ test("structured compact rebuilds canonical context when its retained browser di
   }
 });
 
+test("an ended native turn retires only the browser turn still waiting for its tool results", async () => {
+  const sessions = new ChatGptTurnSessions();
+  let settleWaiting!: () => void;
+  const waitingSettlement = new Promise<void>(resolve => { settleWaiting = resolve; });
+  const runtime = (settlement: Promise<void>, cancellations: { count: number }) => ({
+    mode: "read-only" as const,
+    browser: Promise.resolve("answer"),
+    physicalSettlement: settlement,
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel() { cancellations.count += 1; },
+  });
+
+  const waitingCancellations = { count: 0 };
+  const idleCancellations = { count: 0 };
+  const waiting = sessions.getOrCreate(
+    "waiting",
+    () => runtime(waitingSettlement, waitingCancellations),
+    "trace_waiting",
+    "owner",
+    "turn_shared",
+    "thread_shared",
+  );
+  waiting.setOutstanding([{
+    callId: "call_waiting",
+    wireName: "exec_command",
+    freeform: false,
+    arguments: { cmd: "cmd.exe /d /c echo hi" },
+  }]);
+  sessions.getOrCreate(
+    "idle",
+    () => runtime(Promise.resolve(), idleCancellations),
+    "trace_idle",
+    "owner",
+    "turn_shared",
+    "thread_shared",
+  );
+
+  const retirement = sessions.retireWaitingForFollowUp(
+    "thread_shared",
+    "turn_shared",
+    new Error("the outer Codex turn ended before its tool results returned"),
+  );
+  expect(retirement.retired).toBe(1);
+  expect(sessions.find("waiting")).toBeUndefined();
+  // A turn that is not waiting for tool results is not a zombie and keeps its retained surface.
+  expect(sessions.find("idle")).toBeDefined();
+  expect(waitingCancellations.count).toBe(1);
+  expect(idleCancellations.count).toBe(0);
+  settleWaiting();
+  await retirement.settlement;
+  sessions.clear();
+});
+
+test("a tool batch with no follow-up round is retired once the follow-up window passes", async () => {
+  const followUpTimeoutMs = 60_000;
+  const sessions = new ChatGptTurnSessions(30 * 60_000, 256, followUpTimeoutMs);
+  const runtime = () => ({
+    mode: "read-only" as const,
+    browser: Promise.resolve("answer"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel() {},
+  });
+  const batch = [{
+    callId: "call_stale",
+    wireName: "exec_command",
+    freeform: false,
+    arguments: { cmd: "cmd.exe /d /c echo hi" },
+  }];
+  const stale = sessions.getOrCreate("stale", runtime, "trace_stale", "owner");
+  stale.setOutstanding(batch, [], [], performance.now() - followUpTimeoutMs - 1_000);
+  expect(sessions.find("stale")).toBeDefined();
+
+  // The registry sweeps on its next access, so a batch whose follow-up never arrived is retired
+  // instead of holding the ChatGPT surface, while a batch still inside its window survives.
+  const fresh = sessions.getOrCreate("fresh", runtime, "trace_fresh", "owner");
+  fresh.setOutstanding(batch, [], [], performance.now());
+  expect(sessions.find("stale")).toBeUndefined();
+  expect(sessions.find("fresh")).toBeDefined();
+  expect(sessions.activeCount()).toBe(1);
+  sessions.clear();
+});
+
 test("a disappeared retained source cannot leave its fresh compaction rebuild past the shared deadline", async () => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-stale-retained-deadline-"));
   const provider: CodexProviderConfig = {

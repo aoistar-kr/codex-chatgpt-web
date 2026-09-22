@@ -6,7 +6,7 @@ import {
   discoverManagedCodexCliCandidates,
   resolveOriginalCodexCli,
 } from "../src/codex-cli-resolver";
-import { parseCodexProxyControlFrame } from "../src/codex-stdio-proxy";
+import { parseCodexProxyControlFrame, parseCodexTurnTerminalFrame } from "../src/codex-stdio-proxy";
 
 const threadId = "01a0a9e1-5e11-7453-8b94-87d7a7857831";
 const turnId = "01a0aace-2eb6-74c0-bb6c-ec6fd37ab6a7";
@@ -140,5 +140,29 @@ describe("Codex stdio active-turn control proxy", () => {
       method: "turn/steer",
       params: { threadId, expectedTurnId: turnId, input: [{ type: "localImage", path: "x" }] },
     }))).toBeUndefined();
+  });
+
+  test("observes the app-server terminal turn frame so the daemon can retire a stalled follow-up", () => {
+    // An interrupted turn ends exactly like a completed one, and both mean no tool-result round is
+    // coming back, so the browser turn waiting for it must be retired.
+    for (const status of ["completed", "interrupted", "failed"]) {
+      expect(parseCodexTurnTerminalFrame(JSON.stringify({
+        method: "turn/completed",
+        params: { threadId, turn: { id: turnId, status } },
+      }))).toEqual({ kind: "retire", payload: { threadId, turnId } });
+    }
+    expect(parseCodexTurnTerminalFrame(JSON.stringify({
+      method: "turn/started",
+      params: { threadId, turn: { id: turnId } },
+    }))).toBeUndefined();
+    expect(parseCodexTurnTerminalFrame(JSON.stringify({
+      method: "item/agentMessage/delta",
+      params: { threadId, turnId, delta: "still working" },
+    }))).toBeUndefined();
+    expect(parseCodexTurnTerminalFrame(JSON.stringify({
+      method: "turn/completed",
+      params: { threadId: "short", turn: { id: turnId } },
+    }))).toBeUndefined();
+    expect(parseCodexTurnTerminalFrame("not json")).toBeUndefined();
   });
 });

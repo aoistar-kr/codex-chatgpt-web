@@ -75,6 +75,23 @@ export function chatGptBrowserTabClosedError(): ChatGptWebAdapterError {
   );
 }
 
+/**
+ * The outer Codex turn ended while its browser turn was still waiting for the tool results of an
+ * emitted batch. The follow-up round that would deliver those results can never arrive, so the
+ * browser turn is retired instead of holding the ChatGPT surface and its turn token hostage.
+ */
+export function chatGptFollowUpRoundMissingError(): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError(
+    "The Codex turn ended before its ChatGPT tool results returned, so the browser turn was retired.",
+    {
+      status: 499,
+      errorType: "client_closed_request",
+      code: "follow_up_round_missing",
+      retryable: false,
+    },
+  );
+}
+
 export function chatGptStoppedThinkingError(): ChatGptWebAdapterError {
   return new ChatGptWebAdapterError(
     // Our fork classifies a persistent 'Stopped thinking' as a terminal cancelled turn: Codex must

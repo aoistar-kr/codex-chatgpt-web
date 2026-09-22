@@ -19,7 +19,8 @@ export type CodexProxyControlFrame =
         content: Array<{ type: "input_text" | "text"; text: string }>;
       };
     }
-  | { kind: "interrupt"; payload: { threadId: string; turnId: string } };
+  | { kind: "interrupt"; payload: { threadId: string; turnId: string } }
+  | { kind: "retire"; payload: { threadId: string; turnId: string } };
 
 const IDENTIFIER = /^[A-Za-z0-9_-]{6,128}$/;
 
@@ -69,6 +70,27 @@ export function parseCodexProxyControlFrame(line: string): CodexProxyControlFram
   };
 }
 
+/**
+ * The app-server reports every native turn's terminal state on stdout. Once a native turn is over, a
+ * browser turn that is still waiting for that turn's tool results has no consumer left, so the daemon
+ * is told to retire it instead of holding the ChatGPT surface until the process restarts.
+ */
+export function parseCodexTurnTerminalFrame(line: string): CodexProxyControlFrame | undefined {
+  let message: Record<string, unknown> | undefined;
+  try { message = object(JSON.parse(line)); } catch { return undefined; }
+  if (!message || message.method !== "turn/completed") return undefined;
+  const params = object(message.params);
+  const turn = params ? object(params.turn) : undefined;
+  const threadId = params && typeof params.threadId === "string" ? params.threadId.trim() : "";
+  const turnId = turn && typeof turn.id === "string" ? turn.id.trim() : "";
+  if (!IDENTIFIER.test(threadId) || !IDENTIFIER.test(turnId)) return undefined;
+  return { kind: "retire", payload: { threadId, turnId } };
+}
+
+function reportControlError(error: unknown): void {
+  process.stderr.write(`codex-webgpt-proxy: ${error instanceof Error ? error.message : String(error)}\n`);
+}
+
 function configPath(): string {
   const explicit = process.env.CODEX_CHATGPT_WEB_HOME;
   const home = explicit ? resolve(explicit) : join(process.env.USERPROFILE ?? process.env.HOME ?? "", ".codex-chatgpt-web");
@@ -90,7 +112,7 @@ function loadProxyConfig(): ProxyConfig {
 
 async function postControl(frame: CodexProxyControlFrame): Promise<void> {
   const config = loadProxyConfig();
-  const path = frame.kind === "steer" ? "steer-turn" : "interrupt-turn";
+  const path = frame.kind === "steer" ? "steer-turn" : frame.kind === "retire" ? "retire-turn" : "interrupt-turn";
   const deadline = Date.now() + 1_500;
   do {
     const response = await fetch(`http://${config.host}:${config.port}/admin/${path}`, {
@@ -106,7 +128,7 @@ async function postControl(frame: CodexProxyControlFrame): Promise<void> {
       const detail = (await response.text()).replace(/[\r\n]+/g, " ").slice(0, 512);
       throw new Error(`WebGPT ${frame.kind} control returned HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
     }
-    if (frame.kind === "interrupt") return;
+    if (frame.kind === "interrupt" || frame.kind === "retire") return;
     const result = await response.json() as { accepted_browser_turns?: unknown };
     if (result.accepted_browser_turns === 1) return;
     if (result.accepted_browser_turns !== 0 || Date.now() >= deadline) {
@@ -139,9 +161,7 @@ async function run(): Promise<number> {
       const frame = parseCodexProxyControlFrame(line);
       if (frame) {
         try { await postControl(frame); }
-        catch (error) {
-          process.stderr.write(`codex-webgpt-proxy: ${error instanceof Error ? error.message : String(error)}\n`);
-        }
+        catch (error) { reportControlError(error); }
       }
       child.stdin.write(wireLine);
     }
@@ -155,7 +175,24 @@ async function run(): Promise<number> {
     if (pending) child.stdin.write(pending);
     child.stdin.end();
   })();
-  const stdout = (async () => { for await (const chunk of child.stdout) process.stdout.write(chunk); })();
+  // The app-server's bytes are forwarded untouched; a decoded copy is inspected only for terminal
+  // turn notifications, and that control call never blocks the app's stdout.
+  const stdoutDecoder = new TextDecoder();
+  const stdout = (async () => {
+    let inspected = "";
+    for await (const chunk of child.stdout) {
+      process.stdout.write(chunk);
+      inspected += stdoutDecoder.decode(chunk, { stream: true });
+      for (;;) {
+        const newline = inspected.indexOf("\n");
+        if (newline < 0) break;
+        const line = inspected.slice(0, newline).replace(/\r$/, "");
+        inspected = inspected.slice(newline + 1);
+        const frame = parseCodexTurnTerminalFrame(line);
+        if (frame) void postControl(frame).catch(reportControlError);
+      }
+    }
+  })();
   const stderr = (async () => { for await (const chunk of child.stderr) process.stderr.write(chunk); })();
   const terminate = () => { try { child.kill(); } catch {} };
   process.once("SIGINT", terminate);
