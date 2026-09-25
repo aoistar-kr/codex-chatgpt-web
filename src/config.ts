@@ -427,8 +427,8 @@ function parseConfig(value: unknown, path: string): AppConfig {
   }
   const solAvailable = parsed.solAvailable !== false;
   const proAvailable = parsed.proAvailable === true;
-  // Bigger Context is the default transport: the six-part split and its three-times window are
-  // always active, so a stale saved value cannot silently disable them.
+  // Bigger Context is the default transport. Its three-part request transport is always active,
+  // so a stale saved value cannot silently disable it.
   const experimentalBiggerContext = true;
   if (parsed.experimentalSkillAttachments !== undefined
     && typeof parsed.experimentalSkillAttachments !== "boolean") {

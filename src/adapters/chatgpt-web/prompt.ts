@@ -44,12 +44,10 @@ export interface CompileChatGptWebPromptOptions {
   retainedContinuation?: "steering";
 }
 
-// Our browser path stages three parts; upstream moved to six. The helper below derives from this
-// constant so the planner, usage accounting and the browser-side limit check stay in agreement.
-// Six-part staging only: the planner, usage accounting, the browser-side limit check and the
-// launcher's staging loop all derive from this constant. The Codex-facing effort routing is
-// deliberately unchanged.
-export const CHATGPT_BIGGER_CONTEXT_PARTS = 6 as const;
+// Keep multipart transport at three total requests. The planner, usage accounting, browser-side
+// limit check and launcher's staging loop all derive from this constant, so compaction uses two
+// inert stages and one final commit without a separate request-count policy.
+export const CHATGPT_BIGGER_CONTEXT_PARTS = 3 as const;
 export type ChatGptWebMultipartPartCount = 2 | typeof CHATGPT_BIGGER_CONTEXT_PARTS;
 export type ChatGptWebMultipartParts = readonly string[];
 
@@ -122,7 +120,7 @@ export function formatChatGptWebMultipartCommit(
   assertMultipartTransactionId(transactionId);
   const totalParts = multipart.parts.length;
   if (!isChatGptWebMultipartPartCount(totalParts)) {
-    throw new Error("ChatGPT multipart commit requires two or six context parts");
+    throw new Error("ChatGPT multipart commit requires two or three context parts");
   }
   const manifest = multipart.parts.map((payload, index) => (
     `${index + 1}/${totalParts}:${createHash("sha256").update(payload).digest("hex")}`
@@ -482,7 +480,7 @@ export function compileChatGptWebPrompt(
   const multipartParts = options?.experimentalMultipartParts;
   const multipartEnabled = multipartParts !== undefined;
   if (multipartParts !== undefined && !isChatGptWebMultipartPartCount(multipartParts)) {
-    throw new Error("Bigger Context requires two or six context parts");
+    throw new Error("Bigger Context requires two or three context parts");
   }
   if (multipartEnabled && parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID) {
     throw new Error("Bigger Context is unavailable for Luna because its accumulated browser transcript still shares one 28,000-token transport budget");

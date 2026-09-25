@@ -58,7 +58,7 @@ export function chatGptEffortSelectionRequired(
  */
 export function resolveChatGptTurnPlan(input: ChatGptTurnPlanInput): ChatGptTurnPlan {
   // Multipart and compaction are deliberately eligible: their messages are the largest in the
-  // system (compaction always splits into six parts) and typing them into the composer stalls the
+  // system (compaction always splits into three parts) and typing them into the composer stalls the
   // ChatGPT renderer for tens of seconds on real content. The request-body writer keeps those bytes
   // out of the composer, which is the only place the client would otherwise parse and lay them out.
   // Image turns are admitted as well: the writer only swaps the prompt value, and attachments ride

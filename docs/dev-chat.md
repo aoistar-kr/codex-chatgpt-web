@@ -107,7 +107,7 @@ the transport would require a source change, not a preference.
 
 A normal turn stays on the original single-message path while its estimated input is below the
 selected mode's existing auto-compaction threshold. At the first threshold it uses two messages; at
-twice that threshold it uses six messages. The final context part also commits the transaction and
+twice that threshold it uses three messages. The final context part also commits the transaction and
 starts the task, so there is no extra request. The DEV compaction threshold is three times the
 selected mode's base limit.
 
@@ -128,7 +128,7 @@ and waits for its physical launcher settlement before closing the old surface; t
 starts a fresh Temporary Chat. This does not depend on ChatGPT rendering assistant text or a Copy
 action after the control-only response. If the retained private chat was already closed, the bridge
 starts one read-only fallback chat from the canonical Codex history instead. Browser-only mode
-has no retained MCP boundary and uses the six-message compaction path so its summarizer receives
+has no retained MCP boundary and uses the three-message compaction path so its summarizer receives
 the complete expanded history.
 
 Any missing or malformed acknowledgement fails the whole transaction. No later part or final
@@ -137,8 +137,8 @@ and auto-compaction ceilings are reported as 3× while the switch is active, but
 stage must still fit the selected ChatGPT mode's measured one-message boundary.
 
 Small turns use one request. Two-part turns use one inert staging request and one final request;
-six-part turns use five staging requests and one final request. Browser-only compaction also uses
-six parts. Inert stages use the fastest available mode that fits their complete messages; the final
+three-part turns use two staging requests and one final request. Browser-only compaction also uses
+three parts. Inert stages use the fastest available mode that fits their complete messages; the final
 part uses the selected execution effort. Large turns may increase the probability of
 rate limits or a temporary account cooldown. The experiment is intentionally unavailable for Luna:
 Luna's later requests still include the accumulated transcript inside the same measured
