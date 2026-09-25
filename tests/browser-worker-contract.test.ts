@@ -25,7 +25,7 @@ test("completed diagnostic can pass only through the persisted-detail or strict 
   expect(acceptance).toContain("&& metric.equivalentEvidenceMatched && metric.equivalentEvidenceReasons.length === 0");
 });
 import type { Page } from "playwright-core";
-import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCaptureEnabled, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptConnectorAttachmentMode, chatGptEffortSelectionRequired, chatGptNewTurnIdentities, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptRecoverableIncompleteCaptureFailure, chatGptResolveAssistantTurnByStoredMessageIds, chatGptResolveAssistantTurnOwnership, chatGptSameDocumentTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCaptureEnabled, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptConnectorAttachmentMode, chatGptEffortSelectionRequired, chatGptNewTurnIdentities, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptRecoverableIncompleteCaptureFailure, chatGptResolveAssistantTurnByStoredMessageIds, chatGptResolveAssistantTurnOwnership, chatGptSameDocumentTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withBrowserTurnAbort, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserSteeringQueue } from "../src/adapters/chatgpt-web/browser-worker";
 import { ensureChatGptPersonalizedConnectorAccess } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
@@ -3684,6 +3684,50 @@ test("Full mode fails closed when ChatGPT exposes completion without a post-tool
   expect(tracker.update({ ...partialLookingFinal, currentHtml: '<p data-hydrated="true">partial answer</p>' }, 1_999)).toBeFalse();
   expect(() => tracker.update(partialLookingFinal, 2_000))
     .toThrow("completed without producing a final answer after its last Codex tool call");
+});
+
+test("an owned but text-empty pre-tool boundary acknowledges and still gates the post-tool answer", () => {
+  const tracker = new ChatGptCompletionTracker(500, 1_000);
+  // ChatGPT can call a tool before it renders any final-answer text. Once the logical turn is
+  // owned, that empty projection is the observed pre-tool boundary: acknowledging it is the causal
+  // proof the daemon waits for, and refusing it stalled every Codex tool turn until the deadline.
+  expect(tracker.observeToolBatch(1, "")).toBeTrue();
+  const emptyCompletionLooking = {
+    responsePresent: true,
+    running: false,
+    currentText: "",
+    currentHtml: "",
+    completionActionVisible: true,
+  };
+  // The empty prefix itself is never publishable, however complete the response looks.
+  expect(tracker.update(emptyCompletionLooking, 2_000)).toBeFalse();
+  const finalAnswer = {
+    ...emptyCompletionLooking,
+    currentText: "final answer",
+    currentHtml: "<p>final answer</p>",
+  };
+  expect(tracker.update(finalAnswer, 3_000)).toBeFalse();
+  expect(tracker.update(finalAnswer, 3_500)).toBeTrue();
+});
+
+test("an already-aborted browser wait adopts its abandoned operation instead of crashing the helper", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const abandoned = Promise.reject(new Error("late observation failure"));
+  await expect(withBrowserTurnAbort(abandoned, controller.signal))
+    .rejects.toThrow("ChatGPT web turn aborted");
+  // Without adoption this rejection surfaces as an unhandled rejection and terminates the whole
+  // browser helper process mid-turn (observed live as "helper exited with status 1").
+  await Bun.sleep(10);
+});
+
+test("tool-batch acknowledgement follows owned response reads instead of answer text length", () => {
+  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  expect(source).not.toContain("if (boundaryText.trim().length > 0) {");
+  expect(source).not.toContain("if (snapshot.visibleText.trim().length > 0) {");
+  expect(source).toContain("return snapshot.responsePresent ? snapshot.visibleText : undefined;");
+  expect(source).toContain("await externalProgress.acknowledgeToolBatch(progress.lastToolBatchRevision);");
+  expect(source).toContain("void promise.catch(() => {});");
 });
 
 test("a future progress timestamp is not treated as liveness", () => {

@@ -1209,9 +1209,15 @@ function throwIfPromptAttachmentAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new DOMException("ChatGPT prompt attachment aborted", "AbortError");
 }
 
-function withBrowserTurnAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+export function withBrowserTurnAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(new DOMException("ChatGPT web turn aborted", "AbortError"));
+  if (signal.aborted) {
+    // The caller is already unwinding the turn, so nothing can consume this operation any more.
+    // Adopt it here: a later rejection (page close, aborted progress wait) must never surface as an
+    // unhandled rejection and terminate the whole browser helper process.
+    void promise.catch(() => {});
+    return Promise.reject(new DOMException("ChatGPT web turn aborted", "AbortError"));
+  }
   return new Promise<T>((resolvePromise, rejectPromise) => {
     const onAbort = () => rejectPromise(new DOMException("ChatGPT web turn aborted", "AbortError"));
     signal.addEventListener("abort", onAbort, { once: true });
@@ -3152,6 +3158,11 @@ export class ChatGptBrowserWorker {
     });
   }
 
+  /**
+   * Read the owned pre-tool answer boundary. Ownership decides whether this is an observation, not
+   * the text length: a proven turn that has not rendered final-answer text yet is an observed empty
+   * boundary, while bare DOM cardinality is not ownership and must never acknowledge a tool batch.
+   */
   private async currentSubmissionAnswerText(
     page: Page,
     baseline: ChatGptSubmissionBaseline,
@@ -3159,8 +3170,8 @@ export class ChatGptBrowserWorker {
     binding?: ChatGptAssistantTurnBinding,
   ): Promise<string | undefined> {
     if (binding) {
-      const text = (await this.responseDomSnapshot(binding.locator, {})).visibleText;
-      return text.trim().length > 0 ? text : undefined;
+      const snapshot = await this.responseDomSnapshot(binding.locator, {});
+      return snapshot.responsePresent ? snapshot.visibleText : undefined;
     }
     const state = await this.submissionDomState(page, baseline.domCache, signal);
     const identities = chatGptNewTurnIdentities(
@@ -3168,10 +3179,9 @@ export class ChatGptBrowserWorker {
       state.responseIdentities,
     );
     if (identities.length !== 1) return undefined;
-    const identity = identities[0];
-    const locator = page.locator(`[data-turn-id=${JSON.stringify(identity)}]`);
-    const text = (await this.responseDomSnapshot(locator, {})).visibleText;
-    return text.trim().length > 0 ? text : undefined;
+    const locator = page.locator(`[data-turn-id=${JSON.stringify(identities[0])}]`).last();
+    const snapshot = await this.responseDomSnapshot(locator, {});
+    return snapshot.responsePresent ? snapshot.visibleText : undefined;
   }
 
   private async assistantTurnCandidateProvenance(
@@ -3429,14 +3439,14 @@ export class ChatGptBrowserWorker {
         && externalProgress
         && completionTracker?.needsToolBatchObservation(progress.lastToolBatchRevision)) {
         if (identity) {
+          // The matching logical turn is the ownership proof. An empty rendered answer is the
+          // observed pre-tool boundary, so it still acknowledges the batch.
           const boundaryText = (await this.responseDomSnapshot(
             page.locator(`[data-turn-id=${JSON.stringify(identity)}]`).last(),
             {},
           )).visibleText;
-          if (boundaryText.trim().length > 0) {
-            completionTracker.observeToolBatch(progress.lastToolBatchRevision, boundaryText);
-            await externalProgress.acknowledgeToolBatch(progress.lastToolBatchRevision);
-          }
+          completionTracker.observeToolBatch(progress.lastToolBatchRevision, boundaryText);
+          await externalProgress.acknowledgeToolBatch(progress.lastToolBatchRevision);
         }
       }
       if (identity) return {
@@ -4406,7 +4416,9 @@ export class ChatGptBrowserWorker {
       if (externalProgress
         && externalProgressSnapshot
         && completionTracker.needsToolBatchObservation(externalProgressSnapshot.lastToolBatchRevision)) {
-        if (snapshot.visibleText.trim().length > 0) {
+        // A read owned response root is the observation; an empty stage answer still acknowledges
+        // the batch instead of stalling the daemon's causal tool boundary until its 10s deadline.
+        if (snapshot.responsePresent) {
           completionTracker.observeToolBatch(
             externalProgressSnapshot.lastToolBatchRevision,
             snapshot.visibleText,
@@ -6979,7 +6991,9 @@ export class ChatGptBrowserWorker {
         if (turn.externalProgress
           && externalProgressSnapshot
           && completionTracker.needsToolBatchObservation(externalProgressSnapshot.lastToolBatchRevision)) {
-          if (snapshot.visibleText.trim().length > 0) {
+          // The owned response root was read, so its text - including an empty pre-tool answer -
+          // is the real causal boundary. Refusing to acknowledge here stalled every tool turn.
+          if (snapshot.responsePresent) {
             completionTracker.observeToolBatch(
               externalProgressSnapshot.lastToolBatchRevision,
               snapshot.visibleText,
