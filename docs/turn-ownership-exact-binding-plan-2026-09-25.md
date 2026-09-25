@@ -80,6 +80,22 @@ wait only if unchanged, cleaning up the losing waiters.
 This is a design constraint, not a measured end-to-end speed guarantee. Report
 local timing or live timing only when actually measured, and distinguish them.
 
+### Live DOM contract observed 2026-09-26 (supported binding variant)
+
+Measured directly on the running launcher page: a user turn is
+`[data-testid^="conversation-turn-"][data-turn="user"]` whose inner message node carries
+`data-message-id` (the turn UUID). An assistant turn is
+`[data-testid^="conversation-turn-"][data-turn="assistant"]` with
+`data-turn-id="request-WEB:<conversationUuid>-<ordinal>"` and **no `data-message-id` node anywhere
+inside it**. No `[data-message-author-role="assistant"]` node exists in this build.
+
+Consequence: the DOM half of the exact proof can never hydrate for assistant turns. The supported
+contract for such a build is therefore: the capture that bound this exact request (its stream
+identity) plus a single new assistant turn proves ownership, while two or more new turns stay
+ambiguous and pending. A build that does expose assistant message ids keeps the strict hydration
+wait. The tool-batch acknowledgement never waits for the final identity (see the ACK row above);
+one new assistant turn is the observed pre-tool boundary even while exact ownership is pending.
+
 ## Confirmed compaction incident
 
 Canonical rollout evidence shows a completed compaction at 2026-09-25 13:59:42 UTC

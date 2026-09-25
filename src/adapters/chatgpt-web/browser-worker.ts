@@ -1534,6 +1534,12 @@ export type ChatGptAssistantTurnCandidateProvenance = {
   nodeCount: number;
   messageIds: readonly string[];
   rendererCopiesEquivalent?: boolean;
+  /**
+   * True when this ChatGPT build renders the assistant turn without any message-identity node.
+   * The DOM half of the exact proof can then never hydrate, so ownership falls back to the
+   * request-owned stream that bound this exact request.
+   */
+  assistantMessageIdsUnavailable?: boolean;
 };
 
 export function chatGptResolveAssistantTurnOwnership(
@@ -1594,6 +1600,18 @@ export function chatGptResolveAssistantTurnOwnership(
     // Exact request provenance is mandatory only for ambiguous/reused ownership paths. A passive
     // tap that was installed but could not bind a stream must not disable the established single
     // DOM-candidate path for an ordinary fresh turn.
+    return newResponseIdentities[0];
+  }
+  if (exactProofRequired
+    && newResponseIdentities.length === 1
+    && candidates.length === 1
+    && candidates[0]!.nodeCount > 0
+    && candidates[0]!.assistantMessageIdsUnavailable === true
+    && wire?.streamId !== undefined) {
+    // This ChatGPT build renders assistant turns without any DOM message identity, so the DOM half
+    // of the exact proof can never hydrate. The capture that bound this exact request is the
+    // ownership evidence and a single new assistant turn is the only turn it can be. Anything
+    // ambiguous - two or more new turns, or a capture that never bound our request - stays pending.
     return newResponseIdentities[0];
   }
   if (candidateProvenancePending) return undefined;
@@ -3196,6 +3214,14 @@ export class ChatGptBrowserWorker {
         .filter(element => wanted.has(element.getAttribute("data-turn-id") ?? ""));
       return wantedIdentities.map(identity => {
         const matching = roots.filter(element => element.getAttribute("data-turn-id") === identity);
+        const isAssistantTurn = (root: HTMLElement): boolean => (
+          root.getAttribute("data-turn") === "assistant"
+          || root.getAttribute("data-message-author-role") === "assistant"
+          || root.querySelector('[data-message-author-role="assistant"]') !== null
+        );
+        const exposesMessageId = (root: HTMLElement): boolean => (
+          root.hasAttribute("data-message-id") || root.querySelector("[data-message-id]") !== null
+        );
         const idsForRoot = (root: HTMLElement): string[] => [...new Set(
           [root, ...root.querySelectorAll<HTMLElement>("[data-message-id]")]
             .filter(element => {
@@ -3212,7 +3238,17 @@ export class ChatGptBrowserWorker {
         const rendererCopiesEquivalent = copies.length <= 1
           || copies.every(ids => JSON.stringify(ids) === JSON.stringify(copies[0]));
         const messageIds = [...new Set(copies.flat())].sort();
-        return { identity, nodeCount: matching.length, messageIds, rendererCopiesEquivalent };
+        const assistantTurns = matching.filter(isAssistantTurn);
+        const assistantMessageIdsUnavailable = assistantTurns.length > 0
+          && messageIds.length === 0
+          && assistantTurns.every(root => !exposesMessageId(root));
+        return {
+          identity,
+          nodeCount: matching.length,
+          messageIds,
+          rendererCopiesEquivalent,
+          ...(assistantMessageIdsUnavailable ? { assistantMessageIdsUnavailable: true } : {}),
+        };
       });
     }, [...identities]), signal));
   }
@@ -3438,11 +3474,15 @@ export class ChatGptBrowserWorker {
       if (progress
         && externalProgress
         && completionTracker?.needsToolBatchObservation(progress.lastToolBatchRevision)) {
-        if (identity) {
-          // The matching logical turn is the ownership proof. An empty rendered answer is the
-          // observed pre-tool boundary, so it still acknowledges the batch.
+        // Never await the final identity to acknowledge a tool batch. A single new assistant turn
+        // is the observed pre-tool boundary even while exact ownership is still pending; two or
+        // more new turns remain ambiguous and cannot acknowledge anything. An empty rendered
+        // answer is the observed pre-tool boundary, so it still acknowledges the batch.
+        const ackIdentity = identity
+          ?? (newResponseIdentities.length === 1 ? newResponseIdentities[0] : undefined);
+        if (ackIdentity) {
           const boundaryText = (await this.responseDomSnapshot(
-            page.locator(`[data-turn-id=${JSON.stringify(identity)}]`).last(),
+            page.locator(`[data-turn-id=${JSON.stringify(ackIdentity)}]`).last(),
             {},
           )).visibleText;
           completionTracker.observeToolBatch(progress.lastToolBatchRevision, boundaryText);

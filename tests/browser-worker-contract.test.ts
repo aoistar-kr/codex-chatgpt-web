@@ -353,6 +353,48 @@ test("stored direct assistant message ids prove remounts without a live wire cap
   ], ["message-owned"])).toThrow("mapped to multiple response turns");
 });
 
+test("a build without assistant message ids still binds one request-owned turn", () => {
+  // The live ChatGPT DOM renders assistant turns as [data-turn="assistant"] roots that contain no
+  // data-message-id node at all, so the DOM half of the exact proof can never hydrate. The capture
+  // that bound this exact request plus one new assistant turn is then the ownership evidence.
+  const idlessTurn = [{
+    identity: "request-WEB:conversation-2",
+    nodeCount: 1,
+    messageIds: [],
+    assistantMessageIdsUnavailable: true,
+  }];
+  expect(chatGptResolveAssistantTurnOwnership(
+    ["request-WEB:conversation-2"],
+    idlessTurn,
+    { streamId: "stream-owned", complete: false, failed: false },
+    true,
+  )).toBe("request-WEB:conversation-2");
+
+  // A capture that never bound this request cannot prove ownership, so the turn stays pending.
+  expect(chatGptResolveAssistantTurnOwnership(
+    ["request-WEB:conversation-2"],
+    idlessTurn,
+    { complete: false, failed: false },
+    true,
+  )).toBeUndefined();
+
+  // Two new assistant turns stay ambiguous even when the build exposes no message ids.
+  expect(chatGptResolveAssistantTurnOwnership(
+    ["request-WEB:conversation-2", "request-WEB:conversation-3"],
+    [...idlessTurn, { identity: "request-WEB:conversation-3", nodeCount: 1, messageIds: [], assistantMessageIdsUnavailable: true }],
+    { streamId: "stream-owned", complete: false, failed: false },
+    true,
+  )).toBeUndefined();
+
+  // A build that does expose assistant message ids keeps the strict hydration wait.
+  expect(chatGptResolveAssistantTurnOwnership(
+    ["request-WEB:conversation-2"],
+    [{ identity: "request-WEB:conversation-2", nodeCount: 1, messageIds: [] }],
+    { streamId: "stream-owned", complete: false, failed: false },
+    true,
+  )).toBeUndefined();
+});
+
 test("assistant bindings retain direct message identity for same-document and launcher remount proof", () => {
   const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
   expect(source).toContain("ownedAssistantMessageIds: readonly string[];");
