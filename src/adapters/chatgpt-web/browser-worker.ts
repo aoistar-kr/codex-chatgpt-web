@@ -4071,7 +4071,7 @@ export class ChatGptBrowserWorker {
     recordTiming("active_composer");
     const sendButton = composer
       .locator("xpath=ancestor::form[1]")
-      .getByTestId("send-button");
+      .locator('[data-testid="send-button"], button[type="submit"]');
     await sendButton.waitFor({ state: "visible", timeout: browserStageTimeouts.send });
     recordTiming("button_visible");
     const sendEnableDeadline = Date.now() + CHATGPT_SEND_ENABLE_GRACE_MS;
@@ -4759,7 +4759,7 @@ export class ChatGptBrowserWorker {
         + (alerts.length > 0 ? `: ${alerts.join(" | ")}` : ""),
       );
     }
-    const send = composerForm.getByTestId("send-button");
+    const send = composerForm.locator('[data-testid="send-button"], button[type="submit"]');
     const deadline = Date.now() + 60_000;
     while (Date.now() < deadline) {
       if (await send.isEnabled().catch(() => false)) return;

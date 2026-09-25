@@ -6,18 +6,23 @@ export const CHATGPT_COMPOSER_SELECTOR = [
   '[data-testid="prompt-textarea"]',
   "#prompt-textarea",
   '[contenteditable="true"][data-lexical-editor="true"]',
+  '[contenteditable="true"][data-composer-markdown][role="textbox"]',
 ].join(", ");
 export const CHATGPT_EFFORT_CONTROL_SELECTOR = [
   'button[aria-haspopup="menu"][data-tone="neutral"]',
   'button[data-testid="model-switcher-dropdown-button"][aria-haspopup="menu"]',
+  'button[data-codex-intelligence-trigger="true"][aria-haspopup="menu"]',
 ].join(", ");
 export const CHATGPT_EFFORT_MENU_SELECTOR = [
-  '[data-testid="composer-intelligence-picker-content"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider])',
-  '[role="menu"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider])',
-  '[role="group"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider])',
+  '[data-testid="composer-intelligence-picker-content"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider], [data-reasoning-slider])',
+  '[role="menu"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider], [data-reasoning-slider])',
+  '[role="group"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider], [data-reasoning-slider])',
 ].join(", ");
 export const CHATGPT_EFFORT_ITEM_SELECTOR = '[role="menuitemradio"]';
-export const CHATGPT_EFFORT_SLIDER_SELECTOR = '[data-model-reasoning-effort-slider] [role="slider"]';
+export const CHATGPT_EFFORT_SLIDER_SELECTOR = [
+  '[data-model-reasoning-effort-slider] [role="slider"]',
+  '[data-reasoning-slider="true"] [role="slider"]',
+].join(", ");
 
 function effortMenuSelectorForId(menuId: string): string {
   return `[id=${JSON.stringify(menuId)}]`;
