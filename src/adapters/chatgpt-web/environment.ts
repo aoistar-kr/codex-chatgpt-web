@@ -241,6 +241,54 @@ export function extractChatGptCompactionSourceRevision(parsed: CodexParsedReques
   return revision;
 }
 
+/**
+ * `content_item_kinds` values that prove a user-role wire item carries runtime context rather than
+ * a human instruction. Codex marks real human text with `user.text` (or no kinds at all).
+ */
+const COMPACTION_CONTEXT_ITEM_KINDS: ReadonlySet<string> = new Set([
+  "goal.internal_context",
+  "environments.environment_context",
+  "agents_md.instructions",
+  "plugins.recommendations",
+  "skills.selected_skill_instructions",
+]);
+
+function isCompactionContextWrapper(item: Record<string, unknown>): boolean {
+  const text = rawMessageText(item).trim();
+  if (/^<codex_internal_context source="[a-z][a-z0-9_]*">[\s\S]*<\/codex_internal_context>$/.test(text)
+    || /^<goal_context>[\s\S]*<\/goal_context>$/.test(text)) return true;
+  const kinds = record(item.internal_chat_message_metadata_passthrough)?.content_item_kinds;
+  if (!Array.isArray(kinds) || kinds.length === 0) return false;
+  return kinds.every(kind => typeof kind === "string"
+    && (COMPACTION_CONTEXT_ITEM_KINDS.has(kind) || kind.startsWith("additional_content.")));
+}
+
+/**
+ * Select the exact instruction that a remote compaction replacement history retains.
+ *
+ * Compaction-handoff only. The ordinary revision scanner intentionally keeps its current behavior
+ * for goal turns and same-turn context; this narrower seam answers one question: which
+ * producer-defined representation may the immediate continuation authenticate against? Native
+ * compaction removes goal wrappers and metadata-proven context, so the continuation selects the
+ * latest real human/direct-parent instruction instead. Items without provenance are not revisions
+ * here either, exactly like the ordinary scanner.
+ */
+export function extractChatGptCompactionRetainedInstructionRevision(
+  parsed: CodexParsedRequest,
+): ChatGptTurnUserRevision | undefined {
+  const body = record(parsed._rawBody);
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const metadata = clientTurnMetadata(parsed);
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const item = record(input[index]);
+    if (!item || !isUserOrParentInstruction(item, metadata)) continue;
+    if (item.type === "message" && (isTurnAbortedNotice(item) || isCompactionContextWrapper(item))) continue;
+    const revision = userRevision(input[index], undefined, metadata);
+    if (revision) return revision;
+  }
+  return undefined;
+}
+
 /** True only when this exact daemon previously returned the checkpoint for this native turn. */
 export function isChatGptCompactionContinuation(parsed: CodexParsedRequest): boolean {
   const identity = extractChatGptTurnIdentity(parsed);

@@ -13,13 +13,31 @@ import { chatGptWebSocketEncodedItems } from "./websocket-handoff";
 const CHATGPT_CONVERSATION_POST = /^\/backend-api\/(?:f\/)?conversation$/;
 
 type WireEvent =
-  | { type: "start"; streamId: string; url: string; status: number; contentType: string }
+  | {
+      type: "start";
+      streamId: string;
+      url: string;
+      status: number;
+      contentType: string;
+      captureEpoch?: string;
+      bodyTransport?: "init-string" | "request-clone" | "unavailable";
+      provenanceToken?: string;
+      clientUserMessageId?: string;
+      requestConversationId?: string;
+      hasUserMessage?: boolean;
+    }
   | { type: "chunk"; streamId: string; chunk: string }
   | { type: "end"; streamId: string }
   | { type: "error"; streamId: string; message: string };
 
+export type ChatGptWireExpectation =
+  | { kind: "token"; token: string }
+  | { kind: "submission" }
+  | { kind: "diagnostic" };
+
 export class ChatGptWireCapture {
   private readonly accumulator: ChatGptConversationSseAccumulator;
+  private revision = 0;
   private streamId?: string;
   private status?: number;
   private contentType?: string;
@@ -30,18 +48,48 @@ export class ChatGptWireCapture {
   private handoffObservedAt?: number;
   private firstHandoffChunkAt?: number;
   private failed = false;
+  private requestEpoch?: string;
+  private requestBodyTransport?: "init-string" | "request-clone" | "unavailable";
+  private requestClientUserMessageId?: string;
+  private requestConversationId?: string;
+  private requestIdentityConflict = false;
+  private foreignStartCount = 0;
   private readonly listeners = new Set<(snapshot: ChatGptWireSnapshot) => void>();
 
-  constructor(recordProtocolTrace = false) {
+  constructor(
+    recordProtocolTrace = false,
+    private readonly expectedEpoch?: string,
+    private readonly expectation: ChatGptWireExpectation = { kind: "diagnostic" },
+  ) {
     this.accumulator = new ChatGptConversationSseAccumulator(recordProtocolTrace);
   }
 
   accept(event: WireEvent): void {
     if (event.type === "start") {
-      if (this.streamId !== undefined) return;
+      const expectedEpochMatches = this.expectedEpoch === undefined || event.captureEpoch === this.expectedEpoch;
+      const expectationMatches = this.expectation.kind !== "token"
+        || event.provenanceToken === this.expectation.token;
+      const submissionShapeMatches = this.expectation.kind !== "submission"
+        || event.hasUserMessage !== false;
+      if (!expectedEpochMatches || !expectationMatches || !submissionShapeMatches) {
+        this.foreignStartCount = Math.min(1_000, this.foreignStartCount + 1);
+        this.notify();
+        return;
+      }
+      if (this.streamId !== undefined) {
+        if (event.streamId !== this.streamId) {
+          this.requestIdentityConflict = true;
+          this.notify();
+        }
+        return;
+      }
       this.streamId = event.streamId;
       this.status = event.status;
       this.contentType = event.contentType;
+      this.requestEpoch = event.captureEpoch;
+      this.requestBodyTransport = event.bodyTransport;
+      this.requestClientUserMessageId = event.clientUserMessageId;
+      this.requestConversationId = event.requestConversationId;
       this.startedAt = Date.now();
       this.notify();
       return;
@@ -92,7 +140,17 @@ export class ChatGptWireCapture {
       completedAt: this.completedAt,
       handoffObservedAt: this.handoffObservedAt,
       firstHandoffChunkAt: this.firstHandoffChunkAt,
+      requestEpoch: this.requestEpoch,
+      requestBodyTransport: this.requestBodyTransport,
+      requestClientUserMessageId: this.requestClientUserMessageId,
+      requestConversationId: this.requestConversationId,
+      ...(this.requestIdentityConflict ? { requestIdentityConflict: true } : {}),
+      ...(this.foreignStartCount > 0 ? { foreignStartCount: this.foreignStartCount } : {}),
     };
+  }
+
+  revisionNumber(): number {
+    return this.revision;
   }
 
   subscribe(listener: (snapshot: ChatGptWireSnapshot) => void): () => void {
@@ -109,6 +167,17 @@ export class ChatGptWireCapture {
     return this.waitFor(snapshot => snapshot.completedAt !== undefined, timeoutMs, signal);
   }
 
+  waitForChange(
+    afterRevision: number,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<ChatGptWireSnapshot | undefined> {
+    if (!Number.isSafeInteger(afterRevision) || afterRevision < 0) {
+      return Promise.reject(new Error("ChatGPT wire capture received an invalid revision"));
+    }
+    return this.waitFor(() => this.revision > afterRevision, timeoutMs, signal);
+  }
+
   private waitFor(
     predicate: (snapshot: ChatGptWireSnapshot) => boolean,
     timeoutMs: number,
@@ -119,24 +188,32 @@ export class ChatGptWireCapture {
     if (signal?.aborted || timeoutMs <= 0) return Promise.resolve(undefined);
     return new Promise(resolve => {
       let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let unsubscribe = () => {};
       const finish = (value: ChatGptWireSnapshot | undefined) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         unsubscribe();
         signal?.removeEventListener("abort", onAbort);
         resolve(value);
       };
       const onAbort = () => finish(undefined);
-      const unsubscribe = this.subscribe(snapshot => {
+      const subscribed = this.subscribe(snapshot => {
         if (predicate(snapshot)) finish(snapshot);
       });
-      const timer = setTimeout(() => finish(undefined), timeoutMs);
+      unsubscribe = subscribed;
+      if (settled) {
+        unsubscribe();
+        return;
+      }
+      timer = setTimeout(() => finish(undefined), timeoutMs);
       signal?.addEventListener("abort", onAbort, { once: true });
     });
   }
 
   private notify(): void {
+    this.revision += 1;
     const snapshot = this.snapshot();
     for (const listener of this.listeners) listener(snapshot);
   }
@@ -168,7 +245,7 @@ export class ChatGptWebStreamTap {
     try {
       await page.evaluate(({ bindingName: installedBinding, token: installedToken, requestDiagnostics }) => {
       const root = window as typeof window & {
-        __codexWebStreamTap?: { token: string; restore(): void; requestDiagnostic?(): {
+        __codexWebStreamTap?: { token: string; captureEpoch?: string; restore(): void; requestDiagnostic?(): {
           wrapperCurrent: boolean; conversationPostAttempts: number; saturated: boolean;
         } };
         [key: string]: unknown;
@@ -203,15 +280,73 @@ export class ChatGptWebStreamTap {
         if (requestDiagnostics && isConversationPost(input, init)) {
           conversationPostAttempts = Math.min(1_000, conversationPostAttempts + 1);
         }
-        const response = await originalFetch(input, init);
+        if (!isConversationPost(input, init)) return originalFetch(input, init);
+        const captureEpoch = root.__codexWebStreamTap?.token === installedToken
+          ? root.__codexWebStreamTap.captureEpoch
+          : undefined;
+        const inputRequest = input instanceof Request ? input : undefined;
+        const observeBody = async (): Promise<{
+          rawBody?: string;
+          bodyTransport: "init-string" | "request-clone" | "unavailable";
+        }> => {
+          if (typeof init?.body === "string") return { rawBody: init.body, bodyTransport: "init-string" };
+          if (init?.body !== undefined || !inputRequest) return { bodyTransport: "unavailable" };
+          try {
+            return { rawBody: await inputRequest.clone().text(), bodyTransport: "request-clone" };
+          } catch {
+            return { bodyTransport: "unavailable" };
+          }
+        };
+        // Clone a Request body before fetch() can mark the original as used. Reading that clone is
+        // still concurrent with the browser send, so ownership observation adds no send latency.
+        const bodyObservationPromise = observeBody();
+        const responsePromise = originalFetch(input, init);
+        const [response, bodyObservation] = await Promise.all([responsePromise, bodyObservationPromise]);
         try {
-          if (!isConversationPost(input, init)) return response;
           const contentType = response.headers.get("content-type") ?? "";
           if (!contentType.includes("text/event-stream") || !response.body || response.bodyUsed) return response;
           const copy = response.clone();
           if (!copy.body) return response;
+          let provenanceToken: string | undefined;
+          let clientUserMessageId: string | undefined;
+          let requestConversationId: string | undefined;
+          let hasUserMessage: boolean | undefined;
+          if (bodyObservation.rawBody !== undefined) {
+            provenanceToken = bodyObservation.rawBody.match(/__CODEX_WEB_PROMPT_[0-9a-f]{32}__/)?.[0];
+            try {
+              const decoded = JSON.parse(bodyObservation.rawBody) as Record<string, unknown>;
+              requestConversationId = typeof decoded.conversation_id === "string" ? decoded.conversation_id : undefined;
+              if (Array.isArray(decoded.messages)) {
+                hasUserMessage = false;
+                for (let index = decoded.messages.length - 1; index >= 0; index -= 1) {
+                  const message = decoded.messages[index];
+                  if (!message || typeof message !== "object" || Array.isArray(message)) continue;
+                  const record = message as Record<string, unknown>;
+                  const author = record.author;
+                  const role = typeof record.role === "string"
+                    ? record.role
+                    : author && typeof author === "object" && !Array.isArray(author)
+                      ? (author as Record<string, unknown>).role
+                      : undefined;
+                  if (role !== "user") continue;
+                  hasUserMessage = true;
+                  if (typeof record.id === "string" && record.id.trim()) clientUserMessageId = record.id;
+                  break;
+                }
+              }
+            } catch {
+              // Body identity is optional. Exact placeholder matching still works without JSON.
+            }
+          }
           const streamId = `codex-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-          emit({ type: "start", streamId, url: response.url, status: response.status, contentType });
+          emit({
+            type: "start", streamId, url: response.url, status: response.status, contentType,
+            captureEpoch, bodyTransport: bodyObservation.bodyTransport,
+            ...(provenanceToken ? { provenanceToken } : {}),
+            ...(clientUserMessageId ? { clientUserMessageId } : {}),
+            ...(requestConversationId ? { requestConversationId } : {}),
+            ...(hasUserMessage !== undefined ? { hasUserMessage } : {}),
+          });
           const reader = copy.body.getReader();
           const decoder = new TextDecoder();
           void (async () => {
@@ -282,10 +417,22 @@ export class ChatGptWebStreamTap {
     return tap;
   }
 
-  beginCapture(): ChatGptWireCapture {
+  async beginCapture(expectation: ChatGptWireExpectation = { kind: "submission" }): Promise<ChatGptWireCapture> {
     if (this.closed) throw new Error("ChatGPT web stream tap is closed");
-    this.capture = new ChatGptWireCapture(chatGptStreamProtocolDiagnosticsEnabled());
-    return this.capture;
+    const epoch = randomUUID();
+    const capture = new ChatGptWireCapture(chatGptStreamProtocolDiagnosticsEnabled(), epoch, expectation);
+    this.capture = capture;
+    try {
+      await this.page.evaluate(({ token, epoch }) => {
+        const state = (window as typeof window & { __codexWebStreamTap?: { token: string; captureEpoch?: string } }).__codexWebStreamTap;
+        if (state?.token !== token) throw new Error("ChatGPT stream tap is no longer installed");
+        state.captureEpoch = epoch;
+      }, { token: this.token, epoch });
+    } catch (error) {
+      if (this.capture === capture) this.capture = undefined;
+      throw error;
+    }
+    return capture;
   }
 
   /** Use the fresh page after reconnect; counters survive only on the original document.
@@ -342,7 +489,13 @@ function isWireEvent(value: unknown): value is WireEvent {
   if (event.type === "start") {
     return typeof event.url === "string"
       && typeof event.status === "number"
-      && typeof event.contentType === "string";
+      && typeof event.contentType === "string"
+      && (event.captureEpoch === undefined || typeof event.captureEpoch === "string")
+      && (event.bodyTransport === undefined || event.bodyTransport === "init-string" || event.bodyTransport === "request-clone" || event.bodyTransport === "unavailable")
+      && (event.provenanceToken === undefined || typeof event.provenanceToken === "string")
+      && (event.clientUserMessageId === undefined || typeof event.clientUserMessageId === "string")
+      && (event.requestConversationId === undefined || typeof event.requestConversationId === "string")
+      && (event.hasUserMessage === undefined || typeof event.hasUserMessage === "boolean");
   }
   if (event.type === "chunk") return typeof event.chunk === "string";
   if (event.type === "end") return true;

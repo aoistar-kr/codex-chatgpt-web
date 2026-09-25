@@ -18,6 +18,7 @@ import {
   CHATGPT_TURN_REVISION_CONFLICT_MESSAGE,
   extractChatGptTurnIdentity,
   extractCodexTurnIdentityFromBody,
+  extractChatGptCompactionRetainedInstructionRevision,
   extractChatGptCompactionSourceRevision,
 } from "./adapters/chatgpt-web/environment";
 import { rememberCompactionContinuation } from "./adapters/chatgpt-web/compaction-continuation";
@@ -552,11 +553,20 @@ export async function responseRequest(
     const body = parsed._rawBody as { input?: unknown[] };
     // v1 installs the bounded user-message output, whereas v2 retains the original source.
     // Authenticate both exact producer-defined representations, never arbitrary rewrites.
-    const v1Source = extractChatGptCompactionSourceRevision({
+    const v1Parsed: CodexParsedRequest = {
       ...parsed,
       _rawBody: { ...body, input: buildCompactV1Output(extractCompactUserMessages(body.input), summary) },
-    });
-    rememberCompactionContinuation(parsed, identity, [source, v1Source], summary);
+    };
+    const v1Source = extractChatGptCompactionSourceRevision(v1Parsed);
+    // Native compaction removes goal wrappers and metadata-proven context, so the immediate
+    // continuation authenticates against the retained human/direct-parent instruction instead.
+    // Register that exact retained representation from the actual input and from the
+    // deterministic v1 projection; neither path accepts arbitrary history.
+    const retainedSources = [
+      extractChatGptCompactionRetainedInstructionRevision(parsed),
+      extractChatGptCompactionRetainedInstructionRevision(v1Parsed),
+    ].flatMap(revision => (revision ? [revision] : []));
+    rememberCompactionContinuation(parsed, identity, [source, v1Source, ...retainedSources], summary);
   };
   if (compaction && route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) {
     return formatErrorResponse(

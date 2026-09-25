@@ -80,6 +80,28 @@ test("reasoning tool recipient and non-assistant IDs never establish final-messa
   expect(parser.snapshot().assistantMessageIdentityUnknown).toBeUndefined();
 });
 
+test("request-owned assistant IDs include tool envelopes while final provenance stays final-only", () => {
+  const parser = new ChatGptConversationSseAccumulator();
+  parser.feed(sse({
+    conversation_id: "conversation-a",
+    message: {
+      ...provenanceMessage("tool-call-id"),
+      recipient: "python",
+      channel: "analysis",
+    },
+  }));
+  expect(parser.snapshot().responseOwnerAssistantIds).toEqual(["tool-call-id"]);
+  expect(parser.snapshot().assistantMessageId).toBeUndefined();
+
+  parser.feed(sse({
+    conversation_id: "conversation-a",
+    message: provenanceMessage("final-id"),
+  }));
+  expect(parser.snapshot().responseOwnerAssistantIds).toEqual(["tool-call-id", "final-id"]);
+  expect(parser.snapshot().assistantMessageId).toBe("final-id");
+  expect(parser.snapshot().responseOwnerIdentityConflict).toBeUndefined();
+});
+
 test("missing or invalid explicit IDs and missing paired conversation remain unknown without backfill", () => {
   for (const message of [provenanceMessage(null), provenanceMessage(""), provenanceMessage(42)]) {
     const parser = new ChatGptConversationSseAccumulator();
@@ -284,6 +306,65 @@ test("wire capture binds exactly one response stream", () => {
   expect(snapshot.status).toBe(200);
   expect(snapshot.complete).toBeTrue();
   expect(snapshot.failed).toBeFalse();
+});
+
+test("wire capture ignores foreign epochs and wrong tokens before binding the owned request", () => {
+  const capture = new ChatGptWireCapture(false, "epoch-current", {
+    kind: "token",
+    token: "__CODEX_WEB_PROMPT_0123456789abcdef0123456789abcdef__",
+  });
+  const base = {
+    type: "start" as const,
+    url: "https://chatgpt.com/backend-api/f/conversation",
+    status: 200,
+    contentType: "text/event-stream",
+    hasUserMessage: true,
+  };
+  capture.accept({
+    ...base,
+    streamId: "late-old",
+    captureEpoch: "epoch-old",
+    provenanceToken: "__CODEX_WEB_PROMPT_0123456789abcdef0123456789abcdef__",
+  });
+  capture.accept({
+    ...base,
+    streamId: "wrong-token",
+    captureEpoch: "epoch-current",
+    provenanceToken: "__CODEX_WEB_PROMPT_ffffffffffffffffffffffffffffffff__",
+  });
+  expect(capture.snapshot().streamId).toBeUndefined();
+  expect(capture.snapshot().foreignStartCount).toBe(2);
+
+  capture.accept({
+    ...base,
+    streamId: "owned",
+    captureEpoch: "epoch-current",
+    bodyTransport: "init-string",
+    provenanceToken: "__CODEX_WEB_PROMPT_0123456789abcdef0123456789abcdef__",
+  });
+  expect(capture.snapshot().streamId).toBe("owned");
+  expect(capture.snapshot().requestEpoch).toBe("epoch-current");
+  expect(capture.snapshot().requestBodyTransport).toBe("init-string");
+  expect(capture.snapshot().requestIdentityConflict).toBeUndefined();
+});
+
+test("wire capture fails closed when two streams match the same exact request provenance", () => {
+  const token = "__CODEX_WEB_PROMPT_0123456789abcdef0123456789abcdef__";
+  const capture = new ChatGptWireCapture(false, "epoch-current", { kind: "token", token });
+  const start = (streamId: string) => ({
+    type: "start" as const,
+    streamId,
+    url: "https://chatgpt.com/backend-api/f/conversation",
+    status: 200,
+    contentType: "text/event-stream",
+    captureEpoch: "epoch-current",
+    provenanceToken: token,
+    hasUserMessage: true,
+  });
+  capture.accept(start("owned-first"));
+  capture.accept(start("owned-second"));
+  expect(capture.snapshot().streamId).toBe("owned-first");
+  expect(capture.snapshot().requestIdentityConflict).toBeTrue();
 });
 
 test("network shadow mode is enabled by default and explicitly disableable", () => {
@@ -1103,6 +1184,8 @@ test("request injection fails closed for duplicate values, object-key collisions
 
 test("wire waiters wake on stream start and terminal response", async () => {
   const capture = new ChatGptWireCapture();
+  const initialRevision = capture.revisionNumber();
+  const changed = capture.waitForChange(initialRevision, 1_000);
   const started = capture.waitForStart(1_000);
   capture.accept({
     type: "start",
@@ -1111,6 +1194,8 @@ test("wire waiters wake on stream start and terminal response", async () => {
     status: 200,
     contentType: "text/event-stream",
   });
+  expect((await changed)?.streamId).toBe("stream");
+  expect(capture.revisionNumber()).toBeGreaterThan(initialRevision);
   expect((await started)?.streamId).toBe("stream");
 
   const ended = capture.waitForEnd(1_000);
@@ -1145,6 +1230,19 @@ test("wire capture timestamps the first final-answer text separately from transp
     }),
   });
   expect(capture.snapshot().firstTextAt).toBeNumber();
+});
+
+test("network tap clones Request bodies before dispatch while reading the clone concurrently", () => {
+  const source = readFileSync(
+    new URL("../src/adapters/chatgpt-web/web-stream/network-observer.ts", import.meta.url),
+    "utf8",
+  );
+  const observe = source.indexOf("const bodyObservationPromise = observeBody();");
+  const dispatch = source.indexOf("const responsePromise = originalFetch(input, init);");
+  const join = source.indexOf("Promise.all([responsePromise, bodyObservationPromise])");
+  expect(observe).toBeGreaterThan(-1);
+  expect(dispatch).toBeGreaterThan(observe);
+  expect(join).toBeGreaterThan(dispatch);
 });
 
 test("stream handoff extracts only an exact conversation-turn WebSocket topic", () => {
@@ -1288,18 +1386,32 @@ test("request injection shadow wraps the real prompt before DOM attachment witho
   expect(source).toContain('mode: "request-injection-shadow"');
 });
 
-test("browser turns install the shadow only after attachments and close it before releasing the page", () => {
+test("browser turns wrap each multipart injector with the stream tap and arm ordinary capture after attachments", () => {
   const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const installed = source.indexOf("ChatGptWebStreamTap.install(page, turn.traceId)");
+  const multipartInjector = source.indexOf("stageRequestInjector = await ChatGptRequestInjector.install(");
+  const multipartEnabled = source.indexOf("await enableNetworkStreamTap();", multipartInjector);
+  const multipartCapture = source.indexOf("const stageWireCapture = await webStreamTap.beginCapture", multipartEnabled);
+  const multipartSend = source.indexOf("multipart_stage_", multipartCapture);
+  const multipartTapClosed = source.indexOf("await webStreamTap.close().catch(() => {});", multipartSend);
+  const multipartInjectorClosed = source.indexOf("await stageRequestInjector.close().catch(() => {});", multipartTapClosed);
   const fileAttached = source.indexOf('await diagnostics.capture(page, "file-attachment-complete")');
-  const installed = source.indexOf("ChatGptWebStreamTap.install(page, turn.traceId)", fileAttached);
-  const sent = source.indexOf("let finalSubmissionEvidence", installed);
+  const ordinaryEnabled = source.indexOf("await enableNetworkStreamTap();", fileAttached);
+  const sent = source.indexOf("let finalSubmissionEvidence", ordinaryEnabled);
   const networkPrimary = source.indexOf("const domFailureBeforeWire", sent);
   const closed = source.indexOf("await webStreamTap.close()", networkPrimary);
   const connectionReleased = source.indexOf("await turnConnection.close()", closed);
 
+  expect(installed).toBeGreaterThan(-1);
+  expect(multipartInjector).toBeGreaterThan(-1);
+  expect(multipartEnabled).toBeGreaterThan(multipartInjector);
+  expect(multipartCapture).toBeGreaterThan(multipartEnabled);
+  expect(multipartSend).toBeGreaterThan(multipartCapture);
+  expect(multipartTapClosed).toBeGreaterThan(multipartSend);
+  expect(multipartInjectorClosed).toBeGreaterThan(multipartTapClosed);
   expect(fileAttached).toBeGreaterThan(-1);
-  expect(installed).toBeGreaterThan(fileAttached);
-  expect(sent).toBeGreaterThan(installed);
+  expect(ordinaryEnabled).toBeGreaterThan(fileAttached);
+  expect(sent).toBeGreaterThan(ordinaryEnabled);
   expect(networkPrimary).toBeGreaterThan(sent);
   expect(closed).toBeGreaterThan(sent);
   expect(connectionReleased).toBeGreaterThan(closed);
@@ -1324,6 +1436,7 @@ test("opt-in request injection keeps the SPA submit pipeline and has a fail-clos
   const closeStream = source.indexOf("await webStreamTap.close()", fallback);
   const closeInjector = source.indexOf("await activeRequestInjector.close()", closeStream);
   const fallbackPrompt = source.indexOf("finalPrompt,", closeInjector);
+  const fallbackExpectation = source.indexOf('currentWireExpectation = { kind: "submission" };', fallbackPrompt);
   const fallbackSend = source.indexOf('"send_fallback"', fallbackPrompt);
 
   expect(installed).toBeGreaterThan(-1);
@@ -1334,7 +1447,8 @@ test("opt-in request injection keeps the SPA submit pipeline and has a fail-clos
   expect(closeStream).toBeGreaterThan(fallback);
   expect(closeInjector).toBeGreaterThan(closeStream);
   expect(fallbackPrompt).toBeGreaterThan(closeInjector);
-  expect(fallbackSend).toBeGreaterThan(fallbackPrompt);
+  expect(fallbackExpectation).toBeGreaterThan(fallbackPrompt);
+  expect(fallbackSend).toBeGreaterThan(fallbackExpectation);
   expect(source).toContain('turnPlan.requestInjection === "primary"');
   expect(source).toContain('mode: "request-injection-primary"');
 });

@@ -3,6 +3,13 @@ import { chatGptStreamHandoffTopic } from "./websocket-handoff";
 
 export type ChatGptWireSnapshot = {
   streamId?: string;
+  /** Page-local request epoch captured before the matching fetch was dispatched. */
+  requestEpoch?: string;
+  requestBodyTransport?: "init-string" | "request-clone" | "unavailable";
+  requestClientUserMessageId?: string;
+  requestConversationId?: string;
+  requestIdentityConflict?: boolean;
+  foreignStartCount?: number;
   conversationId?: string;
   /** Original explicit wire mapping only, never fresh post-reconnect conversation proof.
    * Raw IDs are process-local; do not serialize into metrics/protocol diagnostics.
@@ -11,6 +18,11 @@ export type ChatGptWireSnapshot = {
   assistantMessageConversationId?: string;
   assistantMessageIdentityConflict?: boolean;
   assistantMessageIdentityUnknown?: boolean;
+  /** All explicit assistant envelope ids observed on the owned response stream. This is separate
+   * from assistantMessageId, which intentionally remains final-channel-only recovery authority. */
+  responseOwnerAssistantIds?: readonly string[];
+  responseOwnerIdentityConflict?: boolean;
+  responseOwnerIdentityUnknown?: boolean;
   text: string;
   /** Final Responses-compatible annotations recovered from ChatGPT message metadata. */
   annotations?: CodexOutputTextAnnotation[];
@@ -434,6 +446,9 @@ export class ChatGptConversationSseAccumulator {
   private assistantMessageConversationId?: string;
   private assistantMessageIdentityConflict = false;
   private assistantMessageIdentityUnknown = false;
+  private readonly responseOwnerAssistantIds: string[] = [];
+  private responseOwnerIdentityConflict = false;
+  private responseOwnerIdentityUnknown = false;
   private handoffTopicId?: string;
   private complete = false;
   private inputSource: "bootstrap" | "handoff" = "bootstrap";
@@ -484,6 +499,7 @@ export class ChatGptConversationSseAccumulator {
     ChatGptWireSnapshot,
     "conversationId" | "text" | "annotations" | "complete" | "handoffTopicId" | "protocolTrace" | "protocolTraceDropped" | "protocolSummary"
     | "assistantMessageId" | "assistantMessageConversationId" | "assistantMessageIdentityConflict" | "assistantMessageIdentityUnknown"
+    | "responseOwnerAssistantIds" | "responseOwnerIdentityConflict" | "responseOwnerIdentityUnknown"
   > {
     return {
       conversationId: this.conversationId,
@@ -493,6 +509,11 @@ export class ChatGptConversationSseAccumulator {
       } : {}),
       ...(this.assistantMessageIdentityConflict ? { assistantMessageIdentityConflict: true } : {}),
       ...(this.assistantMessageId && this.assistantMessageIdentityUnknown ? { assistantMessageIdentityUnknown: true } : {}),
+      ...(this.responseOwnerAssistantIds.length > 0
+        ? { responseOwnerAssistantIds: [...this.responseOwnerAssistantIds] }
+        : {}),
+      ...(this.responseOwnerIdentityConflict ? { responseOwnerIdentityConflict: true } : {}),
+      ...(this.responseOwnerIdentityUnknown ? { responseOwnerIdentityUnknown: true } : {}),
       text: this.assistantText,
       ...(this.complete ? { annotations: chatGptOutputTextAnnotations(this.assistantText, this.finalAssistantMetadata) } : {}),
       complete: this.complete,
@@ -634,6 +655,19 @@ export class ChatGptConversationSseAccumulator {
   private handleMessage(message: Record<string, unknown>, conversationId: unknown): void {
     this.observeConversationId(conversationId);
     this.recordMessage(message);
+    const author = message.author;
+    const assistantEnvelope = Boolean(author && typeof author === "object"
+      && (author as { role?: unknown }).role === "assistant");
+    if (assistantEnvelope) {
+      if (typeof message.id === "string" && message.id.trim().length > 0
+        && !this.responseOwnerAssistantIds.includes(message.id)) {
+        if (this.responseOwnerAssistantIds.length >= 64) {
+          this.responseOwnerIdentityUnknown = true;
+        } else {
+          this.responseOwnerAssistantIds.push(message.id);
+        }
+      }
+    }
     if (!isFinalAssistantMessage(message)) {
       this.trackingFinalAssistant = false;
       return;
@@ -673,12 +707,21 @@ export class ChatGptConversationSseAccumulator {
 
   private observeIdentityPatch(path: unknown, operation: unknown): void {
     if (operation === "patch") return; // Batch entries are inspected individually.
-    if (path === "" || path === "/" || path === "/message"
+    const finalIdentityAffected = path === "" || path === "/" || path === "/message"
       || (typeof path === "string" && /^\/(?:conversation_id(?:\/|$)|message\/(?:id|author|recipient|channel|content_type)(?:\/|$))/.test(path))
-      || path === "/message/content" || path === "/message/content/content_type") {
+      || path === "/message/content" || path === "/message/content/content_type";
+    if (finalIdentityAffected) {
       // Unsupported identity/qualification mutation: retain original evidence, but poison its
       // use as a complete mapping even if a later full message repeats the original ID.
       this.assistantMessageIdentityUnknown = true;
+    }
+    const responseOwnerAffected = path === "" || path === "/" || path === "/message"
+      || (typeof path === "string" && /^\/message\/(?:id|author)(?:\/|$)/.test(path));
+    if (responseOwnerAffected) {
+      // Early response ownership depends only on an explicit assistant envelope id and author.
+      // Recipient/channel/content patches may change final-answer qualification but do not erase
+      // the request-owned assistant identity itself.
+      this.responseOwnerIdentityUnknown = true;
     }
   }
 

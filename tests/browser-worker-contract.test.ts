@@ -25,7 +25,7 @@ test("completed diagnostic can pass only through the persisted-detail or strict 
   expect(acceptance).toContain("&& metric.equivalentEvidenceMatched && metric.equivalentEvidenceReasons.length === 0");
 });
 import type { Page } from "playwright-core";
-import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCaptureEnabled, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptConnectorAttachmentMode, chatGptEffortSelectionRequired, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptRecoverableIncompleteCaptureFailure, chatGptSameDocumentTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCaptureEnabled, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptConnectorAttachmentMode, chatGptEffortSelectionRequired, chatGptNewTurnIdentities, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptRecoverableIncompleteCaptureFailure, chatGptResolveAssistantTurnByStoredMessageIds, chatGptResolveAssistantTurnOwnership, chatGptSameDocumentTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserSteeringQueue } from "../src/adapters/chatgpt-web/browser-worker";
 import { ensureChatGptPersonalizedConnectorAccess } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
@@ -174,10 +174,24 @@ test("browser worker delegates network stream eligibility to the pure turn plan"
   expect(workerSource).toContain("const turnPlan = resolveChatGptTurnPlan({");
   expect(workerSource).toContain("networkStreamPrimary: chatGptNetworkStreamPrimaryEnabled(),");
   expect(workerSource).toContain("networkStreamShadow: chatGptNetworkStreamShadowEnabled(),");
-  // In-flight steering can open a new conversation request on the same browser answer. Until the
-  // wire tap binds that sequence, steerable turns keep the DOM as final-text authority.
-  expect(workerSource).toContain('const networkStreamPrimary = turnPlan.networkStream === "primary" && !turn.steering;');
-  expect(workerSource).toContain('if (turnPlan.networkStream === "off") return;');
+  // Queue capability exists on every browser turn. It must not disable the ordinary primary path;
+  // only an actually queued steering revision advances the active request-owned capture.
+  expect(workerSource).toContain('const networkStreamPrimary = turnPlan.networkStream === "primary";');
+  expect(workerSource).not.toContain('turnPlan.networkStream === "primary" && !turn.steering');
+  expect(workerSource).toContain("if (turn.steering?.hasPending()) await submitNetworkPrimarySteering();");
+  expect(workerSource).toContain("turn.steering.waitForPending(waitSignal)");
+  expect(workerSource).toContain("activeNetworkCapture = accepted.wireCapture;");
+  expect(workerSource).toContain('&& !prepared.multipart) return;');
+  expect(workerSource).not.toContain("&& !requireExactOwnershipProof\n          && !turn.steering");
+  const multipartInjector = workerSource.indexOf("stageRequestInjector = await ChatGptRequestInjector.install(");
+  const multipartTap = workerSource.indexOf("await enableNetworkStreamTap();", multipartInjector);
+  const multipartTapClose = workerSource.indexOf("await webStreamTap.close().catch(() => {});", multipartTap);
+  const multipartInjectorClose = workerSource.indexOf("await stageRequestInjector.close().catch(() => {});", multipartTapClose);
+  expect(multipartInjector).toBeGreaterThan(-1);
+  expect(multipartTap).toBeGreaterThan(multipartInjector);
+  expect(multipartTapClose).toBeGreaterThan(multipartTap);
+  expect(multipartInjectorClose).toBeGreaterThan(multipartTapClose);
+  expect(workerSource).not.toContain("!turn.completionFence && !turn.steering");
 });
 
 test("conversation turn identity survives ChatGPT DOM virtualization", () => {
@@ -193,6 +207,159 @@ test("conversation turn identity survives ChatGPT DOM virtualization", () => {
     ["conversation-turn-1"],
     ["conversation-turn-1", "conversation-turn-2", "conversation-turn-3"],
   )).toThrow("2 new conversation turns");
+});
+
+test("assistant ownership fast-paths one candidate and exact-matches ambiguous candidates", () => {
+  const baseline = ["assistant-old"];
+  const current = ["assistant-old", "assistant-a", "assistant-b", "assistant-c"];
+  expect(chatGptNewTurnIdentities(baseline, current)).toEqual([
+    "assistant-a", "assistant-b", "assistant-c",
+  ]);
+  expect(chatGptResolveAssistantTurnOwnership(
+    ["assistant-a"],
+    [],
+    undefined,
+  )).toBe("assistant-a");
+  expect(chatGptResolveAssistantTurnOwnership(
+    ["assistant-a"],
+    [],
+    { complete: false, failed: false },
+  )).toBe("assistant-a");
+
+  const candidates = [
+    { identity: "assistant-a", nodeCount: 1, messageIds: ["message-a"] },
+    { identity: "assistant-b", nodeCount: 1, messageIds: ["message-b"] },
+    { identity: "assistant-c", nodeCount: 1, messageIds: ["message-c"] },
+  ];
+  expect(chatGptResolveAssistantTurnOwnership(
+    ["assistant-a", "assistant-b", "assistant-c"],
+    candidates,
+    { assistantMessageId: "message-b", complete: false, failed: false },
+  )).toBe("assistant-b");
+  expect(chatGptResolveAssistantTurnOwnership(
+    ["assistant-a", "assistant-b", "assistant-c"],
+    candidates,
+    { complete: false, failed: false },
+  )).toBeUndefined();
+  expect(chatGptResolveAssistantTurnOwnership(
+    ["assistant-a", "assistant-b"],
+    [
+      { identity: "assistant-a", nodeCount: 1, messageIds: [] },
+      { identity: "assistant-b", nodeCount: 1, messageIds: ["message-b"] },
+    ],
+    { assistantMessageId: "message-a", complete: true, failed: false },
+  )).toBeUndefined();
+});
+
+test("assistant ownership fails closed on contradictory direct provenance", () => {
+  const candidates = [
+    { identity: "assistant-a", nodeCount: 1, messageIds: ["same-message"] },
+    { identity: "assistant-b", nodeCount: 1, messageIds: ["same-message"] },
+  ];
+  expect(() => chatGptResolveAssistantTurnOwnership(
+    ["assistant-a", "assistant-b"],
+    candidates,
+    { assistantMessageId: "same-message", complete: false, failed: false },
+  )).toThrow("mapped to multiple response turns");
+  expect(() => chatGptResolveAssistantTurnOwnership(
+    ["assistant-a", "assistant-b"],
+    candidates,
+    { assistantMessageIdentityConflict: true, complete: false, failed: false },
+  )).toThrow("wire assistant identity conflicted");
+  expect(() => chatGptResolveAssistantTurnOwnership(
+    ["assistant-a", "assistant-b"],
+    candidates,
+    { assistantMessageIdentityUnknown: true, complete: false, failed: false },
+  )).toThrow("wire assistant identity became unknown");
+  expect(() => chatGptResolveAssistantTurnOwnership(
+    ["assistant-a", "assistant-b"],
+    candidates,
+    { assistantMessageId: "missing-message", complete: true, failed: false },
+  )).not.toThrow();
+  expect(chatGptResolveAssistantTurnOwnership(
+    ["assistant-a", "assistant-b"],
+    candidates,
+    { assistantMessageId: "missing-message", complete: true, failed: false },
+  )).toBeUndefined();
+});
+
+test("exact assistant ownership stays pending through hydration, tolerates equivalent renderer copies, and survives siblings", () => {
+  const ownedWire = {
+    streamId: "stream-owned",
+    responseOwnerAssistantIds: ["message-owned"],
+    complete: true,
+    failed: false,
+    completedAt: 123,
+  };
+
+  // SSE can complete before data-message-id hydrates. Exact ownership must remain pending.
+  expect(chatGptResolveAssistantTurnOwnership(
+    ["assistant-owned"],
+    [{ identity: "assistant-owned", nodeCount: 1, messageIds: [] }],
+    ownedWire,
+    true,
+  )).toBeUndefined();
+
+  // A renderer may duplicate one logical turn. Equivalent copies are still one owner.
+  expect(chatGptResolveAssistantTurnOwnership(
+    ["assistant-owned"],
+    [{
+      identity: "assistant-owned",
+      nodeCount: 2,
+      messageIds: ["message-owned"],
+      rendererCopiesEquivalent: true,
+    }],
+    ownedWire,
+    true,
+  )).toBe("assistant-owned");
+
+  // An unrelated sibling becoming visible later cannot steal the already direct-matched owner.
+  expect(chatGptResolveAssistantTurnOwnership(
+    ["assistant-sibling", "assistant-owned"],
+    [
+      { identity: "assistant-sibling", nodeCount: 1, messageIds: ["message-sibling"] },
+      { identity: "assistant-owned", nodeCount: 1, messageIds: ["message-owned"] },
+    ],
+    ownedWire,
+    true,
+  )).toBe("assistant-owned");
+
+  // A remounted logical root is accepted only when it exposes the same direct message identity.
+  expect(chatGptResolveAssistantTurnOwnership(
+    ["assistant-remounted"],
+    [{ identity: "assistant-remounted", nodeCount: 1, messageIds: ["message-owned"] }],
+    ownedWire,
+    true,
+  )).toBe("assistant-remounted");
+});
+
+test("stored direct assistant message ids prove remounts without a live wire capture", () => {
+  expect(chatGptResolveAssistantTurnByStoredMessageIds([
+    { identity: "assistant-sibling", nodeCount: 1, messageIds: ["message-sibling"] },
+    { identity: "assistant-remounted", nodeCount: 1, messageIds: ["message-owned"] },
+  ], ["message-owned"])).toBe("assistant-remounted");
+
+  // Hydration lag stays unresolved instead of falling back to DOM cardinality.
+  expect(chatGptResolveAssistantTurnByStoredMessageIds([
+    { identity: "assistant-remounted", nodeCount: 1, messageIds: [] },
+  ], ["message-owned"])).toBeUndefined();
+  expect(chatGptResolveAssistantTurnByStoredMessageIds([
+    { identity: "assistant-wrong", nodeCount: 1, messageIds: ["message-wrong"] },
+  ], ["message-owned"])).toBeUndefined();
+
+  expect(() => chatGptResolveAssistantTurnByStoredMessageIds([
+    { identity: "assistant-a", nodeCount: 1, messageIds: ["message-owned"] },
+    { identity: "assistant-b", nodeCount: 1, messageIds: ["message-owned"] },
+  ], ["message-owned"])).toThrow("mapped to multiple response turns");
+});
+
+test("assistant bindings retain direct message identity for same-document and launcher remount proof", () => {
+  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  expect(source).toContain("ownedAssistantMessageIds: readonly string[];");
+  expect(source).toContain("chatGptResolveAssistantTurnByStoredMessageIds(\n        provenance,\n        binding.ownedAssistantMessageIds,");
+  expect(source).toContain("chatGptResolveAssistantTurnByStoredMessageIds(\n                reboundProvenance,\n                responseTurn.ownedAssistantMessageIds,");
+  expect(source).toContain("binding.ownedAssistantMessageIds.length === 0");
+  expect(source).toContain("responseTurn.ownedAssistantMessageIds.length === 0");
 });
 
 test("assistant tracking rebinds only one proven replacement after React detaches its node", () => {
@@ -218,15 +385,26 @@ test("same-document recovery proof rejects document replacement, extra users, an
   const acceptedUsers = ["conversation-turn-user-1"];
   const initialResponses = ["conversation-turn-assistant-old"];
   const boundAssistant = "conversation-turn-assistant-1";
+  const knownResponses = [...initialResponses, boundAssistant];
 
   expect(chatGptSameDocumentTurnIdentity(
     expectedDocument,
     expectedDocument,
     acceptedUsers,
     acceptedUsers,
-    initialResponses,
+    knownResponses,
     boundAssistant,
-    [...initialResponses, boundAssistant],
+    knownResponses,
+  )).toBe(boundAssistant);
+
+  expect(chatGptSameDocumentTurnIdentity(
+    expectedDocument,
+    expectedDocument,
+    acceptedUsers,
+    acceptedUsers,
+    [...knownResponses, "conversation-turn-assistant-known-competitor"],
+    boundAssistant,
+    [...knownResponses, "conversation-turn-assistant-known-competitor"],
   )).toBe(boundAssistant);
 
   expect(() => chatGptSameDocumentTurnIdentity(
@@ -234,9 +412,9 @@ test("same-document recovery proof rejects document replacement, extra users, an
     "document-2",
     acceptedUsers,
     acceptedUsers,
-    initialResponses,
+    knownResponses,
     boundAssistant,
-    [...initialResponses, boundAssistant],
+    knownResponses,
   )).toThrow("no longer exposes the committed response document");
 
   expect(() => chatGptSameDocumentTurnIdentity(
@@ -244,9 +422,9 @@ test("same-document recovery proof rejects document replacement, extra users, an
     expectedDocument,
     acceptedUsers,
     [...acceptedUsers, "conversation-turn-user-2"],
-    initialResponses,
+    knownResponses,
     boundAssistant,
-    [...initialResponses, boundAssistant],
+    knownResponses,
   )).toThrow("opened another user turn");
 
   expect(() => chatGptSameDocumentTurnIdentity(
@@ -254,20 +432,20 @@ test("same-document recovery proof rejects document replacement, extra users, an
     expectedDocument,
     acceptedUsers,
     acceptedUsers,
-    initialResponses,
+    knownResponses,
     boundAssistant,
     [...initialResponses, "conversation-turn-assistant-rebound-1", "conversation-turn-assistant-rebound-2"],
-  )).toThrow("2 new conversation turns");
+  )).toThrow("committed assistant turn disappeared");
 
-  expect(() => chatGptSameDocumentTurnIdentity(
+  expect(chatGptSameDocumentTurnIdentity(
     expectedDocument,
     expectedDocument,
     acceptedUsers,
     acceptedUsers,
-    initialResponses,
+    knownResponses,
     boundAssistant,
-    [...initialResponses, boundAssistant, "conversation-turn-assistant-extra"],
-  )).toThrow("2 new conversation turns");
+    [...knownResponses, "conversation-turn-assistant-extra"],
+  )).toBe(boundAssistant);
 });
 
 test("a retained MCP conversation reuses its proven connector binding", () => {
@@ -631,7 +809,7 @@ test("a stalled post-submit DOM probe is bounded before same-page launcher recov
   const submissionAccepted = runBrowserTurn.indexOf("submission accepted evidence=");
   const recovery = runBrowserTurn.indexOf("await rebindLauncherPage(", submissionAccepted);
   const freshDocument = runBrowserTurn.indexOf("this.submissionDomState(page, {}", recovery);
-  const documentProof = runBrowserTurn.indexOf("chatGptSameDocumentTurnIdentity(", freshDocument);
+  const documentProof = runBrowserTurn.indexOf("assistantTurnCandidateProvenance(", freshDocument);
   const duplicateSend = runBrowserTurn.indexOf("sendAttachedPrompt(", recovery);
 
   const rebindDefinition = runBrowserTurn.indexOf("const rebindLauncherPage");
@@ -2589,7 +2767,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     "high",
     pro,
     900_000,
-    6,
+    3,
   )).toThrow("ChatGPT message boundary");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     20_000,
@@ -2624,7 +2802,7 @@ test("Bigger Context stages use the lowest account mode that can carry the stage
     "low",
     plus,
     300_000,
-    6,
+    3,
     {
       stagingEffort: "medium",
       maxStageMessageTokens: 30_000,
@@ -3835,12 +4013,42 @@ test("in-flight steering submits into the live composer without stopping the act
   expect(block).toContain("while (!armed && Date.now() < armDeadline)");
   // The steered revision opens its own assistant turn; the answer authority moves to it.
   expect(block).toContain("replyIdentity");
-  expect(block).toContain("more than one new assistant turn");
+  expect(block).toContain("beginWireCapture?.()");
+  expect(block).toContain("chatGptResolveAssistantTurnOwnership(");
+  expect(block).toContain("assistantTurnCandidateProvenance(page, replies, signal)");
+  expect(block).not.toContain("exactReplyOwnershipRequired");
+  const missingWire = block.indexOf("if (!steeringWireCapture) {");
+  const steeringSend = block.indexOf("const submitted = await clickArmedSteeringSend();");
+  expect(missingWire).toBeGreaterThan(-1);
+  expect(steeringSend).toBeGreaterThan(missingWire);
+  expect(block.slice(missingWire, steeringSend)).toContain("await this.clearSteeringRevision(page).catch(() => {});");
+  expect(block.slice(missingWire, steeringSend)).toContain("throw new ChatGptSteeringUnavailableError();");
+  const steeringCapture = worker.indexOf('const steeringCapture = await webStreamTap.beginCapture({ kind: "submission" });', at);
+  const promotedCapture = worker.indexOf("wireCapture = steeringCapture;", steeringCapture);
+  const recoverySubscription = worker.indexOf("stopRecoveryWireObservation = steeringCapture.subscribe", promotedCapture);
+  expect(steeringCapture).toBeGreaterThan(at);
+  expect(promotedCapture).toBeGreaterThan(steeringCapture);
+  expect(recoverySubscription).toBeGreaterThan(promotedCapture);
   // Acceptance is exactly one new user turn whose content matches the submitted revision.
   expect(block).toContain("added.length > 1");
   expect(block).toContain("promptTextEquivalent");
   // The steady DOM loop drains the queue; the steerable path deliberately keeps DOM authority.
   expect(worker).toContain("await submitPendingSteering();");
+});
+
+test("retained abort requires exact assistant ownership on the next reused submitted turn", () => {
+  const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
+  const runExclusiveAt = worker.indexOf("private async runExclusive(");
+  const runBrowserAt = worker.indexOf("private async runBrowserTurn(", runExclusiveAt);
+  const runExclusive = worker.slice(runExclusiveAt, runBrowserAt);
+  expect(runExclusive).toContain('const requireExactOwnershipProof = typeof surfaceId === "string" && reused;');
+  expect(runExclusive).not.toContain("exactOwnershipAfterAbortSurfaces");
+  expect(runExclusive).toContain("requireExactOwnershipProof");
+
+  const runBrowser = worker.slice(runBrowserAt);
+  expect(runBrowser).toContain("wireCapture,");
+  expect(runBrowser).toContain("requireExactOwnershipProof,");
+  expect(runBrowser).toContain("&& !requireExactOwnershipProof");
 });
 
 test("a rejected steering round replays idempotently without appending after completion", () => {

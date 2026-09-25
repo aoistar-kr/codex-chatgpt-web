@@ -3,8 +3,14 @@ import type { ProviderAdapter } from "../src/adapters/base";
 import { defaultConfig } from "../src/config";
 import { COMPACT_PROMPT, SUMMARY_PREFIX, decodeCompactionSummary } from "../src/responses/compaction";
 import { compactRequest, responseRequest } from "../src/server";
-import type { CodexProviderConfig } from "../src/types";
-import { extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
+import type { CodexParsedRequest, CodexProviderConfig } from "../src/types";
+import {
+  extractChatGptCompactionRetainedInstructionRevision,
+  extractChatGptCompactionSourceRevision,
+  extractChatGptTurnIdentity,
+  extractChatGptTurnUserRevision,
+  isChatGptCompactionContinuation,
+} from "../src/adapters/chatgpt-web/environment";
 import { chatGptCompactionSourceExecutionKey, chatGptTurnExecutionKey } from "../src/adapters/chatgpt-web/turn-execution";
 
 const model = "chatgpt-web/high";
@@ -172,6 +178,121 @@ test("returns exactly one native compaction item for a ChatGPT Web v2 request", 
   expect(body.output).toHaveLength(1);
   expect(body.output[0]!.type).toBe("compaction");
   expect(decodeCompactionSummary(body.output[0]!.encrypted_content ?? "")).toBe(summary);
+});
+
+test("completed compaction authenticates the exact human instruction retained after goal and mixed context removal", async () => {
+  const threadId = "thread_compaction_retained_human";
+  const compactTurnId = "turn_compaction_retained_human";
+  const sourceTurnId = "turn_before_compaction_retained_human";
+  const metadata = {
+    request_kind: "turn",
+    thread_id: threadId,
+    turn_id: compactTurnId,
+    agent_name: "/root",
+  };
+  const human = {
+    type: "message",
+    role: "user",
+    id: "msg_retained_human",
+    content: [{ type: "input_text", text: "Continue the exact original task" }],
+    internal_chat_message_metadata_passthrough: {
+      turn_id: sourceTurnId,
+      content_item_kinds: ["user.text"],
+    },
+  };
+  const mixedContext = {
+    type: "message",
+    role: "user",
+    id: "msg_mixed_runtime_context",
+    content: [{ type: "input_text", text: "<recommended_plugins>plugins</recommended_plugins>\n<environment_context>runtime</environment_context>" }],
+    internal_chat_message_metadata_passthrough: {
+      turn_id: compactTurnId,
+      content_item_kinds: [
+        "plugins.recommendations",
+        "agents_md.instructions",
+        "environments.environment_context",
+      ],
+    },
+  };
+  const goal = {
+    type: "message",
+    role: "user",
+    id: "msg_current_goal",
+    content: [{ type: "input_text", text: "<codex_internal_context source=\"goal\">Continue autonomously</codex_internal_context>" }],
+    internal_chat_message_metadata_passthrough: {
+      turn_id: compactTurnId,
+      content_item_kinds: ["goal.internal_context"],
+    },
+  };
+  let compactParsed: CodexParsedRequest | undefined;
+  const response = await responseRequest(new Request("http://127.0.0.1:17841/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model,
+      stream: false,
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) },
+      input: [human, mixedContext, goal, { type: "compaction_trigger" }],
+    }),
+  }), defaultConfig("full"), () => ({
+    name: "retained-human-compactor",
+    async runTurn(parsed, _incoming, emit) {
+      compactParsed = parsed;
+      expect(extractChatGptCompactionSourceRevision(parsed).content).toEqual(goal.content);
+      expect(extractChatGptCompactionRetainedInstructionRevision(parsed)?.content).toEqual(human.content);
+      emit({ type: "text_delta", text: summary, phase: "final_answer" });
+      emit({ type: "done", stopReason: "stop", endTurn: true });
+    },
+  }));
+
+  expect(response.status).toBe(200);
+  const body = await response.json() as {
+    output: Array<{ type: string; encrypted_content?: string }>;
+  };
+  expect(compactParsed).toBeDefined();
+  expect(body.output).toHaveLength(1);
+  const compactionItem = body.output[0]!;
+  expect(compactionItem.type).toBe("compaction");
+
+  const continuation = {
+    ...compactParsed!,
+    _rawBody: {
+      ...(compactParsed!._rawBody as Record<string, unknown>),
+      // Native replacement drops the current goal. The mixed context remains earlier in history,
+      // while the older human instruction becomes the latest executable user revision.
+      input: [mixedContext, human, compactionItem],
+    },
+  } as CodexParsedRequest & { _compactionRequest?: boolean };
+  delete continuation._compactionRequest;
+  expect(isChatGptCompactionContinuation(continuation)).toBeTrue();
+  expect(extractChatGptTurnUserRevision(continuation)).toEqual(human.content);
+
+  const readableContinuation = {
+    ...continuation,
+    _rawBody: {
+      ...(continuation._rawBody as Record<string, unknown>),
+      input: [mixedContext, human, {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: `${SUMMARY_PREFIX}\n${summary}` }],
+      }],
+    },
+  } as CodexParsedRequest;
+  expect(isChatGptCompactionContinuation(readableContinuation)).toBeTrue();
+  expect(extractChatGptTurnUserRevision(readableContinuation)).toEqual(human.content);
+
+  const modifiedHuman = structuredClone(human);
+  modifiedHuman.content[0]!.text += " modified";
+  const modifiedContinuation = {
+    ...continuation,
+    _rawBody: {
+      ...(continuation._rawBody as Record<string, unknown>),
+      input: [mixedContext, modifiedHuman, compactionItem],
+    },
+  } as CodexParsedRequest;
+  expect(isChatGptCompactionContinuation(modifiedContinuation)).toBeFalse();
+  expect(() => extractChatGptTurnUserRevision(modifiedContinuation))
+    .toThrow("conflicts with native Codex turn_id metadata");
 });
 
 test("streams one compaction item without leaking the summary as a normal assistant message", async () => {
