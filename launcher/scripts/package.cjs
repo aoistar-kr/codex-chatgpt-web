@@ -29,11 +29,36 @@ if (target !== nativeTarget) {
 
 const env = { ...process.env };
 if (!env.CSC_LINK && !env.CSC_NAME) env.CSC_IDENTITY_AUTO_DISCOVERY = "false";
+const sourceRevisionResult = spawnSync("git", ["rev-parse", "HEAD"], {
+  cwd: path.resolve(root, ".."),
+  encoding: "utf8",
+  shell: false,
+});
+if (sourceRevisionResult.error) throw sourceRevisionResult.error;
+if (sourceRevisionResult.status !== 0) {
+  throw new Error(`Could not resolve launcher source revision: ${sourceRevisionResult.stderr.trim()}`);
+}
+const sourceRevision = sourceRevisionResult.stdout.trim().toLowerCase();
+if (!/^[a-f0-9]{40}$/.test(sourceRevision)) {
+  throw new Error(`Invalid launcher source revision: ${sourceRevision}`);
+}
+const sourceStatusResult = spawnSync("git", ["status", "--porcelain"], {
+  cwd: path.resolve(root, ".."),
+  encoding: "utf8",
+  shell: false,
+});
+if (sourceStatusResult.error) throw sourceStatusResult.error;
+if (sourceStatusResult.status !== 0) {
+  throw new Error(`Could not inspect launcher source state: ${sourceStatusResult.stderr.trim()}`);
+}
+const sourceState = sourceStatusResult.stdout.trim() ? "dirty" : "clean";
 const builderArgs = [
   electronBuilderCli,
   target,
   "--publish",
   "never",
+  `--config.extraMetadata.sourceRevision=${sourceRevision}`,
+  `--config.extraMetadata.sourceState=${sourceState}`,
 ];
 if (target === "--mac" && !env.CSC_LINK && !env.CSC_NAME) {
   builderArgs.push("--config.mac.identity=-");

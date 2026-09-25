@@ -7,12 +7,65 @@ const { spawnSync } = require("node:child_process");
 const {
   buildJob,
   compareVersions,
+  createSourceUpdateController,
   createUpdateController,
   expectedChecksum,
   macApplicationPath,
   releaseAssetName,
+  sourceCommitUrl,
   validateReleaseAssetUrl,
 } = require("../electron/update.cjs");
+
+test("source update check compares the packaged revision with the custom branch head", async () => {
+  const installed = "1".repeat(40);
+  const latest = "2".repeat(40);
+  let calls = 0;
+  const published = [];
+  const controller = createSourceUpdateController({
+    currentRevision: installed,
+    currentSourceState: "clean",
+    packaged: true,
+    publish: (state) => published.push(state),
+    dependencies: {
+      fetchSourceHead: async () => {
+        calls += 1;
+        return { sha: latest };
+      },
+    },
+  });
+
+  assert.deepEqual(await controller.checkOnce(), { status: "available", revision: latest.slice(0, 12) });
+  assert.deepEqual(await controller.checkOnce(), { status: "available", revision: latest.slice(0, 12) });
+  assert.equal(calls, 1);
+  assert.equal(controller.getUpdateUrl(), sourceCommitUrl(latest));
+  assert.deepEqual(published.map((state) => state.status), ["checking", "available"]);
+});
+
+test("source update check stays hidden when the installed source matches custom HEAD", async () => {
+  const revision = "a".repeat(40);
+  const controller = createSourceUpdateController({
+    currentRevision: revision,
+    currentSourceState: "clean",
+    packaged: true,
+    dependencies: { fetchSourceHead: async () => ({ sha: revision.toUpperCase() }) },
+  });
+
+  assert.deepEqual(await controller.checkOnce(), { status: "up-to-date" });
+  assert.equal(controller.getUpdateUrl(), null);
+});
+
+test("source update remains visible for a package built from a dirty worktree", async () => {
+  const revision = "b".repeat(40);
+  const controller = createSourceUpdateController({
+    currentRevision: revision,
+    currentSourceState: "dirty",
+    packaged: true,
+    dependencies: { fetchSourceHead: async () => ({ sha: revision }) },
+  });
+
+  assert.deepEqual(await controller.checkOnce(), { status: "available", revision: revision.slice(0, 12) });
+  assert.equal(controller.getUpdateUrl(), sourceCommitUrl(revision));
+});
 
 test("Linux auto-update fails closed without the stable installer wrapper", () => {
   const previousAppImage = process.env.CODEX_WEB_GPT_APPIMAGE;

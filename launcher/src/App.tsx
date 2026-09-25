@@ -327,9 +327,8 @@ function LauncherShell({
   const needsSetup = !needsBrowser
     && (snapshot.state.coreSetupComplete !== true || snapshot.state.codexCatalogVerified !== true);
   const mcpOptional = snapshot.state.codexCatalogVerified === true && snapshot.state.mcpSetupComplete !== true;
-  const updateVisible = ["available", "downloading", "installing"].includes(snapshot.update.status);
-  const updateBusy = snapshot.update.status === "downloading" || snapshot.update.status === "installing";
-  const updateVersion = "version" in snapshot.update ? snapshot.update.version : null;
+  const updateVisible = snapshot.update.status === "available";
+  const updateRevision = snapshot.update.status === "available" ? snapshot.update.revision : null;
 
   useLayoutEffect(() => {
     let cancelled = false;
@@ -416,10 +415,10 @@ function LauncherShell({
     if (compactSidebar) setSidebarOpen(false);
   };
 
-  const installUpdate = async () => {
+  const openUpdate = async () => {
     setError(null);
     try {
-      await api!.installUpdate();
+      await api!.openUpdate();
     } catch (cause) {
       setError(messageOf(cause));
     }
@@ -545,10 +544,9 @@ function LauncherShell({
               {updateVisible ? (
                 <SidebarItem
                   active={false}
-                  disabled={updateBusy || operation?.status === "running" || browser?.status === "running"}
                   icon="update"
-                  label={updateBusy ? copy.updating : `${copy.updateAvailable} v${updateVersion}`}
-                  onClick={() => void installUpdate()}
+                  label={`${copy.updateAvailable} ${updateRevision}`}
+                  onClick={() => void openUpdate()}
                   tone="update"
                 />
               ) : null}

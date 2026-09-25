@@ -30,7 +30,8 @@ const { ensurePackagedRuntime, preparePackagedRuntimeConcurrent } = require("./r
 const { RuntimeSupervisor } = require("./runtime-supervisor.cjs");
 const { DEVELOPMENT_PROFILE, resolveLauncherProfile } = require("./profile.cjs");
 const { runtimeBundlePaths, runtimeInvocation } = require("./runtime-command.cjs");
-const { createUpdateController } = require("./update.cjs");
+const { createSourceUpdateController } = require("./update.cjs");
+const launcherManifest = require("../package.json");
 const {
   createStateStore,
   nextSessionRefreshReminderAt,
@@ -763,14 +764,10 @@ function registerIpc({ logger, stateStore }) {
     logger.info("launcher.logs_exported", { recordCount });
     return result.filePath;
   });
-  handle("launcher:update-install", async () => {
-    if (!updateController) throw new Error("Launcher updates are unavailable");
-    const launch = await updateController.beginInstall();
-    const result = await requestQuit();
-    if (!result.ok) {
-      updateController.cancelInstall(launch);
-      throw new Error(result.message);
-    }
+  handle("launcher:update-open", async () => {
+    const url = updateController?.getUpdateUrl();
+    if (!url) throw new Error("No source update is available");
+    await openWebUrl(url);
     return true;
   });
   handle("launcher:window-state", (event) => {
@@ -989,17 +986,10 @@ async function start() {
     showWindow: showMainWindow,
   });
   await browserHost.ready();
-  const updaterRuntimeRoot = runtimeRootProvider();
-  updateController = createUpdateController({
-    currentVersion: app.getVersion(),
-    platform: process.platform,
-    arch: process.arch,
+  updateController = createSourceUpdateController({
+    currentRevision: launcherManifest.sourceRevision,
+    currentSourceState: launcherManifest.sourceState,
     packaged: app.isPackaged && !IS_DEV_PROFILE,
-    executablePath: process.execPath,
-    runtimeExecutable: updaterRuntimeRoot
-      ? runtimeBundlePaths(updaterRuntimeRoot, process.platform).executable
-      : null,
-    logsDirectory: app.getPath("logs"),
     publish: (state) => send("launcher:update-state", state),
     logger,
   });

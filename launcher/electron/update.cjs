@@ -8,8 +8,23 @@ const { pipeline } = require("node:stream/promises");
 
 const REPOSITORY = "miuuyy/codex-chatgpt-web";
 const RELEASE_API_URL = `https://api.github.com/repos/${REPOSITORY}/releases/latest`;
+const SOURCE_REPOSITORY = "aoistar-kr/codex-chatgpt-web";
+const SOURCE_REF = "custom";
+const SOURCE_COMMIT_API_URL = `https://api.github.com/repos/${SOURCE_REPOSITORY}/commits/${SOURCE_REF}`;
+const SOURCE_REPOSITORY_URL = `https://github.com/${SOURCE_REPOSITORY}`;
 const USER_AGENT = "codex-web-gpt-launcher-updater";
 const MAX_REDIRECTS = 5;
+
+function normalizeRevision(value) {
+  const revision = String(value || "").trim().toLowerCase();
+  return /^[a-f0-9]{40}$/.test(revision) ? revision : null;
+}
+
+function sourceCommitUrl(revision) {
+  const normalized = normalizeRevision(revision);
+  if (!normalized) throw new Error(`Invalid source revision: ${revision}`);
+  return `${SOURCE_REPOSITORY_URL}/commit/${normalized}`;
+}
 
 function parseVersion(value) {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(String(value || "").trim());
@@ -244,6 +259,67 @@ function defaultDependencies() {
   };
 }
 
+function createSourceUpdateController({
+  currentRevision,
+  currentSourceState,
+  packaged,
+  publish,
+  logger,
+  dependencies = {},
+}) {
+  const installedRevision = normalizeRevision(currentRevision);
+  const installedSourceState = currentSourceState === "clean" || currentSourceState === "dirty"
+    ? currentSourceState
+    : null;
+  const deps = {
+    fetchSourceHead: async () => JSON.parse(await downloadText(SOURCE_COMMIT_API_URL)),
+    ...dependencies,
+  };
+  let state = packaged && installedRevision && installedSourceState ? { status: "idle" } : { status: "disabled" };
+  let checked = false;
+  let updateUrl = null;
+
+  const transition = (next) => {
+    state = next;
+    publish?.(state);
+    return state;
+  };
+
+  async function checkOnce() {
+    if (state.status === "disabled" || checked) return state;
+    checked = true;
+    transition({ status: "checking" });
+    try {
+      const remote = await deps.fetchSourceHead();
+      const revision = normalizeRevision(remote?.sha);
+      if (!revision) throw new Error("GitHub returned an invalid source revision");
+      if (revision === installedRevision && installedSourceState === "clean") {
+        updateUrl = null;
+        return transition({ status: "up-to-date" });
+      }
+      updateUrl = sourceCommitUrl(revision);
+      logger?.info("launcher.source_update_available", {
+        currentRevision: installedRevision,
+        currentSourceState: installedSourceState,
+        revision,
+        repository: SOURCE_REPOSITORY,
+        ref: SOURCE_REF,
+      });
+      return transition({ status: "available", revision: revision.slice(0, 12) });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger?.warn("launcher.source_update_check_failed", { message });
+      return transition({ status: "error", message });
+    }
+  }
+
+  return {
+    getState: () => state,
+    getUpdateUrl: () => updateUrl,
+    checkOnce,
+  };
+}
+
 function createUpdateController({
   currentVersion,
   platform,
@@ -376,11 +452,14 @@ function createUpdateController({
 module.exports = {
   buildJob,
   compareVersions,
+  createSourceUpdateController,
   createUpdateController,
   expectedChecksum,
   macApplicationPath,
+  normalizeRevision,
   parseVersion,
   releaseAssetName,
   releaseVersion,
+  sourceCommitUrl,
   validateReleaseAssetUrl,
 };
