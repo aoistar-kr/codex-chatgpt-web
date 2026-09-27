@@ -538,6 +538,9 @@ export class ChatGptMarkdownBuffer {
 
     if (segment.sourceStart !== undefined) return undefined;
     if (!segment.tag) return undefined;
+    // Empty text is not a semantic identity: unrelated rules, media placeholders and renderer
+    // shells can all share it. Exact DOM keys and source ranges above remain valid.
+    if (!segment.text.trim()) return undefined;
     const semanticMatches = this.committed
       .map((committed, index) => ({ committed, index }))
       .filter(({ committed }) => committed.tag === segment.tag && committed.text === segment.text);
@@ -553,6 +556,7 @@ export class ChatGptMarkdownBuffer {
     if (exact.length === 1) return true;
     if (segment.sourceStart !== undefined) return false;
     if (!segment.tag) return false;
+    if (!segment.text.trim()) return false;
     return this.latest.filter(candidate => (
       candidate.tag === segment.tag && candidate.text === segment.text
     )).length === 1;

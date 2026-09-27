@@ -59,7 +59,7 @@ test("browser turn orchestration retains owned prompt insertion and semantic sub
   expect(runBrowserTurn).toContain("return this.attachPromptWithCompactionRetry(");
   expect(runBrowserTurn).toContain("connectorAttemptBudget");
   expect(workerSource).toContain('.locator("xpath=ancestor::form[1]")');
-  expect(workerSource).toContain('.getByTestId("send-button")');
+  expect(workerSource).toContain("composerForm.locator('[data-testid=\"send-button\"], button[type=\"submit\"]')");
   expect(workerSource).toContain("await this.waitForSubmissionAccepted(");
   const sendAttachedPrompt = workerSource.slice(
     workerSource.indexOf("  private async sendAttachedPrompt("),
@@ -393,6 +393,33 @@ test("a build without assistant message ids still binds one request-owned turn",
     { streamId: "stream-owned", complete: false, failed: false },
     true,
   )).toBeUndefined();
+});
+
+test("a grouped renderer identity remains wire-owned when assistant message ids are unavailable", () => {
+  const grouped = [{
+    identity: "group:assistant:submitted",
+    nodeCount: 1,
+    messageIds: [],
+    assistantMessageIdsUnavailable: true,
+  }];
+  expect(chatGptResolveAssistantTurnOwnership(
+    ["group:assistant:submitted"],
+    grouped,
+    { streamId: "stream-owned", complete: false, failed: false },
+    true,
+  )).toBe("group:assistant:submitted");
+  expect(chatGptResolveAssistantTurnOwnership(
+    ["group:assistant:submitted"],
+    grouped,
+    { complete: false, failed: false },
+    true,
+  )).toBeUndefined();
+  const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  expect(source).toContain('identity.startsWith("group:assistant:")');
+  expect(source).toContain('const grouped = new Map<string, Element[]>()');
+  expect(source).toContain('const assistant = `group:assistant:${key}`');
+  expect(source).toContain("exactOwnershipRequired = true");
+  expect(source).toContain("chatGptTurnLocatorSelector(identity)");
 });
 
 test("assistant bindings retain direct message identity for same-document and launcher remount proof", () => {
@@ -1983,8 +2010,8 @@ test("image attachment readiness uses exact file tiles and not localized remove-
         },
       };
     },
-    getByTestId: (testId: string) => {
-      expect(testId).toBe("send-button");
+    locator: (selector: string) => {
+      expect(selector).toBe('[data-testid="send-button"], button[type="submit"]');
       return send;
     },
   };
@@ -2035,15 +2062,16 @@ test("effort selection uses structural menu and slider indices instead of locali
   expect(workerSource).toContain("CHATGPT_EFFORT_MENU_SELECTOR");
   expect(workerSource).toContain("CHATGPT_EFFORT_ITEM_SELECTOR");
   expect(workerSource).toContain('timeout: 70_000');
-  expect(sessionSource).toContain('[role="menu"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider])');
-  expect(sessionSource).toContain('[role="group"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider])');
+  expect(sessionSource).toContain('[role="menu"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider], [data-model-picker-power-slider], [data-reasoning-slider])');
+  expect(sessionSource).toContain('[role="group"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider], [data-model-picker-power-slider], [data-reasoning-slider])');
   expect(sessionSource).toContain('[role="menuitemradio"]');
   expect(sessionSource).toContain('[data-model-reasoning-effort-slider] [role="slider"]');
+  expect(sessionSource).toContain('[data-model-picker-power-slider] [role="slider"]');
   expect(sessionSource).not.toContain(":popover-open");
   expect(sessionSource).not.toContain("data-radix-collection-item");
   expect(workerSource).toContain('getAttribute("aria-checked")');
   expect(workerSource).toContain('getAttribute("aria-expanded")');
-  expect(workerSource).toContain('getAttribute("aria-valuenow")');
+  expect(workerSource).toContain("readChatGptEffortSnapshot(effortSlider)");
   expect(workerSource).toContain("sliderControl.press(key)");
   expect(workerSource).toContain('if (ready !== "slider" && await effortSlider.isVisible().catch(() => false)) ready = "slider";');
   expect(workerSource).not.toContain("currentLabel === targetLabel");
@@ -3036,7 +3064,8 @@ test("response DOM separates streaming commentary from the final Markdown answer
   expect(workerSource).toContain("new MutationObserver(() =>");
   expect(workerSource).toContain("state.waiters.clear();");
   expect(workerSource).toContain("waiters.forEach(resolveWaiter => resolveWaiter())");
-  expect(workerSource).toContain('const allMarkdownRoots = [...root.querySelectorAll<HTMLElement>(".markdown")]');
+  expect(workerSource).toContain("const answerRootSelector = [");
+  expect(workerSource).toContain("root.querySelectorAll<HTMLElement>(answerRootSelector)");
   expect(workerSource).toContain("const selectChatGptAnswerRoots = (");
   expect(workerSource).toContain('candidate.closest("[data-streaming-response-status]") !== null');
   expect(workerSource).toContain("const streamingStatusContainers = [...root.querySelectorAll<HTMLElement>");
@@ -3051,7 +3080,7 @@ test("response DOM separates streaming commentary from the final Markdown answer
   expect(workerSource).toContain("const flattenedMarkdownSegments:");
   expect(workerSource).toContain("Root boundaries and visible indices therefore are not identity");
   expect(workerSource).toContain("const blockMarkdownTags = new Set([");
-  expect(workerSource).toContain("markdownRoot.childNodes.forEach((node) => {");
+  expect(workerSource).toContain("content.childNodes.forEach((node) => {");
   expect(workerSource).toContain("flushInlineRun();");
   expect(workerSource).toContain('tag: "inline"');
   expect(workerSource).not.toContain("const hasDirectText =");

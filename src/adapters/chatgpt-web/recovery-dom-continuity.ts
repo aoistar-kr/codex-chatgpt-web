@@ -42,7 +42,12 @@ export function startChatGptRecoveryDomContinuity(options: {
   };
   const observer = new MutationObserver(consume);
   observer.observe(root.documentElement, { subtree: true, childList: true, attributes: true, attributeOldValue: true,
-    attributeFilter: ["data-testid", "data-message-id", "data-message-author-role", "data-turn", "data-turn-id", "data-turn-id-container"] });
+    attributeFilter: [
+      "data-testid", "data-message-id", "data-message-author-role", "data-turn", "data-turn-id",
+      "data-turn-id-container", "data-turn-key", "data-conversation-role", "data-chatgpt-agent-turn-start",
+      "data-user-message-bubble", "data-markdown-text-style", "data-markdown-text-tone",
+      "data-content-search-unit-key",
+    ] });
   const onNavigation = () => { navigated = true; };
   for (const event of ["pagehide", "popstate", "hashchange"]) view.addEventListener(event, onNavigation);
   const removeListeners = () => {

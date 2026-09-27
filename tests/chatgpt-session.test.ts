@@ -3,9 +3,21 @@ import {
   CHATGPT_COMPOSER_SELECTOR,
   CHATGPT_EFFORT_CONTROL_SELECTOR,
   CHATGPT_EFFORT_MENU_SELECTOR,
+  CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
   CHATGPT_EFFORT_SLIDER_SELECTOR,
+  chatGptTurnLocatorSelector,
   detectChatGptAccountCapabilities,
+  readChatGptEffortSnapshot,
 } from "../src/chatgpt-session";
+
+test("turn locator identities keep grouped renderer keys separate from legacy turn ids", () => {
+  expect(chatGptTurnLocatorSelector("legacy-turn")).toBe('[data-turn-id="legacy-turn"]');
+  expect(chatGptTurnLocatorSelector("group:user:shared-key"))
+    .toBe('[data-turn-key="shared-key"]:has([data-user-message-bubble])');
+  expect(chatGptTurnLocatorSelector("group:assistant:shared-key"))
+    .toBe('[data-turn-key="shared-key"]:has([data-conversation-role="assistant"], [data-chatgpt-agent-turn-start])');
+  expect(chatGptTurnLocatorSelector("group:assistant:shared-key")).not.toContain("data-turn-id");
+});
 
 test("login keeps the established turn composer contract", () => {
   const turnSelectors = CHATGPT_COMPOSER_SELECTOR.split(",").map(selector => selector.trim());
@@ -20,6 +32,27 @@ test("the effort selector identifies the model slider instead of any composer me
   expect(CHATGPT_EFFORT_CONTROL_SELECTOR).toContain('button[aria-haspopup="menu"][data-tone="neutral"]');
   expect(CHATGPT_EFFORT_CONTROL_SELECTOR).toContain('[data-testid="model-switcher-dropdown-button"]');
   expect(CHATGPT_EFFORT_CONTROL_SELECTOR).not.toBe('button[aria-haspopup="menu"]');
+  expect(CHATGPT_EFFORT_MENU_SELECTOR).toContain("[data-model-picker-power-slider]");
+  expect(CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR).toContain("[data-model-picker-power-slider]");
+  expect(CHATGPT_EFFORT_SLIDER_SELECTOR).toContain('[data-model-picker-power-slider] [role="slider"]');
+});
+
+test("the power slider reads one atomic snapshot and rejects a locked Pro tier", async () => {
+  const slider = {
+    evaluate: async () => ({
+      min: "0",
+      max: "4",
+      value: "3",
+      power: true,
+      locks: ["false", "false", "false", "false", "true"],
+    }),
+  };
+  await expect(readChatGptEffortSnapshot(slider as never)).resolves.toEqual({
+    min: 0,
+    max: 4,
+    value: 3,
+    available: [true, true, true, true, false],
+  });
 });
 
 test("a complete authenticated composer with no effort selector is Luna-only", async () => {
@@ -110,11 +143,13 @@ test("the new model rows cannot hide an authoritative five-step Pro effort slide
     last() { return this; },
     waitFor: async () => {},
     isVisible: async () => true,
-    getAttribute: async (name: string) => ({
-      "aria-valuemin": "0",
-      "aria-valuemax": "4",
-      "aria-valuenow": "3",
-    })[name] ?? null,
+    evaluate: async () => ({
+      min: "0",
+      max: "4",
+      value: "3",
+      power: false,
+      locks: [],
+    }),
   };
   const page = {
     locator: (selector: string) => {

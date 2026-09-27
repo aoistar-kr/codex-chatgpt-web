@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  ChatGptMarkdownBuffer,
   chatGptHtmlToMarkdown,
   compareChatGptWireAndDomMarkdown,
 } from "../src/adapters/chatgpt-web/markdown";
@@ -214,4 +215,12 @@ test("reports only content-free shape metadata for residual Markdown differences
     wireBackslashes: 0,
     domBackslashes: 0,
   });
+});
+
+test("does not use empty text as a semantic Markdown block identity", () => {
+  const buffer = new ChatGptMarkdownBuffer(markdown => markdown, 0);
+  buffer.observe([{ key: "old-rule", tag: "hr", html: "<hr>", text: "", streamable: true }], 0);
+  buffer.observe([{ key: "new-rule", tag: "hr", html: "<hr>", text: "", streamable: false }], 1);
+  expect(buffer.currentSnapshotIsConsistent()).toBeFalse();
+  expect(() => buffer.finish()).toThrow("could not be aligned");
 });
