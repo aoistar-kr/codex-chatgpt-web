@@ -42,14 +42,32 @@ export type ChatGptDirectRequestMetadata = {
   mode?: { model: string; thinkingEffort?: string };
 };
 
+type ChatGptRequestShapeValueType = "m" | "n" | "s" | "a" | "o" | "x";
+
+export type ChatGptRequestShapeReceipt = {
+  noncePath: "messages[].content.parts[]" | "unknown";
+  nodeTypes: "o>a>o>o>a>s" | "unknown";
+  model: ChatGptRequestShapeValueType;
+  thinkingEffort: ChatGptRequestShapeValueType;
+  messageMetadata: ChatGptRequestShapeValueType;
+  topHints: ChatGptRequestShapeValueType;
+  messageHints: ChatGptRequestShapeValueType;
+  serialization: ChatGptRequestShapeValueType;
+  offsets: ChatGptRequestShapeValueType;
+};
+
 export type ChatGptRequestInjectionSnapshot = {
   observed: boolean;
   rewritten: boolean;
-  failureCode?: "unsupported-body" | "invalid-json" | "non-object-json" | "match-count" | "literal-count" | "request-shape" | "transport";
+  failureCode?: "unsupported-body" | "invalid-json" | "non-object-json" | "match-count" | "literal-count"
+    | "request-shape" | "request-shape-model" | "request-shape-messages" | "request-shape-content"
+    | "request-shape-metadata" | "request-shape-parts" | "request-shape-hints" | "request-shape-serialization"
+    | "request-shape-offsets" | "request-shape-replace-count" | "transport";
   exactValueMatches?: number;
   literalMatches?: number;
   originalBodyChars?: number;
   rewrittenBodyChars?: number;
+  shapeReceipt?: ChatGptRequestShapeReceipt;
 };
 
 export type ChatGptCdpRequestInjectionShadowSnapshot = {
@@ -76,12 +94,14 @@ type RequestInjectionShadowEvent = {
 
 type RequestInjectionEvent = {
   type: "request-injection";
+  receiptToken: string;
   rewritten: boolean;
   failureCode?: ChatGptRequestInjectionSnapshot["failureCode"];
   exactValueMatches: number;
   literalMatches: number;
   originalBodyChars: number;
   rewrittenBodyChars: number;
+  shapeReceipt?: ChatGptRequestShapeReceipt;
 };
 
 export class ChatGptRequestInjectionFallbackError extends Error {
@@ -580,6 +600,7 @@ export class ChatGptRequestInjector {
     private readonly page: Page,
     private readonly bindingName: string,
     private readonly token: string,
+    private readonly receiptToken: string,
   ) {}
 
   static async install(
@@ -609,11 +630,19 @@ export class ChatGptRequestInjector {
     }
     const safeTrace = traceId.replace(/[^a-zA-Z0-9_]/g, "_").slice(0, 48);
     const token = randomUUID();
+    const receiptToken = randomUUID();
     const bindingName = `__codexRequestInject_${safeTrace}_${token.replaceAll("-", "")}`;
-    const injector = new ChatGptRequestInjector(page, bindingName, token);
+    const injector = new ChatGptRequestInjector(page, bindingName, token, receiptToken);
     await page.exposeFunction(bindingName, (payload: string) => injector.receive(payload));
     try {
-      await page.evaluate(({ bindingName: installedBinding, installedToken, placeholderValue, promptValue, directMetadataValue }) => {
+      await page.evaluate(({
+        bindingName: installedBinding,
+        installedToken,
+        installedReceiptToken,
+        placeholderValue,
+        promptValue,
+        directMetadataValue,
+      }) => {
         const root = window as typeof window & {
           __codexRequestInjector?: { token: string; restore(): void };
           [key: string]: unknown;
@@ -627,7 +656,10 @@ export class ChatGptRequestInjector {
         let consumed = false;
         const emit = (event: RequestInjectionEvent) => {
           try {
-            void (binding as (payload: string) => Promise<unknown>)(JSON.stringify(event));
+            void (binding as (payload: string) => Promise<unknown>)(JSON.stringify({
+              ...event,
+              receiptToken: installedReceiptToken,
+            }));
           } catch {
             // The request itself remains fail-closed even if diagnostics disconnect.
           }
@@ -660,20 +692,83 @@ export class ChatGptRequestInjector {
           return Object.values(value as Record<string, unknown>)
             .reduce<number>((count, entry) => count + countExactValues(entry), 0);
         };
+        const valueType = (value: unknown, present = true): ChatGptRequestShapeValueType => {
+          if (!present) return "m";
+          if (value === null) return "n";
+          if (typeof value === "string") return "s";
+          if (Array.isArray(value)) return "a";
+          if (typeof value === "object") return "o";
+          return "x";
+        };
+        const requestShapeReceipt = (decodedValue: unknown): ChatGptRequestShapeReceipt | undefined => {
+          if (!decodedValue || typeof decodedValue !== "object" || Array.isArray(decodedValue)) return undefined;
+          const body = decodedValue as Record<string, unknown>;
+          const messages = body.messages;
+          let noncePath: ChatGptRequestShapeReceipt["noncePath"] = "unknown";
+          let nodeTypes: ChatGptRequestShapeReceipt["nodeTypes"] = "unknown";
+          let message: Record<string, unknown> | undefined;
+          let metadata: Record<string, unknown> | undefined;
+          if (Array.isArray(messages)) {
+            let matches = 0;
+            for (const candidate of messages) {
+              if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+              const candidateMessage = candidate as Record<string, unknown>;
+              const content = candidateMessage.content;
+              if (!content || typeof content !== "object" || Array.isArray(content)) continue;
+              const parts = (content as Record<string, unknown>).parts;
+              if (!Array.isArray(parts)) continue;
+              for (const part of parts) {
+                if (typeof part === "string" && part.includes(placeholderValue)) {
+                  matches += 1;
+                  message = candidateMessage;
+                }
+              }
+            }
+            if (matches === 1) {
+              noncePath = "messages[].content.parts[]";
+              nodeTypes = "o>a>o>o>a>s";
+            }
+          }
+          const metadataValue = message?.metadata;
+          if (metadataValue && typeof metadataValue === "object" && !Array.isArray(metadataValue)) {
+            metadata = metadataValue as Record<string, unknown>;
+          }
+          const serializationValue = metadata?.serialization_metadata;
+          const serialization = serializationValue && typeof serializationValue === "object"
+            && !Array.isArray(serializationValue)
+            ? serializationValue as Record<string, unknown>
+            : undefined;
+          const receipt: ChatGptRequestShapeReceipt = {
+            noncePath,
+            nodeTypes,
+            model: valueType(body.model, Object.hasOwn(body, "model")),
+            thinkingEffort: valueType(body.thinking_effort, Object.hasOwn(body, "thinking_effort")),
+            messageMetadata: valueType(metadataValue, message ? Object.hasOwn(message, "metadata") : false),
+            topHints: valueType(body.system_hints, Object.hasOwn(body, "system_hints")),
+            messageHints: valueType(metadata?.system_hints, metadata ? Object.hasOwn(metadata, "system_hints") : false),
+            serialization: valueType(serializationValue, metadata ? Object.hasOwn(metadata, "serialization_metadata") : false),
+            offsets: valueType(serialization?.custom_symbol_offsets, serialization
+              ? Object.hasOwn(serialization, "custom_symbol_offsets") : false),
+          };
+          return JSON.stringify(receipt).length <= 240 ? receipt : undefined;
+        };
         const fail = (
           failureCode: NonNullable<RequestInjectionEvent["failureCode"]>,
           exactValueMatches = 0,
           literalMatches = 0,
           originalBodyChars = 0,
+          receipt?: ChatGptRequestShapeReceipt,
         ): never => {
           emit({
             type: "request-injection",
+            receiptToken: installedReceiptToken,
             rewritten: false,
             failureCode,
             exactValueMatches,
             literalMatches,
             originalBodyChars,
             rewrittenBodyChars: 0,
+            ...(receipt ? { shapeReceipt: receipt } : {}),
           });
           throw new TypeError(`ChatGPT request injection rejected the generated request (${failureCode})`);
         };
@@ -720,8 +815,9 @@ export class ChatGptRequestInjector {
             return fail("non-object-json", 0, 0, rawBody.length);
           }
           const exactValueMatches = countExactValues(decoded);
+          const receipt = requestShapeReceipt(decoded);
           if (exactValueMatches !== 1) {
-            return fail("match-count", exactValueMatches, 0, rawBody.length);
+            return fail("match-count", exactValueMatches, 0, rawBody.length, receipt);
           }
           let literalMatches = 0;
           let searchFrom = 0;
@@ -732,7 +828,7 @@ export class ChatGptRequestInjector {
             searchFrom = index + placeholderLiteral.length;
           }
           if (literalMatches !== 1) {
-            return fail("literal-count", exactValueMatches, literalMatches, rawBody.length);
+            return fail("literal-count", exactValueMatches, literalMatches, rawBody.length, receipt);
           }
           let rewrittenBody: string;
           if (directMetadataValue?.connector || directMetadataValue?.mode) {
@@ -762,7 +858,7 @@ export class ChatGptRequestInjector {
             if (directMetadataValue.mode) {
               if (typeof body.model !== "string"
                 || (body.thinking_effort !== undefined && typeof body.thinking_effort !== "string")) {
-                return fail("request-shape", exactValueMatches, literalMatches, rawBody.length);
+                return fail("request-shape-model", exactValueMatches, literalMatches, rawBody.length, receipt);
               }
               body.model = directMetadataValue.mode.model;
               if (directMetadataValue.mode.thinkingEffort === undefined) {
@@ -776,14 +872,16 @@ export class ChatGptRequestInjector {
               const messages = body.messages;
               if (!Array.isArray(messages) || messages.length !== 1
                 || !messages[0] || typeof messages[0] !== "object" || Array.isArray(messages[0])) {
-                return fail("request-shape", exactValueMatches, literalMatches, rawBody.length);
+                return fail("request-shape-messages", exactValueMatches, literalMatches, rawBody.length, receipt);
               }
               const message = messages[0] as Record<string, unknown>;
               const content = message.content;
               const metadata = message.metadata;
-              if (!content || typeof content !== "object" || Array.isArray(content)
-                || !metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
-                return fail("request-shape", exactValueMatches, literalMatches, rawBody.length);
+              if (!content || typeof content !== "object" || Array.isArray(content)) {
+                return fail("request-shape-content", exactValueMatches, literalMatches, rawBody.length, receipt);
+              }
+              if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+                return fail("request-shape-metadata", exactValueMatches, literalMatches, rawBody.length, receipt);
               }
               const partsValue = (content as Record<string, unknown>).parts;
               const parts: unknown[] | undefined = Array.isArray(partsValue) ? partsValue : undefined;
@@ -796,15 +894,19 @@ export class ChatGptRequestInjector {
                   && part.split(placeholderValue).length - 1 === 1)
                 : -1;
               if (parts === undefined || textPartIndex === -1) {
-                return fail("request-shape", exactValueMatches, literalMatches, rawBody.length);
+                return fail("request-shape-parts", exactValueMatches, literalMatches, rawBody.length, receipt);
               }
               const topHints = body.system_hints;
               const messageMetadata = metadata as Record<string, unknown>;
               const messageHints = messageMetadata.system_hints;
-              if (!Array.isArray(topHints) || (topHints.length !== 0 && !(topHints.length === 1 && topHints[0] === pluginId))
-                || (messageHints !== undefined && (!Array.isArray(messageHints)
-                  || (messageHints.length !== 0 && !(messageHints.length === 1 && messageHints[0] === pluginId))))) {
-                return fail("request-shape", exactValueMatches, literalMatches, rawBody.length);
+              // The current ChatGPT client no longer sends system_hints on the conversation POST, so an
+              // absent field is a state this flow owns and may set. A present field that is neither empty
+              // nor already bound to this exact plugin belongs to another connector and must not be clobbered.
+              const hintsConflict = (hints: unknown): boolean => hints !== undefined
+                && (!Array.isArray(hints)
+                  || (hints.length !== 0 && !(hints.length === 1 && hints[0] === pluginId)));
+              if (hintsConflict(topHints) || hintsConflict(messageHints)) {
+                return fail("request-shape-hints", exactValueMatches, literalMatches, rawBody.length, receipt);
               }
               let serialization = messageMetadata.serialization_metadata;
               if (serialization === undefined) {
@@ -812,12 +914,12 @@ export class ChatGptRequestInjector {
                 messageMetadata.serialization_metadata = serialization;
               }
               if (!serialization || typeof serialization !== "object" || Array.isArray(serialization)) {
-                return fail("request-shape", exactValueMatches, literalMatches, rawBody.length);
+                return fail("request-shape-serialization", exactValueMatches, literalMatches, rawBody.length, receipt);
               }
               const serializationObject = serialization as Record<string, unknown>;
               const offsets = serializationObject.custom_symbol_offsets;
               if (offsets !== undefined && (!Array.isArray(offsets) || offsets.length !== 0)) {
-                return fail("request-shape", exactValueMatches, literalMatches, rawBody.length);
+                return fail("request-shape-offsets", exactValueMatches, literalMatches, rawBody.length, receipt);
               }
               const mention = `@${appName}`;
               parts[textPartIndex] = `${mention}  ${parts[textPartIndex] as string}`;
@@ -829,7 +931,7 @@ export class ChatGptRequestInjector {
               body.client_prepare_state = "success";
             }
             if (replacePlaceholder(body) !== 1) {
-              return fail("request-shape", exactValueMatches, literalMatches, rawBody.length);
+              return fail("request-shape-replace-count", exactValueMatches, literalMatches, rawBody.length, receipt);
             }
             rewrittenBody = JSON.stringify(body);
           } else {
@@ -841,18 +943,20 @@ export class ChatGptRequestInjector {
           }
           emit({
             type: "request-injection",
+            receiptToken: installedReceiptToken,
             rewritten: true,
             exactValueMatches,
             literalMatches,
             originalBodyChars: rawBody.length,
             rewrittenBodyChars: rewrittenBody.length,
+            ...(receipt ? { shapeReceipt: receipt } : {}),
           });
           if (requestBodyTransport === "request-clone" && inputRequest) {
             let rewrittenRequest: Request;
             try {
               rewrittenRequest = new Request(inputRequest, { ...init, body: rewrittenBody });
             } catch {
-              return fail("transport", exactValueMatches, literalMatches, rawBody.length);
+              return fail("transport", exactValueMatches, literalMatches, rawBody.length, receipt);
             }
             return originalFetch(rewrittenRequest);
           }
@@ -869,6 +973,7 @@ export class ChatGptRequestInjector {
       }, {
         bindingName,
         installedToken: token,
+        installedReceiptToken: receiptToken,
         placeholderValue: placeholder,
         promptValue: prompt,
         directMetadataValue: directMetadata,
@@ -947,7 +1052,9 @@ export class ChatGptRequestInjector {
     } catch {
       return;
     }
-    if (!isRequestInjectionEvent(event)) return;
+    if (!event || typeof event !== "object"
+      || (event as Record<string, unknown>).receiptToken !== this.receiptToken
+      || !isRequestInjectionEvent(event)) return;
     this.snapshotValue = {
       observed: true,
       rewritten: event.rewritten,
@@ -956,6 +1063,7 @@ export class ChatGptRequestInjector {
       literalMatches: event.literalMatches,
       originalBodyChars: event.originalBodyChars,
       rewrittenBodyChars: event.rewrittenBodyChars,
+      shapeReceipt: event.shapeReceipt,
     };
     const snapshot = this.snapshot();
     for (const listener of this.listeners) listener(snapshot);
@@ -1295,8 +1403,32 @@ function isRequestInjectionEvent(value: unknown): value is RequestInjectionEvent
     || event.failureCode === "match-count"
     || event.failureCode === "literal-count"
     || event.failureCode === "request-shape"
+    || event.failureCode === "request-shape-model"
+    || event.failureCode === "request-shape-messages"
+    || event.failureCode === "request-shape-content"
+    || event.failureCode === "request-shape-metadata"
+    || event.failureCode === "request-shape-parts"
+    || event.failureCode === "request-shape-hints"
+    || event.failureCode === "request-shape-serialization"
+    || event.failureCode === "request-shape-offsets"
+    || event.failureCode === "request-shape-replace-count"
     || event.failureCode === "transport";
+  const receipt = event.shapeReceipt;
+  const receiptTypes = new Set(["m", "n", "s", "a", "o", "x"]);
+  const receiptValid = receipt === undefined || (
+    receipt !== null && typeof receipt === "object" && !Array.isArray(receipt)
+    && Object.keys(receipt as Record<string, unknown>).length === 9
+    && ((receipt as Record<string, unknown>).noncePath === "messages[].content.parts[]"
+      || (receipt as Record<string, unknown>).noncePath === "unknown")
+    && ((receipt as Record<string, unknown>).nodeTypes === "o>a>o>o>a>s"
+      || (receipt as Record<string, unknown>).nodeTypes === "unknown")
+    && ["model", "thinkingEffort", "messageMetadata", "topHints", "messageHints", "serialization", "offsets"]
+      .every(key => receiptTypes.has((receipt as Record<string, unknown>)[key] as string))
+    && JSON.stringify(receipt).length <= 240
+  );
   return event.type === "request-injection"
+    && typeof event.receiptToken === "string"
+    && /^[0-9a-f-]{36}$/.test(event.receiptToken)
     && typeof event.rewritten === "boolean"
     && failureCodeValid
     && Number.isSafeInteger(event.exactValueMatches)
@@ -1306,5 +1438,6 @@ function isRequestInjectionEvent(value: unknown): value is RequestInjectionEvent
     && Number.isSafeInteger(event.originalBodyChars)
     && Number(event.originalBodyChars) >= 0
     && Number.isSafeInteger(event.rewrittenBodyChars)
-    && Number(event.rewrittenBodyChars) >= 0;
+    && Number(event.rewrittenBodyChars) >= 0
+    && receiptValid;
 }

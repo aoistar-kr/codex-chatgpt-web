@@ -6215,6 +6215,7 @@ export class ChatGptBrowserWorker {
           literalMatches: injectionFailure.literalMatches,
           originalBodyChars: injectionFailure.originalBodyChars,
           rewrittenBodyChars: injectionFailure.rewrittenBodyChars,
+          shapeReceipt: injectionFailure.shapeReceipt,
         })}`);
         await diagnostics.capture(page, `request-injection-fallback-${injectionFailure.failureCode ?? "unknown"}-e${injectionFailure.exactValueMatches ?? "x"}-l${injectionFailure.literalMatches ?? "x"}`);
         await this.assertRequestInjectionFallbackSafe(page, submissionBaseline, turn.abortSignal);
@@ -7767,6 +7768,7 @@ export class ChatGptBrowserWorker {
           literalMatches: injection.literalMatches,
           originalBodyChars: injection.originalBodyChars,
           rewrittenBodyChars: injection.rewrittenBodyChars,
+          shapeReceipt: injection.shapeReceipt,
         })}`);
       }
       if (requestInjector) {

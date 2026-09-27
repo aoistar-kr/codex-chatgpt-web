@@ -284,7 +284,8 @@ process.env.CODEX_CHATGPT_WEB_REQUEST_INJECTION_SHADOW = requestPrimary
 process.env.CODEX_CHATGPT_WEB_REQUEST_INJECTION_CDP_SHADOW = requestCdpShadow ? "1" : "0";
 process.env.CODEX_CHATGPT_WEB_REQUEST_INJECTION_CDP_PRIMARY = requestCdpPrimary ? "1" : "0";
 
-const runtimeConfig: AppConfig = { ...config, mode: "browser-only" };
+const canaryMode = process.env.CODEX_CHATGPT_WEB_STREAM_CANARY_MODE === "full" ? "full" : "browser-only";
+const runtimeConfig: AppConfig = { ...config, mode: canaryMode };
 const runtime = createLauncherDevAdapter(runtimeConfig, scratch);
 const store = new DevChatStore(join(scratch, "chats"));
 const driver = new DevChatDriver(runtimeConfig, store, runtime.adapterFactory, process.cwd());

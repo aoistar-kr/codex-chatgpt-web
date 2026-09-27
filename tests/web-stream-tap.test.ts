@@ -9,6 +9,7 @@ import {
   ChatGptRequestInjectionFallbackError,
   ChatGptRequestInjector,
   ChatGptRequestInjectionShadow,
+  type ChatGptRequestInjectionSnapshot,
   ChatGptWebStreamTap,
   ChatGptWireCapture,
   chatGptNetworkStreamPrimaryEnabled,
@@ -669,6 +670,7 @@ function pageRequestInjectorFixture() {
       return new Response("", { status: 200 });
     },
   };
+  let evaluateArgument: Record<string, unknown> | undefined;
   const runInPage = async <T>(operation: () => T | Promise<T>): Promise<T> => {
     const globals = globalThis as any;
     const hadWindow = Object.prototype.hasOwnProperty.call(globals, "window");
@@ -693,9 +695,10 @@ function pageRequestInjectorFixture() {
       fakeWindow[name] = callback;
     },
     removeExposedFunction: async (name: string) => { delete fakeWindow[name]; },
-    evaluate: async (operation: (...args: any[]) => unknown, arg?: unknown) => (
-      runInPage(() => operation(arg))
-    ),
+    evaluate: async (operation: (...args: any[]) => unknown, arg?: unknown) => {
+      if (arg && typeof arg === "object") evaluateArgument = arg as Record<string, unknown>;
+      return runInPage(() => operation(arg));
+    },
   } as unknown as Page;
   return {
     page,
@@ -704,6 +707,19 @@ function pageRequestInjectorFixture() {
       "https://chatgpt.com/backend-api/f/conversation",
       { method: "POST", headers: { "content-type": "application/json" }, body },
     )),
+    fetchConversationBody: async (body: BodyInit) => runInPage(() => fakeWindow.fetch(
+      "https://chatgpt.com/backend-api/f/conversation",
+      { method: "POST", body },
+    )),
+    emitInjectionEvent: async (event: Record<string, unknown>, validToken = false) => {
+      const bindingName = Object.keys(fakeWindow).find(key => key.startsWith("__codexRequestInject_"));
+      const binding = bindingName ? fakeWindow[bindingName] : undefined;
+      if (typeof binding !== "function") throw new Error("request injection binding not installed");
+      return await (binding as (payload: string) => unknown)(JSON.stringify({
+        ...event,
+        receiptToken: validToken ? evaluateArgument?.installedReceiptToken : "00000000-0000-0000-0000-000000000000",
+      }));
+    },
   };
 }
 
@@ -781,7 +797,170 @@ test("page request injector directly synthesizes the observed High plus connecto
   }]);
   expect(injector.snapshot()).toMatchObject({
     observed: true, rewritten: true, exactValueMatches: 1, literalMatches: 1,
+    shapeReceipt: {
+      noncePath: "messages[].content.parts[]",
+      nodeTypes: "o>a>o>o>a>s",
+      model: "s",
+      thinkingEffort: "s",
+      messageMetadata: "o",
+      topHints: "a",
+      messageHints: "a",
+      serialization: "o",
+      offsets: "a",
+    },
   });
+  await injector.close();
+});
+
+test("page request injector reports the current thin body without relaxing its connector contract", async () => {
+  const fixture = pageRequestInjectorFixture();
+  const placeholder = "__PLACEHOLDER__";
+  const pluginId = "plugin:0123456789abcdef";
+  const injector = await ChatGptRequestInjector.install(
+    fixture.page,
+    "trace_current_thin_body",
+    placeholder,
+    "actual prompt",
+    {
+      mode: { model: "gpt-5-6-thinking", thinkingEffort: "extended" },
+      connector: { pluginId, appName: "Codex Native2" },
+    },
+  );
+  await expect(fixture.fetchConversation(JSON.stringify({
+    action: "next",
+    messages: [{ content: { content_type: "text", parts: [placeholder] } }],
+  }))).rejects.toThrow(/request-shape-model/);
+  await expect(injector.assertRewriteAttempt(1_000)).rejects.toBeInstanceOf(ChatGptRequestInjectionFallbackError);
+  expect(fixture.sent).toHaveLength(0);
+  expect(injector.snapshot()).toMatchObject({
+    observed: true,
+    rewritten: false,
+    failureCode: "request-shape-model",
+    exactValueMatches: 1,
+    literalMatches: 1,
+    shapeReceipt: {
+      noncePath: "messages[].content.parts[]",
+      nodeTypes: "o>a>o>o>a>s",
+      model: "m",
+      thinkingEffort: "m",
+      messageMetadata: "m",
+      topHints: "m",
+      messageHints: "m",
+      serialization: "m",
+      offsets: "m",
+    },
+  });
+  expect(JSON.stringify(injector.snapshot())).not.toContain(placeholder);
+  expect(JSON.stringify(injector.snapshot())).not.toContain("actual prompt");
+  await injector.close();
+});
+
+test("request injection receipts require their private correlation token and bounded schema", async () => {
+  const fixture = pageRequestInjectorFixture();
+  const injector = await ChatGptRequestInjector.install(
+    fixture.page, "trace_receipt_auth", "__PLACEHOLDER__", "actual prompt",
+  );
+  const event = {
+    type: "request-injection",
+    rewritten: false,
+    failureCode: "request-shape-model",
+    exactValueMatches: 1,
+    literalMatches: 1,
+    originalBodyChars: 843,
+    rewrittenBodyChars: 0,
+    shapeReceipt: {
+      noncePath: "messages[].content.parts[]",
+      nodeTypes: "o>a>o>o>a>s",
+      model: "m", thinkingEffort: "m", messageMetadata: "m", topHints: "m",
+      messageHints: "m", serialization: "m", offsets: "m",
+    },
+  };
+  await fixture.emitInjectionEvent(event);
+  expect(injector.snapshot().observed).toBeFalse();
+  await fixture.emitInjectionEvent({ ...event, shapeReceipt: { ...event.shapeReceipt, privateKey: "private" } }, true);
+  expect(injector.snapshot().observed).toBeFalse();
+  await fixture.emitInjectionEvent({
+    ...event,
+    shapeReceipt: { ...event.shapeReceipt, noncePath: "x".repeat(241) },
+  }, true);
+  expect(injector.snapshot().observed).toBeFalse();
+  await fixture.emitInjectionEvent(event, true);
+  expect(injector.snapshot()).toMatchObject({ observed: true, failureCode: "request-shape-model" });
+  const serialized = JSON.stringify(injector.snapshot());
+  expect(serialized).not.toContain("receiptToken");
+  expect(serialized).not.toContain("00000000-0000-0000-0000-000000000000");
+  expect(serialized).not.toContain("privateKey");
+  await injector.close();
+});
+
+test("direct request shape refusals identify the exact guard without exposing values", async () => {
+  const placeholder = "__PLACEHOLDER__";
+  const pluginId = "plugin:0123456789abcdef";
+  const base = () => ({
+    model: "gpt-5-6-thinking",
+    thinking_effort: "extended",
+    system_hints: [],
+    messages: [{
+      content: { parts: [placeholder] },
+      metadata: { system_hints: [], serialization_metadata: { custom_symbol_offsets: [] } },
+    }],
+  });
+  const cases: Array<[NonNullable<ChatGptRequestInjectionSnapshot["failureCode"]>, (body: any) => void]> = [
+    ["request-shape-model", body => { body.model = 42; }],
+    ["request-shape-messages", body => { body.unrelated = placeholder; body.messages = []; }],
+    ["request-shape-content", body => { body.messages[0] = { unrelated: placeholder, metadata: {} }; }],
+    ["request-shape-metadata", body => { delete body.messages[0].metadata; }],
+    ["request-shape-parts", body => { body.messages[0].content = { unrelated: placeholder }; }],
+    ["request-shape-serialization", body => { body.messages[0].metadata.serialization_metadata = 42; }],
+    ["request-shape-offsets", body => {
+      body.messages[0].metadata.serialization_metadata.custom_symbol_offsets = [{ existing: true }];
+    }],
+    ["request-shape-replace-count", body => {
+      body.unrelated = placeholder;
+      body.messages[0].content.parts = ["ordinary text"];
+    }],
+  ];
+  for (const [failureCode, mutate] of cases) {
+    const fixture = pageRequestInjectorFixture();
+    const injector = await ChatGptRequestInjector.install(
+      fixture.page,
+      `trace_${failureCode}`,
+      placeholder,
+      "actual prompt",
+      failureCode === "request-shape-replace-count"
+        ? { mode: { model: "gpt-5-6-thinking", thinkingEffort: "extended" } }
+        : {
+            mode: { model: "gpt-5-6-thinking", thinkingEffort: "extended" },
+            connector: { pluginId, appName: "Codex Native2" },
+          },
+    );
+    const body = base();
+    mutate(body);
+    await expect(fixture.fetchConversation(JSON.stringify(body))).rejects.toThrow(failureCode);
+    const snapshot = injector.snapshot();
+    expect(snapshot.failureCode).toBe(failureCode);
+    if (failureCode === "request-shape-replace-count") {
+      expect(snapshot.shapeReceipt?.noncePath).toBe("unknown");
+    }
+    expect(JSON.stringify(snapshot.shapeReceipt).length).toBeLessThanOrEqual(240);
+    expect(JSON.stringify(snapshot)).not.toContain("actual prompt");
+    await injector.close();
+  }
+});
+
+test("unsupported bodies do not consume the slot, while a later inspectable placeholder remains one-use", async () => {
+  const fixture = pageRequestInjectorFixture();
+  const placeholder = "__PLACEHOLDER__";
+  const injector = await ChatGptRequestInjector.install(
+    fixture.page, "trace_slot_boundaries", placeholder, "actual prompt",
+  );
+  await expect(fixture.fetchConversationBody(new Blob([placeholder]))).rejects.toThrow(/unsupported-body/);
+  expect(fixture.sent).toHaveLength(0);
+  const valid = JSON.stringify({ messages: [{ content: { parts: [placeholder] } }] });
+  await fixture.fetchConversation(valid);
+  expect(fixture.sent).toHaveLength(1);
+  await expect(fixture.fetchConversation(valid)).rejects.toThrow(/literal-count/);
+  expect(fixture.sent).toHaveLength(1);
   await injector.close();
 });
 
@@ -829,10 +1008,50 @@ test("page request injector refuses to overwrite conflicting connector metadata"
     }],
   });
 
-  await expect(fixture.fetchConversation(conflicting)).rejects.toThrow(/request-shape/);
+  await expect(fixture.fetchConversation(conflicting)).rejects.toThrow(/request-shape-hints/);
   await expect(injector.assertRewriteAttempt(1_000)).rejects.toBeInstanceOf(ChatGptRequestInjectionFallbackError);
   expect(fixture.sent).toHaveLength(0);
-  expect(injector.snapshot()).toMatchObject({ observed: true, rewritten: false, failureCode: "request-shape" });
+  expect(injector.snapshot()).toMatchObject({ observed: true, rewritten: false, failureCode: "request-shape-hints" });
+  await injector.close();
+});
+
+test("page request injector binds the connector when the client omits system_hints entirely", async () => {
+  const fixture = pageRequestInjectorFixture();
+  const placeholder = "__PLACEHOLDER__";
+  const pluginId = "plugin:0123456789abcdef";
+  const injector = await ChatGptRequestInjector.install(
+    fixture.page,
+    "trace_direct_absent_hints",
+    placeholder,
+    "actual prompt",
+    { connector: { pluginId, appName: "Codex Native2" } },
+  );
+  // The current ChatGPT client sends neither top-level nor message-level system_hints, and no
+  // serialization_metadata. Absence is an owned state, not a shape conflict.
+  const currentClientShape = JSON.stringify({
+    model: "gpt-5-6-thinking",
+    thinking_effort: "extended",
+    messages: [{ content: { parts: [placeholder] }, metadata: { keep: true } }],
+  });
+
+  await fixture.fetchConversation(currentClientShape);
+  await injector.assertRewriteAttempt(1_000);
+  expect(fixture.sent).toHaveLength(1);
+  const rewritten = JSON.parse(String(fixture.sent[0]?.init?.body));
+  expect(rewritten.system_hints).toEqual([pluginId]);
+  expect(rewritten.client_prepare_state).toBe("success");
+  expect(rewritten.messages[0].content.parts).toEqual(["@Codex Native2  actual prompt"]);
+  expect(rewritten.messages[0].metadata.system_hints).toEqual([pluginId]);
+  expect(rewritten.messages[0].metadata.keep).toBe(true);
+  expect(rewritten.messages[0].metadata.serialization_metadata.custom_symbol_offsets).toEqual([{
+    id: pluginId,
+    symbol: "ecosystemMention",
+    startIndex: 0,
+    endIndex: 14,
+  }]);
+  expect(injector.snapshot()).toMatchObject({
+    observed: true, rewritten: true, exactValueMatches: 1, literalMatches: 1,
+  });
   await injector.close();
 });
 
